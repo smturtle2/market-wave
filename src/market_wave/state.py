@@ -25,16 +25,16 @@ class LatentState:
 
 
 @dataclass(frozen=True)
-class DistributionState:
-    buy_entry_pmf: PriceMap
-    sell_entry_pmf: PriceMap
-    long_exit_pmf: PriceMap
-    short_exit_pmf: PriceMap
+class MDFState:
     relative_ticks: list[int] = field(default_factory=list)
-    buy_entry_pmf_by_tick: TickMap = field(default_factory=dict)
-    sell_entry_pmf_by_tick: TickMap = field(default_factory=dict)
-    long_exit_pmf_by_tick: TickMap = field(default_factory=dict)
-    short_exit_pmf_by_tick: TickMap = field(default_factory=dict)
+    buy_entry_mdf: TickMap = field(default_factory=dict)
+    sell_entry_mdf: TickMap = field(default_factory=dict)
+    long_exit_mdf: TickMap = field(default_factory=dict)
+    short_exit_mdf: TickMap = field(default_factory=dict)
+    buy_entry_mdf_by_price: PriceMap = field(default_factory=dict)
+    sell_entry_mdf_by_price: PriceMap = field(default_factory=dict)
+    long_exit_mdf_by_price: PriceMap = field(default_factory=dict)
+    short_exit_mdf_by_price: PriceMap = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,7 @@ class MarketState:
     intensity: IntensityState
     latent: LatentState
     price_grid: list[float]
-    distributions: DistributionState
+    mdf: MDFState
     orderbook: OrderBookState
     position_mass: PositionMassState
 
@@ -79,15 +79,16 @@ class StepInfo:
     regime: str
     augmentation_strength: float
     price_grid: list[float]
+    mdf_price_basis: float
     relative_ticks: list[int]
-    buy_entry_pmf: PriceMap
-    sell_entry_pmf: PriceMap
-    long_exit_pmf: PriceMap
-    short_exit_pmf: PriceMap
-    buy_entry_pmf_by_tick: TickMap
-    sell_entry_pmf_by_tick: TickMap
-    long_exit_pmf_by_tick: TickMap
-    short_exit_pmf_by_tick: TickMap
+    buy_entry_mdf: TickMap
+    sell_entry_mdf: TickMap
+    long_exit_mdf: TickMap
+    short_exit_mdf: TickMap
+    buy_entry_mdf_by_price: PriceMap
+    sell_entry_mdf_by_price: PriceMap
+    long_exit_mdf_by_price: PriceMap
+    short_exit_mdf_by_price: PriceMap
     buy_volume_by_price: PriceMap
     sell_volume_by_price: PriceMap
     entry_volume_by_price: PriceMap

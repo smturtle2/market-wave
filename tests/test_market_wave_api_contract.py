@@ -7,42 +7,47 @@ from collections.abc import Mapping, Sequence
 
 import pytest
 
-from market_wave import (
-    DiscreteMixtureDistribution,
-    DistributionContext,
-    DistributionState,
-    FatTailPMF,
-    IntensityState,
-    LaplaceMixturePMF,
-    LatentState,
-    Market,
-    MarketState,
-    MixtureComponent,
-    NoisyPMF,
-    OrderBookState,
-    PositionMassState,
-    RelativeMixtureComponent,
-    SkewedPMF,
-    StepInfo,
+import market_wave as mw
+from market_wave import Market, MarketState, StepInfo
+
+PUBLIC_TYPE_EXPORTS = (
+    "Market",
+    "MarketState",
+    "IntensityState",
+    "LatentState",
+    "MDFContext",
+    "MDFSignals",
+    "MDFModel",
+    "RelativeMDFComponent",
+    "DynamicMDFModel",
+    "MDFState",
+    "OrderBookState",
+    "PositionMassState",
+    "StepInfo",
 )
 
-PUBLIC_EXPORTS = (
-    Market,
-    MarketState,
-    IntensityState,
-    LatentState,
-    MixtureComponent,
-    RelativeMixtureComponent,
-    DistributionContext,
-    DiscreteMixtureDistribution,
-    LaplaceMixturePMF,
-    SkewedPMF,
-    FatTailPMF,
-    NoisyPMF,
-    DistributionState,
-    OrderBookState,
-    PositionMassState,
-    StepInfo,
+REMOVED_PUBLIC_PMF_EXPORTS = (
+    "DistributionModel",
+    "DistributionState",
+    "DistributionContext",
+    "LaplaceMixturePMF",
+    "SkewedPMF",
+    "FatTailPMF",
+    "NoisyPMF",
+)
+
+MDF_FIELDS = (
+    "buy_entry_mdf",
+    "sell_entry_mdf",
+    "long_exit_mdf",
+    "short_exit_mdf",
+)
+
+MDF_BY_PRICE_FIELDS = (
+    "buy_entry_mdf_by_price",
+    "sell_entry_mdf_by_price",
+    "long_exit_mdf_by_price",
+    "short_exit_mdf_by_price",
 )
 
 REALISM_STEPINFO_FIELDS = (
@@ -148,6 +153,11 @@ def _state_from_step(step):
     return None
 
 
+def _mdf_state(state):
+    assert isinstance(state.mdf, mw.MDFState)
+    return state.mdf
+
+
 def _price(obj):
     for candidate in _walk(obj):
         for name, value in _public_items(candidate):
@@ -204,11 +214,11 @@ def _distribution_probability_vectors(state):
     vectors = []
     for obj in _walk(state):
         class_name = type(obj).__name__.lower()
-        if "distribution" not in class_name and "mixture" not in class_name:
+        if not any(token in class_name for token in ("mdf", "distribution", "mixture")):
             continue
         for name, value in _public_items(obj):
             lowered = name.lower()
-            if any(token in lowered for token in ("pmf", "prob", "weight")):
+            if any(token in lowered for token in ("mdf", "prob", "weight")):
                 vector = _numeric_sequence(value)
                 if vector is not None:
                     vectors.append((type(obj).__name__, name, vector))
@@ -321,16 +331,38 @@ def _overlap(left, right):
     return total
 
 
+def _assert_mdf_map_is_finite_nonnegative_normalized(name, mdf, *, min_effective_support=None):
+    assert mdf, f"{name} should not be empty"
+    values = list(mdf.values())
+    assert all(_is_number(value) for value in values), f"{name} should contain finite numbers"
+    assert all(value >= -1e-12 for value in values), f"{name} should not contain negatives"
+    assert sum(values) == pytest.approx(1.0, abs=1e-9), f"{name} should be normalized"
+    if min_effective_support is not None:
+        effective_support = 1.0 / sum(value * value for value in values)
+        assert effective_support >= min_effective_support, (
+            f"{name} collapsed to effective support {effective_support:.3f}"
+        )
+
+
 def test_public_api_exports_expected_types():
-    assert all(isinstance(export, type) for export in PUBLIC_EXPORTS)
+    missing = [name for name in PUBLIC_TYPE_EXPORTS if not hasattr(mw, name)]
+
+    assert not missing, "Missing public MDF exports: " + ", ".join(missing)
+    assert all(isinstance(getattr(mw, name), type) for name in PUBLIC_TYPE_EXPORTS)
 
 
-def test_distribution_pmfs_are_normalized_from_initial_market_state():
+def test_public_api_removes_dynamic_pmf_exports():
+    leaked = [name for name in REMOVED_PUBLIC_PMF_EXPORTS if hasattr(mw, name)]
+
+    assert not leaked, "Dynamic PMF names should not remain public: " + ", ".join(leaked)
+
+
+def test_distribution_mdfs_are_normalized_from_initial_market_state():
     market = Market(initial_price=100.0, gap=0.5, popularity=1.0, seed=7, grid_radius=8)
 
     vectors = _distribution_probability_vectors(_state_from_market(market))
 
-    assert vectors, "Expected distribution or mixture PMF/probability vectors on Market state"
+    assert vectors, "Expected MDF/probability vectors on Market state"
     for owner, name, vector in vectors:
         assert all(value >= -1e-12 for value in vector), (
             f"{owner}.{name} contains negative probabilities"
@@ -346,25 +378,16 @@ def test_market_state_distributions_stay_aligned_with_current_price_grid_after_m
 
     assert any(abs(step.price_change) > 1e-12 for step in market.history)
     grid = set(state.price_grid)
-    price_pmfs = (
-        ("buy_entry_pmf", state.distributions.buy_entry_pmf),
-        ("sell_entry_pmf", state.distributions.sell_entry_pmf),
-        ("long_exit_pmf", state.distributions.long_exit_pmf),
-        ("short_exit_pmf", state.distributions.short_exit_pmf),
-    )
-    for name, pmf in price_pmfs:
-        assert set(pmf) == grid, f"{name} keys should match current state.price_grid"
-        assert sum(pmf.values()) == pytest.approx(1.0, abs=1e-9)
+    mdf_state = _mdf_state(state)
+    for name in MDF_BY_PRICE_FIELDS:
+        mdf = getattr(mdf_state, name)
+        assert set(mdf) == grid, f"{name} keys should match current state.price_grid"
+        assert sum(mdf.values()) == pytest.approx(1.0, abs=1e-9)
     tick_grid = set(state.tick_grid)
-    tick_pmfs = (
-        state.distributions.buy_entry_pmf_by_tick,
-        state.distributions.sell_entry_pmf_by_tick,
-        state.distributions.long_exit_pmf_by_tick,
-        state.distributions.short_exit_pmf_by_tick,
-    )
-    for pmf in tick_pmfs:
-        assert set(pmf) == tick_grid
-        assert sum(pmf.values()) == pytest.approx(1.0, abs=1e-9)
+    for name in MDF_FIELDS:
+        mdf = getattr(mdf_state, name)
+        assert set(mdf) == tick_grid
+        assert sum(mdf.values()) == pytest.approx(1.0, abs=1e-9)
 
 
 def test_step_returns_stepinfo_items_and_appends_history():
@@ -399,6 +422,26 @@ def test_stepinfo_json_and_history_records_are_exportable():
     assert records == [step.to_dict()]
 
 
+def test_stepinfo_and_market_state_serialization_do_not_expose_public_pmf_names():
+    market = Market(initial_price=100.0, gap=1.0, seed=103, grid_radius=4)
+    step = market.step(1)[0]
+
+    step_payload = step.to_dict()
+    state_payload = dataclasses.asdict(_state_from_market(market))
+
+    for payload_name, payload in (("StepInfo", step_payload), ("MarketState", state_payload)):
+        serialized_keys = {
+            str(key) for obj in _walk(payload) if isinstance(obj, Mapping) for key in obj
+        }
+        leaked = sorted(key for key in serialized_keys if "pmf" in key.lower())
+        assert not leaked, f"{payload_name} serialization leaked PMF keys: {', '.join(leaked)}"
+
+    for name in MDF_FIELDS + MDF_BY_PRICE_FIELDS:
+        assert name in step_payload
+    for name in MDF_FIELDS + MDF_BY_PRICE_FIELDS:
+        assert name in state_payload["mdf"]
+
+
 def test_step_can_skip_history_and_stream_steps():
     market = Market(initial_price=100.0, gap=1.0, seed=13, grid_radius=6)
 
@@ -414,7 +457,7 @@ def test_step_can_skip_history_and_stream_steps():
     assert [step.step_index for step in streamed] == [4, 5]
 
 
-def test_stepinfo_exposes_relative_tick_pmfs():
+def test_stepinfo_exposes_relative_tick_mdfs():
     market = Market(initial_price=100.0, gap=1.0, seed=23, grid_radius=4)
 
     step = market.step(1)[0]
@@ -422,23 +465,37 @@ def test_stepinfo_exposes_relative_tick_pmfs():
     assert step.tick_before == 100
     assert step.relative_ticks == list(range(-4, 5))
     tick_grid = set(step.relative_ticks)
-    for pmf in (
-        step.buy_entry_pmf_by_tick,
-        step.sell_entry_pmf_by_tick,
-        step.long_exit_pmf_by_tick,
-        step.short_exit_pmf_by_tick,
-    ):
-        assert set(pmf) == tick_grid
-        assert sum(pmf.values()) == pytest.approx(1.0, abs=1e-9)
+    for name in MDF_FIELDS:
+        mdf = getattr(step, name)
+        assert set(mdf) == tick_grid
+        assert sum(mdf.values()) == pytest.approx(1.0, abs=1e-9)
     assert step.price_change == pytest.approx(step.tick_change * market.tick_size)
 
 
-def test_custom_distribution_model_is_pluggable_and_normalized():
+def test_stepinfo_mdf_price_basis_is_pre_trade_price():
+    market = Market(initial_price=100.0, gap=1.0, seed=24, grid_radius=6)
+
+    steps = market.step(80, keep_history=False)
+
+    assert any(step.price_after != pytest.approx(step.price_before) for step in steps)
+    for step in steps:
+        assert step.mdf_price_basis == pytest.approx(step.price_before)
+        basis_tick = market.price_to_tick(step.mdf_price_basis)
+        assert step.price_grid == [
+            market.tick_to_price(basis_tick + relative_tick)
+            for relative_tick in step.relative_ticks
+        ]
+        for name in MDF_BY_PRICE_FIELDS:
+            assert set(getattr(step, name)) == set(step.price_grid)
+
+
+def test_custom_mdf_model_scores_are_called_for_four_flows_and_normalized():
     class CenterWeightedModel:
         def __init__(self):
             self.calls = []
 
-        def pmf(self, side, intent, relative_ticks, context):
+        def scores(self, side, intent, relative_ticks, context, signals=None):
+            del signals
             self.calls.append(
                 (side, intent, tuple(relative_ticks), context.regime, context.step_index)
             )
@@ -450,7 +507,7 @@ def test_custom_distribution_model_is_pluggable_and_normalized():
         gap=1.0,
         seed=29,
         grid_radius=3,
-        distribution_model=model,
+        mdf_model=model,
         regime="trend_up",
         augmentation_strength=0.4,
     )
@@ -458,41 +515,157 @@ def test_custom_distribution_model_is_pluggable_and_normalized():
     step = market.step(1, keep_history=False)[0]
 
     assert len(model.calls) == 4
+    assert {(side, intent) for side, intent, *_ in model.calls} == {
+        ("buy", "entry"),
+        ("sell", "entry"),
+        ("long", "exit"),
+        ("short", "exit"),
+    }
     assert {call[3] for call in model.calls} == {"trend_up"}
     assert {call[4] for call in model.calls} == {1}
     assert step.regime == "trend_up"
     assert step.augmentation_strength == pytest.approx(0.4)
-    assert step.buy_entry_pmf_by_tick[0] > step.buy_entry_pmf_by_tick[-1]
+    assert step.buy_entry_mdf[0] > step.buy_entry_mdf[-1]
 
 
-def test_pmf_inertia_controls_previous_distribution_weight():
-    class StepShiftingModel:
-        def pmf(self, side, intent, relative_ticks, context):
-            target = -1 if context.step_index == 1 else 1
-            return [1.0 if tick == target else 0.01 for tick in relative_ticks]
+def test_executed_volume_memory_is_rebased_to_current_price_basis():
+    market = Market(initial_price=100.0, gap=1.0, seed=43, grid_radius=5)
+    market._last_execution_volume = 7.0
+    market._last_executed_by_price = {101.0: 7.0}
 
-    fresh_market = Market(
+    signals_at_100 = market._mdf_signals(100.0)
+    signals_at_102 = market._mdf_signals(102.0)
+
+    assert set(signals_at_100.executed_volume_by_tick) == {1}
+    assert signals_at_100.executed_volume_by_tick[1] == pytest.approx(7.0)
+    assert set(signals_at_102.executed_volume_by_tick) == {-1}
+    assert signals_at_102.executed_volume_by_tick[-1] == pytest.approx(7.0)
+
+
+def test_mdf_model_scores_supports_legacy_four_argument_signature():
+    class LegacyModel:
+        def __init__(self):
+            self.calls = []
+
+        def scores(self, side, intent, relative_ticks, context):
+            self.calls.append((side, intent, tuple(relative_ticks), context.step_index))
+            return [0.0 for _ in relative_ticks]
+
+    model = LegacyModel()
+    market = Market(initial_price=100.0, gap=1.0, seed=44, grid_radius=3, mdf_model=model)
+
+    step = market.step(1, keep_history=False)[0]
+
+    assert len(model.calls) == 4
+    assert {call[3] for call in model.calls} == {1}
+    for name in MDF_FIELDS:
+        _assert_mdf_map_is_finite_nonnegative_normalized(name, getattr(step, name))
+
+
+def test_mdf_model_scores_typeerror_from_signal_aware_model_is_not_signature_fallback():
+    class BrokenSignalAwareModel:
+        def __init__(self):
+            self.calls = 0
+
+        def scores(self, side, intent, relative_ticks, context, signals=None):
+            del side, intent, relative_ticks, context, signals
+            self.calls += 1
+            raise TypeError("internal score failure")
+
+    model = BrokenSignalAwareModel()
+    market = Market(initial_price=100.0, gap=1.0, seed=45, grid_radius=3, mdf_model=model)
+
+    with pytest.raises(TypeError, match="internal score failure"):
+        market.step(1, keep_history=False)
+
+    assert model.calls == 1
+
+
+def test_mdf_temperature_controls_update_concentration():
+    class TargetScoreModel:
+        def scores(self, side, intent, relative_ticks, context, signals=None):
+            del side, intent, context, signals
+            target = 1
+            return [10.0 if tick == target else 0.0 for tick in relative_ticks]
+
+    cold_market = Market(
         initial_price=100.0,
         gap=1.0,
         seed=37,
         grid_radius=3,
-        distribution_model=StepShiftingModel(),
-        pmf_inertia=0.0,
+        mdf_model=TargetScoreModel(),
+        mdf_temperature=0.25,
     )
-    frozen_market = Market(
+    warm_market = Market(
         initial_price=100.0,
         gap=1.0,
         seed=37,
         grid_radius=3,
-        distribution_model=StepShiftingModel(),
-        pmf_inertia=1.0,
+        mdf_model=TargetScoreModel(),
+        mdf_temperature=4.0,
     )
 
-    fresh_steps = fresh_market.step(2, keep_history=False)
-    frozen_steps = frozen_market.step(2, keep_history=False)
+    cold_step = cold_market.step(1, keep_history=False)[0]
+    warm_step = warm_market.step(1, keep_history=False)[0]
 
-    assert fresh_steps[1].buy_entry_pmf_by_tick[1] > fresh_steps[1].buy_entry_pmf_by_tick[-1]
-    assert frozen_steps[1].buy_entry_pmf_by_tick[-1] > frozen_steps[1].buy_entry_pmf_by_tick[1]
+    assert cold_step.buy_entry_mdf[1] > warm_step.buy_entry_mdf[1]
+    assert cold_step.buy_entry_mdf[1] > 0.90
+    assert warm_step.buy_entry_mdf[1] < 0.75
+
+
+def test_mdf_update_accumulates_previous_distribution_state():
+    class TargetScoreModel:
+        def scores(self, side, intent, relative_ticks, context, signals=None):
+            del side, intent, context, signals
+            return [2.0 if tick == 1 else 0.0 for tick in relative_ticks]
+
+    market = Market(
+        initial_price=100.0,
+        gap=1.0,
+        seed=37,
+        grid_radius=3,
+        mdf_model=TargetScoreModel(),
+        mdf_temperature=1.0,
+    )
+
+    first, second = market.step(2, keep_history=False)
+
+    assert second.buy_entry_mdf[1] > first.buy_entry_mdf[1]
+    assert second.buy_entry_mdf[1] > second.buy_entry_mdf[-1]
+
+
+def test_dynamic_mdf_acceptance_does_not_collapse_for_default_temperature_seed_matrix():
+    peak_ticks = []
+    for seed in range(10, 20):
+        market = Market(
+            initial_price=100.0,
+            gap=1.0,
+            popularity=1.0,
+            seed=seed,
+            grid_radius=12,
+            mdf_temperature=1.0,
+            regime="auto",
+            augmentation_strength=0.25,
+        )
+
+        steps = market.step(160, keep_history=False)
+        peak_ticks.append(max(steps[-1].buy_entry_mdf, key=steps[-1].buy_entry_mdf.get))
+
+        for step in steps:
+            for name in MDF_FIELDS + MDF_BY_PRICE_FIELDS:
+                _assert_mdf_map_is_finite_nonnegative_normalized(
+                    f"seed={seed} step={step.step_index} {name}",
+                    getattr(step, name),
+                    min_effective_support=3.0,
+                )
+        mdf_state = _mdf_state(_state_from_market(market))
+        for name in MDF_FIELDS + MDF_BY_PRICE_FIELDS:
+            _assert_mdf_map_is_finite_nonnegative_normalized(
+                f"seed={seed} final_state.{name}",
+                getattr(mdf_state, name),
+                min_effective_support=3.0,
+            )
+    assert any(tick != 0 for tick in peak_ticks)
 
 
 def test_price_changes_only_on_steps_with_executions():
@@ -618,15 +791,6 @@ def test_market_rejects_non_positive_or_non_finite_inputs():
         Market(initial_price=100.0, gap=1.0, popularity=math.inf)
 
 
-def test_distribution_rejects_non_finite_or_non_positive_component_values():
-    with pytest.raises(ValueError, match="finite"):
-        DiscreteMixtureDistribution((MixtureComponent(math.nan, 100.0, 1.0),)).pmf([100.0])
-    with pytest.raises(ValueError, match="spread"):
-        DiscreteMixtureDistribution((MixtureComponent(1.0, 100.0, 0.0),)).pmf([100.0])
-    with pytest.raises(ValueError, match="price_grid"):
-        DiscreteMixtureDistribution((MixtureComponent(1.0, 100.0, 1.0),)).pmf([math.inf])
-
-
 def test_low_price_markets_do_not_print_zero_or_negative_prices():
     market = Market(initial_price=1.0, gap=1.0, popularity=2.0, seed=17, grid_radius=8)
 
@@ -705,25 +869,30 @@ def test_realism_price_path_moves_without_overly_periodic_returns():
 
 
 def test_realism_volatility_clustering_diagnostic_is_positiveish():
-    market = Market(initial_price=100.0, gap=1.0, popularity=1.2, seed=1234, grid_radius=16)
-    steps = _realism_steps_or_skip(market, 1500)
+    correlations = []
+    follower_ratios = []
+    for seed in (1234, 42, 7, 99, 202, 404):
+        market = Market(initial_price=100.0, gap=1.0, popularity=1.2, seed=seed, grid_radius=16)
+        steps = _realism_steps_or_skip(market, 1500)
 
-    absolute_returns = [abs(step.price_change) for step in steps]
-    nonzero_returns = [value for value in absolute_returns if value > 1e-12]
-    assert len(nonzero_returns) >= 10, "Need enough price moves for a volatility diagnostic"
+        absolute_returns = [abs(step.price_change) for step in steps]
+        nonzero_returns = [value for value in absolute_returns if value > 1e-12]
+        assert len(nonzero_returns) >= 10, "Need enough price moves for a volatility diagnostic"
 
-    correlation = _lag1_correlation(absolute_returns)
-    threshold = sorted(absolute_returns)[int(0.75 * (len(absolute_returns) - 1))]
-    high_followers = [
-        absolute_returns[index + 1]
-        for index, value in enumerate(absolute_returns[:-1])
-        if value >= threshold
-    ]
+        threshold = sorted(absolute_returns)[int(0.75 * (len(absolute_returns) - 1))]
+        high_followers = [
+            absolute_returns[index + 1]
+            for index, value in enumerate(absolute_returns[:-1])
+            if value >= threshold
+        ]
+        correlations.append(_lag1_correlation(absolute_returns))
+        follower_ratios.append(
+            (sum(high_followers) / len(high_followers))
+            / (sum(absolute_returns) / len(absolute_returns))
+        )
 
-    assert correlation > -0.02
-    assert sum(high_followers) / len(high_followers) >= (
-        0.9 * sum(absolute_returns) / len(absolute_returns)
-    )
+    assert sum(correlations) / len(correlations) > -0.02
+    assert sum(follower_ratios) / len(follower_ratios) >= 0.9
 
 
 def test_realism_imbalance_sign_matches_flow_and_price_direction_tolerantly():

@@ -123,7 +123,7 @@ def _generate_path(
     metadata = GenerationMetadata(
         path_id=path_id,
         horizon=horizon,
-        config=config,
+        config=_stable_payload(config),
         config_hash=_config_hash(config),
         version=_package_version(),
         seed=market.seed,
@@ -221,7 +221,8 @@ def _config_from_market(market: Market) -> dict[str, Any]:
         "grid_radius": market.grid_radius,
         "regime": market.regime,
         "augmentation_strength": market.augmentation_strength,
-        "pmf_inertia": market.pmf_inertia,
+        "mdf_temperature": market.mdf_temperature,
+        "mdf_model": market.mdf_model,
     }
 
 
@@ -249,6 +250,19 @@ def _stable_payload(value: Any) -> Any:
             key: item
             for key, item in vars(value).items()
             if not key.startswith("_") and not callable(item)
+        }
+        return {
+            "__class__": f"{type(value).__module__}.{type(value).__qualname__}",
+            "attrs": _stable_payload(public),
+        }
+    slots = getattr(value, "__slots__", ())
+    if isinstance(slots, str):
+        slots = (slots,)
+    if slots:
+        public = {
+            key: getattr(value, key)
+            for key in slots
+            if not key.startswith("_") and hasattr(value, key)
         }
         return {
             "__class__": f"{type(value).__module__}.{type(value).__qualname__}",

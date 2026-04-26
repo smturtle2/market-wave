@@ -1,28 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
-from math import exp, isfinite
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from math import exp, isfinite, log1p
 from random import Random
 from typing import Protocol
 
-
-@dataclass(frozen=True)
-class MixtureComponent:
-    weight: float
-    center_price: float
-    spread: float
+TickMap = dict[int, float]
 
 
 @dataclass(frozen=True)
-class RelativeMixtureComponent:
-    weight: float
-    center_tick: float
-    spread_ticks: float
-
-
-@dataclass(frozen=True)
-class DistributionContext:
+class MDFContext:
     current_price: float
     current_tick: int
     tick_size: float
@@ -35,183 +23,139 @@ class DistributionContext:
     rng: Random
 
 
-class DistributionModel(Protocol):
-    def pmf(
+@dataclass(frozen=True)
+class MDFSignals:
+    orderbook_imbalance: float = 0.0
+    last_return_ticks: float = 0.0
+    last_execution_volume: float = 0.0
+    executed_volume_by_tick: Mapping[int, float] = field(default_factory=dict)
+    liquidity_by_tick: Mapping[int, float] = field(default_factory=dict)
+    long_position_mass_by_tick: Mapping[int, float] = field(default_factory=dict)
+    short_position_mass_by_tick: Mapping[int, float] = field(default_factory=dict)
+
+
+class MDFModel(Protocol):
+    def scores(
         self,
         side: str,
         intent: str,
         relative_ticks: Sequence[int],
-        context: DistributionContext,
+        context: MDFContext,
+        signals: MDFSignals | None = None,
     ) -> list[float]: ...
 
 
 @dataclass(frozen=True)
-class DiscreteMixtureDistribution:
-    components: tuple[MixtureComponent, ...]
-
-    def pmf(self, price_grid: list[float]) -> dict[float, float]:
-        if any(not isfinite(price) for price in price_grid):
-            raise ValueError("price_grid must contain only finite prices")
-        for component in self.components:
-            if not (
-                isfinite(component.weight)
-                and isfinite(component.center_price)
-                and isfinite(component.spread)
-            ):
-                raise ValueError("mixture components must contain only finite values")
-            if component.spread <= 0:
-                raise ValueError("mixture component spread must be positive")
-
-        masses = {}
-        for price in price_grid:
-            mass = 0.0
-            for component in self.components:
-                if component.weight <= 0:
-                    continue
-                spread = max(component.spread, 1e-12)
-                kernel = exp(-abs(price - component.center_price) / spread)
-                mass += component.weight * kernel
-            masses[price] = mass
-
-        total = sum(masses.values())
-        if total <= 0:
-            if not price_grid:
-                return {}
-            uniform = 1.0 / len(price_grid)
-            return {price: uniform for price in price_grid}
-
-        return {price: mass / total for price, mass in masses.items()}
-
-
-def _normalize(values: Sequence[float]) -> list[float]:
-    if not values:
-        return []
-    cleaned = [max(0.0, float(value)) if isfinite(float(value)) else 0.0 for value in values]
-    total = sum(cleaned)
-    if total <= 0:
-        return [1.0 / len(cleaned) for _ in cleaned]
-    return [value / total for value in cleaned]
+class RelativeMDFComponent:
+    weight: float
+    center_tick: float
+    spread_ticks: float
 
 
 @dataclass(frozen=True)
-class LaplaceMixturePMF:
-    components: tuple[RelativeMixtureComponent, ...] | None = None
+class DynamicMDFModel:
+    components: tuple[RelativeMDFComponent, ...] | None = None
+    value_weight: float = 1.0
+    trend_weight: float = 0.48
+    liquidity_weight: float = 0.16
+    memory_weight: float = 0.18
+    risk_weight: float = 0.30
+    orderbook_weight: float = 0.20
 
-    def pmf(
+    def scores(
         self,
         side: str,
         intent: str,
         relative_ticks: Sequence[int],
-        context: DistributionContext,
+        context: MDFContext,
+        signals: MDFSignals | None = None,
     ) -> list[float]:
+        signals = signals or MDFSignals()
         components = self.components or self._default_components(side, intent, context)
-        masses = []
-        spread_scale = 1.0 + 0.35 * context.augmentation_strength
+        liquidity_scale = _scale_map(signals.liquidity_by_tick)
+        memory_scale = _scale_map(signals.executed_volume_by_tick)
+        long_risk = _scale_map(signals.long_position_mass_by_tick)
+        short_risk = _scale_map(signals.short_position_mass_by_tick)
+        directional_side = 1.0 if side in {"buy", "short"} else -1.0
+        trend_push = context.trend + 0.35 * context.mood + 0.20 * signals.last_return_ticks
+        imbalance_push = signals.orderbook_imbalance
+        noise_strength = 0.50 * context.augmentation_strength
+
+        scores: list[float] = []
         for tick in relative_ticks:
-            mass = 0.0
-            for component in components:
-                if component.weight <= 0:
-                    continue
-                spread = max(component.spread_ticks * spread_scale, 1e-12)
-                mass += component.weight * exp(-abs(tick - component.center_tick) / spread)
-            masses.append(mass)
-        return _normalize(masses)
+            value_score = _component_score(tick, components)
+            trend_score = directional_side * trend_push * tick / max(1, len(relative_ticks))
+            orderbook_score = directional_side * imbalance_push * tick / max(1, len(relative_ticks))
+            liquidity_score = liquidity_scale.get(tick, 0.0)
+            memory_score = memory_scale.get(tick, 0.0)
+            if intent == "exit" and side == "long":
+                risk_score = long_risk.get(tick, 0.0) + max(0.0, -tick) * 0.03
+            elif intent == "exit" and side == "short":
+                risk_score = short_risk.get(tick, 0.0) + max(0.0, tick) * 0.03
+            else:
+                risk_score = 0.0
+            noise = context.rng.uniform(-noise_strength, noise_strength) if noise_strength else 0.0
+            scores.append(
+                self.value_weight * value_score
+                + self.trend_weight * trend_score
+                + self.orderbook_weight * orderbook_score
+                + self.liquidity_weight * liquidity_score
+                + self.memory_weight * memory_score
+                + self.risk_weight * risk_score
+                + noise
+            )
+        return scores
 
     def _default_components(
-        self, side: str, intent: str, context: DistributionContext
-    ) -> tuple[RelativeMixtureComponent, ...]:
+        self, side: str, intent: str, context: MDFContext
+    ) -> tuple[RelativeMDFComponent, ...]:
         spread = 1.0 + 5.5 * context.volatility
         trend_shift = context.trend * (2.5 + 3.0 * context.volatility)
         mood_shift = context.mood * 2.0
         if intent == "entry" and side == "buy":
             return (
-                RelativeMixtureComponent(
+                RelativeMDFComponent(
                     0.72 + max(context.mood, 0.0) * 0.18, -1 + trend_shift, spread
                 ),
-                RelativeMixtureComponent(0.28, -4 + mood_shift, spread * 1.8),
+                RelativeMDFComponent(0.28, -4 + mood_shift, spread * 1.8),
             )
         if intent == "entry" and side == "sell":
             return (
-                RelativeMixtureComponent(
+                RelativeMDFComponent(
                     0.72 + max(-context.mood, 0.0) * 0.18, 1 + trend_shift, spread
                 ),
-                RelativeMixtureComponent(0.28, 4 + mood_shift, spread * 1.8),
+                RelativeMDFComponent(0.28, 4 + mood_shift, spread * 1.8),
             )
         if intent == "exit" and side == "long":
             return (
-                RelativeMixtureComponent(0.58, 3.0, spread * 1.2),
-                RelativeMixtureComponent(0.42, -2.0, spread * 1.1),
+                RelativeMDFComponent(0.58, 3.0, spread * 1.2),
+                RelativeMDFComponent(0.42, -2.0, spread * 1.1),
             )
         return (
-            RelativeMixtureComponent(0.58, -3.0, spread * 1.2),
-            RelativeMixtureComponent(0.42, 2.0, spread * 1.1),
+            RelativeMDFComponent(0.58, -3.0, spread * 1.2),
+            RelativeMDFComponent(0.42, 2.0, spread * 1.1),
         )
 
 
-@dataclass(frozen=True)
-class SkewedPMF:
-    base: DistributionModel | None = None
-    skew: float = 0.8
-
-    def pmf(
-        self,
-        side: str,
-        intent: str,
-        relative_ticks: Sequence[int],
-        context: DistributionContext,
-    ) -> list[float]:
-        base = (self.base or LaplaceMixturePMF()).pmf(side, intent, relative_ticks, context)
-        direction = 1.0 if side in {"buy", "short"} else -1.0
-        regime_skew = context.trend + 0.5 * context.mood
-        weights = [
-            probability
-            * max(
-                0.05, 1.0 + direction * self.skew * regime_skew * tick / max(1, len(relative_ticks))
-            )
-            for probability, tick in zip(base, relative_ticks, strict=False)
-        ]
-        return _normalize(weights)
+def _component_score(tick: int, components: Sequence[RelativeMDFComponent]) -> float:
+    mass = 0.0
+    for component in components:
+        if component.weight <= 0:
+            continue
+        if not (
+            isfinite(component.weight)
+            and isfinite(component.center_tick)
+            and isfinite(component.spread_ticks)
+        ):
+            continue
+        spread = max(component.spread_ticks, 1e-12)
+        mass += component.weight * exp(-abs(tick - component.center_tick) / spread)
+    return log1p(max(0.0, mass))
 
 
-@dataclass(frozen=True)
-class FatTailPMF:
-    tail_weight: float = 0.18
-
-    def pmf(
-        self,
-        side: str,
-        intent: str,
-        relative_ticks: Sequence[int],
-        context: DistributionContext,
-    ) -> list[float]:
-        base = LaplaceMixturePMF().pmf(side, intent, relative_ticks, context)
-        tail = _normalize([1.0 / (1.0 + abs(tick)) ** 1.25 for tick in relative_ticks])
-        weight = min(0.55, max(0.0, self.tail_weight + 0.10 * context.augmentation_strength))
-        return _normalize(
-            [
-                (1.0 - weight) * left + weight * right
-                for left, right in zip(base, tail, strict=False)
-            ]
-        )
-
-
-@dataclass(frozen=True)
-class NoisyPMF:
-    base: DistributionModel | None = None
-    strength: float | None = None
-
-    def pmf(
-        self,
-        side: str,
-        intent: str,
-        relative_ticks: Sequence[int],
-        context: DistributionContext,
-    ) -> list[float]:
-        base = (self.base or LaplaceMixturePMF()).pmf(side, intent, relative_ticks, context)
-        strength = context.augmentation_strength if self.strength is None else self.strength
-        if strength <= 0:
-            return base
-        perturbed = [
-            probability * context.rng.lognormvariate(0.0, 0.18 * strength) for probability in base
-        ]
-        return _normalize(perturbed)
+def _scale_map(values: Mapping[int, float]) -> TickMap:
+    cleaned = {tick: max(0.0, value) for tick, value in values.items() if isfinite(value)}
+    peak = max(cleaned.values(), default=0.0)
+    if peak <= 0:
+        return {}
+    return {tick: value / peak for tick, value in cleaned.items()}

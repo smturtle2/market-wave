@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "market-wave"
-version = "0.1.2"
-description = "Discrete mixture distribution market intent simulator"
+version = "0.2.0"
+description = "Dynamic MDF synthetic market data generator"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [
   { name = "Small Turtle 2" },
 ]
-keywords = ["market", "simulation", "discrete-distribution", "orderbook"]
+keywords = ["market", "simulation", "synthetic-data", "orderbook", "mdf"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",

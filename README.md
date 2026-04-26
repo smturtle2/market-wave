@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Fast, lightweight synthetic market data from relative-tick intent PMFs.</strong>
+  <strong>Fast, lightweight synthetic market data from a Dynamic Market Distribution Function.</strong>
 </p>
 
 <p align="center">
@@ -32,16 +32,16 @@ experiments, visualization, teaching, and strategy-environment prototyping.
 
 - **Aggregate intent, not agents**: market participants are represented by
   probability mass over relative ticks, not by individual objects.
-- **Relative tick PMFs**: entry and exit pressure are modeled as
-  `P(relative_tick)`, then projected onto the current price grid.
-- **Pluggable distributions**: swap only the PMF generator with
-  `LaplaceMixturePMF`, `SkewedPMF`, `FatTailPMF`, `NoisyPMF`, or a custom model.
-- **Separated shape and size**: PMFs decide where intent sits; intensity decides
+- **Dynamic MDF**: entry and exit pressure live in four stateful
+  `MDF(relative_tick)` fields that evolve from the previous step.
+- **Pluggable score model**: swap the MDF score function with
+  `DynamicMDFModel` or a custom `MDFModel`.
+- **Separated shape and size**: MDFs decide where intent sits; intensity decides
   how much order flow appears.
 - **Execution-driven prices**: prices stay flat unless trades execute.
 - **Batch generation**: generate many reproducible synthetic paths without
   keeping every path in `market.history`.
-- **Inspectable state**: every step returns a `StepInfo` snapshot with PMFs,
+- **Inspectable state**: every step returns a `StepInfo` snapshot with MDFs,
   volumes, order book state, position mass, VWAP, spread, and imbalance.
 - **Built-in plotting**: `matplotlib` is included, with a clean light chart style
   by default.
@@ -138,17 +138,24 @@ for name, kwargs, steps_count in cases:
 Recent verification on the current implementation:
 
 ```text
-baseline   range= 9930.0-10010.0 moves=235 exec_steps=500 final= 9950.0
-busy       range= 9920.0-10010.0 moves=248 exec_steps=500 final= 9950.0
-thin       range=  470.0-500.0   moves=242 exec_steps=500 final=  475.0
-low_price  range=    1.0-3.0     moves=236 exec_steps=500 final=    1.0
+baseline   range=10000.0-10070.0 moves=248 exec_steps=500 final=10050.0
+busy       range= 9930.0-10040.0 moves=263 exec_steps=500 final= 9960.0
+thin       range=  460.0-500.0   moves=245 exec_steps=500 final=  460.0
+low_price  range=    1.0-5.0     moves=263 exec_steps=500 final=    3.0
 inactive   range=  100.0-100.0   moves=  0 exec_steps=  0 final=  100.0
 ```
 
-Those runs also checked that current-state PMFs stay aligned with
-`state.price_grid`, PMFs remain normalized, prices never fall below one tick,
+Those runs also checked that current-state MDF projections stay aligned with
+`state.price_grid`, MDFs remain normalized, prices never fall below one tick,
 order book and position mass stay non-negative, and price changes only occur on
-steps with executed volume.
+steps with executed volume. Dynamic MDF acceptance also runs seeds `10..19` at
+`mdf_temperature=1.0` and checks that every MDF remains finite, non-negative,
+normalized, and broad enough not to collapse to a single price.
+
+Diagnostic note for `0.2.0`: the current MDF update is numerically stable under
+the smoke metrics above, but it is not behaviorally calibrated. Treat these
+ranges, move counts, and execution counts as regression diagnostics, not claims
+that the generated paths match any real market.
 
 ## Visualization
 
@@ -203,33 +210,27 @@ print(paths[0].metadata.config_hash)
 `regime`, and `augmentation_strength` so synthetic runs can be traced. Pandas is
 optional: install `market-wave[dataframe]` to use `to_dataframe()`.
 
-## Pluggable PMFs
+## Pluggable MDF
 
 ```python
-from market_wave import FatTailPMF, Market, NoisyPMF
+from market_wave import Market
 
-market = Market(
-    initial_price=100,
-    gap=1,
-    distribution_model=NoisyPMF(FatTailPMF()),
-    augmentation_strength=0.5,
-    seed=7,
-)
+class CenterSeekingMDF:
+    def scores(self, side, intent, relative_ticks, context, signals=None):
+        del side, intent, context, signals
+        return [-abs(tick) for tick in relative_ticks]
+
+market = Market(initial_price=100, gap=1, mdf_model=CenterSeekingMDF(), seed=7)
 
 step = market.step(1)[0]
 print(step.relative_ticks)
-print(step.buy_entry_pmf_by_tick)
+print(step.buy_entry_mdf)
 ```
 
-Custom models only need one method:
-
-```python
-class MyPMF:
-    def pmf(self, side, intent, relative_ticks, context):
-        weights = [1.0 / (1.0 + abs(tick)) for tick in relative_ticks]
-        total = sum(weights)
-        return [weight / total for weight in weights]
-```
+Custom MDF models return scores, not probabilities. Treat each score as
+log-growth evidence: additive score differences become multiplicative changes
+to the previous MDF. `Market` applies those scores through the stabilized MDF
+update described below.
 
 ## Core Concepts
 
@@ -240,28 +241,40 @@ relative_tick = (price - current_price) / tick_size
 relative_ticks = [-grid_radius, ..., 0, ..., +grid_radius]
 ```
 
-The simulator maintains four probability mass functions on that relative grid:
+The simulator maintains four Market Distribution Functions on that relative grid:
 
-- `buy_entry_pmf`
-- `sell_entry_pmf`
-- `long_exit_pmf`
-- `short_exit_pmf`
+- `buy_entry_mdf`
+- `sell_entry_mdf`
+- `long_exit_mdf`
+- `short_exit_mdf`
 
-Each PMF is a normalized discrete mixture:
-
-```text
-pmf[tick] = sum(component_weight * kernel(tick, center_tick, spread_ticks))
-kernel(tick, center, spread) proportional to exp(-abs(tick - center) / spread)
-```
-
-Those relative PMFs are projected onto `price_grid = current_price +/- k * gap`
-for order-book formation. `pmf_inertia` keeps intent from jumping abruptly:
+Each MDF is normalized. It is not recreated from scratch each step; it evolves
+from the previous MDF:
 
 ```text
-pmf_t = pmf_inertia * pmf_prev + (1 - pmf_inertia) * pmf_new
+logits = persistence * log(MDF_prev(tick) + eps)
+       + score(tick) / effective_temperature
+proposal = softmax(clamp(logits - max(logits), -50, 0))
+MDF_next = Normalize((1 - floor_mix) * Diffuse(proposal) + floor_mix * Uniform)
 ```
 
-PMFs generate aggregate intent. Intensity controls total size. The order book and
+`score(tick)` can include value, trend, liquidity attraction, memory, risk, and
+order-book pressure. `mdf_temperature` controls how sharply scores reshape the
+distribution. The effective temperature also includes current volatility, so
+high-volatility regimes soften score updates instead of letting one tick absorb
+all mass. Persistence, diffusion, and uniform floor mixing prevent repeated
+small score advantages from collapsing the MDF into a single tick.
+
+Those relative MDFs are projected onto the pre-trade grid
+`price_grid = price_before +/- k * gap` for order-book formation.
+`StepInfo.mdf_price_basis` records that pre-trade price basis.
+
+```text
+low temperature  -> sharper, concentrated MDF
+high temperature -> wider, smoother MDF
+```
+
+MDFs generate aggregate intent. Intensity controls total size. The order book and
 execution layer then turn that intent into limit flow, taker flow, cancellations,
 exits, matched volume, and price changes.
 
@@ -282,18 +295,17 @@ This is a simulator, not a market data replay engine and not financial advice.
 ```python
 from market_wave import (
     Market,
-    LaplaceMixturePMF,
-    SkewedPMF,
-    FatTailPMF,
-    NoisyPMF,
+    DynamicMDFModel,
     generate_paths,
     compute_metrics,
     MarketState,
     IntensityState,
     LatentState,
-    MixtureComponent,
-    DiscreteMixtureDistribution,
-    DistributionState,
+    MDFContext,
+    MDFSignals,
+    MDFModel,
+    RelativeMDFComponent,
+    MDFState,
     OrderBookState,
     PositionMassState,
     StepInfo,
@@ -304,8 +316,9 @@ Useful `StepInfo` fields include:
 
 - `price_before`, `price_after`, `price_change`
 - `tick_before`, `tick_after`, `tick_change`, `relative_ticks`
-- `buy_entry_pmf`, `sell_entry_pmf`, `long_exit_pmf`, `short_exit_pmf`
-- `buy_entry_pmf_by_tick`, `sell_entry_pmf_by_tick`
+- `mdf_price_basis`, `price_grid`
+- `buy_entry_mdf`, `sell_entry_mdf`, `long_exit_mdf`, `short_exit_mdf`
+- `buy_entry_mdf_by_price`, `sell_entry_mdf_by_price`
 - `buy_volume_by_price`, `sell_volume_by_price`
 - `executed_volume_by_price`, `total_executed_volume`, `trade_count`
 - `market_buy_volume`, `market_sell_volume`, `crossed_market_volume`
@@ -313,6 +326,11 @@ Useful `StepInfo` fields include:
 - `vwap_price`, `best_bid_before`, `best_ask_before`, `spread_after`
 - `orderbook_before`, `orderbook_after`
 - `position_mass_before`, `position_mass_after`
+
+The `*_mdf_by_price` fields are pre-trade MDF projections keyed by
+`mdf_price_basis`; current `Market.state.mdf.*_by_price` is reprojected to the
+post-trade state price. Examples and public APIs use MDF names only; stale PMF
+examples from earlier prototypes should be considered obsolete.
 
 ## Development
 

@@ -1,23 +1,26 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
-from math import ceil, isfinite
+from math import ceil, exp, isfinite, log
 from random import Random
 
 from .distribution import (
-    DistributionContext,
-    DistributionModel,
-    LaplaceMixturePMF,
+    DynamicMDFModel,
+    MDFContext,
+    MDFModel,
+    MDFSignals,
 )
 from .state import (
-    DistributionState,
     IntensityState,
     LatentState,
     MarketState,
+    MDFState,
     OrderBookState,
     PositionMassState,
     PriceMap,
     StepInfo,
+    TickMap,
 )
 
 
@@ -160,9 +163,9 @@ class Market:
         popularity: float = 1.0,
         seed: int | None = None,
         grid_radius: int = 20,
-        distribution_model: DistributionModel | None = None,
+        mdf_model: MDFModel | None = None,
         augmentation_strength: float = 0.0,
-        pmf_inertia: float = 0.35,
+        mdf_temperature: float = 1.0,
         regime: str = "normal",
     ) -> None:
         if not isfinite(initial_price) or initial_price <= 0:
@@ -175,8 +178,8 @@ class Market:
             raise ValueError("popularity must be a non-negative finite number")
         if not isfinite(augmentation_strength) or augmentation_strength < 0:
             raise ValueError("augmentation_strength must be a non-negative finite number")
-        if not isfinite(pmf_inertia) or not 0 <= pmf_inertia <= 1:
-            raise ValueError("pmf_inertia must be between 0 and 1")
+        if not isfinite(mdf_temperature) or mdf_temperature <= 0:
+            raise ValueError("mdf_temperature must be a positive finite number")
         if regime not in self._regime_names() | {"auto"}:
             raise ValueError("regime must be one of the supported regimes or 'auto'")
 
@@ -184,9 +187,13 @@ class Market:
         self.popularity = float(popularity)
         self._min_price = self.gap
         self.grid_radius = int(grid_radius)
-        self.distribution_model = distribution_model or LaplaceMixturePMF()
+        self.mdf_model = mdf_model or DynamicMDFModel()
         self.augmentation_strength = float(augmentation_strength)
-        self.pmf_inertia = float(pmf_inertia)
+        self.mdf_temperature = float(mdf_temperature)
+        self._mdf_persistence = 0.88
+        self._mdf_diffusion = 0.04
+        self._mdf_floor_mix = 0.04
+        self._mdf_eps = 1e-12
         self.regime = regime
         self._active_regime = "normal" if regime == "auto" else regime
         self._rng = Random(seed)
@@ -200,7 +207,9 @@ class Market:
         self._last_abs_return_ticks = 0.0
         self._last_imbalance = 0.0
         self._last_execution_volume = 0.0
-        self._previous_tick_pmfs: dict[str, dict[int, float]] = {}
+        self._last_executed_by_price: PriceMap = {}
+        self._mdf_model_accepts_signals = self._scores_accepts_signals(self.mdf_model.scores)
+        self._mdf_memory: dict[str, dict[int, float]] = {}
         self._anchor_price: float
 
         price = self._snap_price(float(initial_price))
@@ -211,19 +220,19 @@ class Market:
         intensity = IntensityState(total=0.0, buy=0.0, sell=0.0, buy_ratio=0.5, sell_ratio=0.5)
         latent = LatentState(mood=0.0, trend=0.0, volatility=0.25)
         uniform = 1.0 / len(grid)
-        initial_pmf = {price_level: uniform for price_level in grid}
-        initial_tick_pmf = {tick: 1.0 / len(tick_grid) for tick in tick_grid}
+        initial_mdf_by_price = {price_level: uniform for price_level in grid}
+        initial_mdf = {tick: 1.0 / len(tick_grid) for tick in tick_grid}
         zero_mass = {price_level: 0.0 for price_level in grid}
-        distributions = DistributionState(
-            initial_pmf,
-            initial_pmf.copy(),
-            initial_pmf.copy(),
-            initial_pmf.copy(),
+        mdf = MDFState(
             relative_ticks=tick_grid,
-            buy_entry_pmf_by_tick=initial_tick_pmf,
-            sell_entry_pmf_by_tick=initial_tick_pmf.copy(),
-            long_exit_pmf_by_tick=initial_tick_pmf.copy(),
-            short_exit_pmf_by_tick=initial_tick_pmf.copy(),
+            buy_entry_mdf=initial_mdf,
+            sell_entry_mdf=initial_mdf.copy(),
+            long_exit_mdf=initial_mdf.copy(),
+            short_exit_mdf=initial_mdf.copy(),
+            buy_entry_mdf_by_price=initial_mdf_by_price,
+            sell_entry_mdf_by_price=initial_mdf_by_price.copy(),
+            long_exit_mdf_by_price=initial_mdf_by_price.copy(),
+            short_exit_mdf_by_price=initial_mdf_by_price.copy(),
         )
         self.state = MarketState(
             price=price,
@@ -233,7 +242,7 @@ class Market:
             intensity=intensity,
             latent=latent,
             price_grid=grid,
-            distributions=distributions,
+            mdf=mdf,
             orderbook=OrderBookState(),
             position_mass=PositionMassState(
                 long_exit_mass_by_price=zero_mass,
@@ -681,18 +690,18 @@ class Market:
         self._active_regime = self._next_regime()
         latent = self._next_latent(state.latent)
         intensity = self._next_intensity(latent)
-        distributions = self._next_distributions(
+        mdf = self._next_mdf(
             price_before,
             price_grid,
             latent,
             step_index=step_index,
-            update_inertia=True,
+            update_memory=True,
         )
 
         cancelled_volume = self._cancel_orders(price_before, latent)
         entry_limit_buy, entry_limit_sell = self._entry_limit_volumes(
             intensity,
-            distributions,
+            mdf,
             latent,
             price_before,
         )
@@ -707,13 +716,13 @@ class Market:
             "long",
             price_before,
             latent,
-            distributions.long_exit_pmf,
+            mdf.long_exit_mdf_by_price,
         )
         short_exit_market, short_exit_limit = self._exit_flow(
             "short",
             price_before,
             latent,
-            distributions.short_exit_pmf,
+            mdf.short_exit_mdf_by_price,
         )
 
         self._add_liquidity_replenishment(price_before, latent, pre_imbalance)
@@ -732,7 +741,7 @@ class Market:
                 short_exit_market,
                 market_sell,
                 long_exit_market,
-                distributions,
+                mdf,
                 stats,
             )
         )
@@ -749,10 +758,10 @@ class Market:
                 volume=volume,
                 kind=kind,
                 fallback_price=price_before,
-                distributions=distributions,
+                mdf=mdf,
                 stats=stats,
             )
-        self._match_crossed_book(distributions, stats)
+        self._match_crossed_book(mdf, stats)
         self._clean_orderbook()
         self._clean_cohorts()
 
@@ -761,12 +770,13 @@ class Market:
         self._last_return_ticks = (price_after - price_before) / self.gap
         self._last_abs_return_ticks = abs(self._last_return_ticks)
         self._last_execution_volume = stats.total_volume
+        self._last_executed_by_price = self._drop_zeroes(stats.executed_by_price)
 
         state_grid = self._price_grid(price_after)
-        state_distributions = self._reproject_distributions(price_after, distributions)
+        state_mdf = self._reproject_mdf(price_after, mdf)
         position_after = self._position_mass_from_cohorts(
-            state_distributions.long_exit_pmf,
-            state_distributions.short_exit_pmf,
+            state_mdf.long_exit_mdf_by_price,
+            state_mdf.short_exit_mdf_by_price,
         )
         orderbook_after = self._snapshot_orderbook()
         best_bid_after = self._best_bid()
@@ -815,15 +825,16 @@ class Market:
             regime=self._active_regime,
             augmentation_strength=self.augmentation_strength,
             price_grid=price_grid,
-            relative_ticks=distributions.relative_ticks,
-            buy_entry_pmf=distributions.buy_entry_pmf,
-            sell_entry_pmf=distributions.sell_entry_pmf,
-            long_exit_pmf=distributions.long_exit_pmf,
-            short_exit_pmf=distributions.short_exit_pmf,
-            buy_entry_pmf_by_tick=distributions.buy_entry_pmf_by_tick,
-            sell_entry_pmf_by_tick=distributions.sell_entry_pmf_by_tick,
-            long_exit_pmf_by_tick=distributions.long_exit_pmf_by_tick,
-            short_exit_pmf_by_tick=distributions.short_exit_pmf_by_tick,
+            mdf_price_basis=price_before,
+            relative_ticks=mdf.relative_ticks,
+            buy_entry_mdf=mdf.buy_entry_mdf,
+            sell_entry_mdf=mdf.sell_entry_mdf,
+            long_exit_mdf=mdf.long_exit_mdf,
+            short_exit_mdf=mdf.short_exit_mdf,
+            buy_entry_mdf_by_price=mdf.buy_entry_mdf_by_price,
+            sell_entry_mdf_by_price=mdf.sell_entry_mdf_by_price,
+            long_exit_mdf_by_price=mdf.long_exit_mdf_by_price,
+            short_exit_mdf_by_price=mdf.short_exit_mdf_by_price,
             buy_volume_by_price=buy_volume,
             sell_volume_by_price=sell_volume,
             entry_volume_by_price=entry_volume,
@@ -859,7 +870,7 @@ class Market:
             intensity=intensity,
             latent=latent,
             price_grid=state_grid,
-            distributions=state_distributions,
+            mdf=state_mdf,
             orderbook=orderbook_after,
             position_mass=position_after,
         )
@@ -990,18 +1001,18 @@ class Market:
             sell_ratio=sell_ratio,
         )
 
-    def _next_distributions(
+    def _next_mdf(
         self,
         price: float,
         price_grid: list[float],
         latent: LatentState,
         *,
         step_index: int,
-        update_inertia: bool,
-    ) -> DistributionState:
+        update_memory: bool,
+    ) -> MDFState:
         del price_grid
         relative_ticks = self.relative_tick_grid()
-        context = DistributionContext(
+        context = MDFContext(
             current_price=price,
             current_tick=self.price_to_tick(price),
             tick_size=self.gap,
@@ -1013,68 +1024,70 @@ class Market:
             step_index=step_index,
             rng=self._rng,
         )
-        buy_entry_ticks = self._smooth_tick_pmf(
+        signals = self._mdf_signals(price)
+        temperature = max(0.05, self.mdf_temperature * (0.65 + context.volatility))
+        buy_entry_ticks = self._evolve_mdf(
             "buy_entry",
-            self.distribution_model.pmf("buy", "entry", relative_ticks, context),
-            update_inertia=update_inertia,
+            self._model_scores("buy", "entry", relative_ticks, context, signals),
+            temperature=temperature,
+            update_memory=update_memory,
         )
-        sell_entry_ticks = self._smooth_tick_pmf(
+        sell_entry_ticks = self._evolve_mdf(
             "sell_entry",
-            self.distribution_model.pmf("sell", "entry", relative_ticks, context),
-            update_inertia=update_inertia,
+            self._model_scores("sell", "entry", relative_ticks, context, signals),
+            temperature=temperature,
+            update_memory=update_memory,
         )
-        long_exit_ticks = self._smooth_tick_pmf(
+        long_exit_ticks = self._evolve_mdf(
             "long_exit",
-            self.distribution_model.pmf("long", "exit", relative_ticks, context),
-            update_inertia=update_inertia,
+            self._model_scores("long", "exit", relative_ticks, context, signals),
+            temperature=temperature,
+            update_memory=update_memory,
         )
-        short_exit_ticks = self._smooth_tick_pmf(
+        short_exit_ticks = self._evolve_mdf(
             "short_exit",
-            self.distribution_model.pmf("short", "exit", relative_ticks, context),
-            update_inertia=update_inertia,
+            self._model_scores("short", "exit", relative_ticks, context, signals),
+            temperature=temperature,
+            update_memory=update_memory,
         )
-        buy_entry = self._project_tick_pmf(context.current_tick, buy_entry_ticks)
-        sell_entry = self._project_tick_pmf(context.current_tick, sell_entry_ticks)
-        long_exit = self._project_tick_pmf(context.current_tick, long_exit_ticks)
-        short_exit = self._project_tick_pmf(context.current_tick, short_exit_ticks)
-        return DistributionState(
-            buy_entry_pmf=buy_entry,
-            sell_entry_pmf=sell_entry,
-            long_exit_pmf=long_exit,
-            short_exit_pmf=short_exit,
+        buy_entry = self._project_tick_mdf(context.current_tick, buy_entry_ticks)
+        sell_entry = self._project_tick_mdf(context.current_tick, sell_entry_ticks)
+        long_exit = self._project_tick_mdf(context.current_tick, long_exit_ticks)
+        short_exit = self._project_tick_mdf(context.current_tick, short_exit_ticks)
+        return MDFState(
+            buy_entry_mdf_by_price=buy_entry,
+            sell_entry_mdf_by_price=sell_entry,
+            long_exit_mdf_by_price=long_exit,
+            short_exit_mdf_by_price=short_exit,
             relative_ticks=relative_ticks,
-            buy_entry_pmf_by_tick=buy_entry_ticks,
-            sell_entry_pmf_by_tick=sell_entry_ticks,
-            long_exit_pmf_by_tick=long_exit_ticks,
-            short_exit_pmf_by_tick=short_exit_ticks,
+            buy_entry_mdf=buy_entry_ticks,
+            sell_entry_mdf=sell_entry_ticks,
+            long_exit_mdf=long_exit_ticks,
+            short_exit_mdf=short_exit_ticks,
         )
 
-    def _reproject_distributions(
+    def _reproject_mdf(
         self,
         price: float,
-        distributions: DistributionState,
-    ) -> DistributionState:
+        mdf: MDFState,
+    ) -> MDFState:
         current_tick = self.price_to_tick(price)
-        return DistributionState(
-            buy_entry_pmf=self._project_tick_pmf(current_tick, distributions.buy_entry_pmf_by_tick),
-            sell_entry_pmf=self._project_tick_pmf(
-                current_tick, distributions.sell_entry_pmf_by_tick
-            ),
-            long_exit_pmf=self._project_tick_pmf(current_tick, distributions.long_exit_pmf_by_tick),
-            short_exit_pmf=self._project_tick_pmf(
-                current_tick, distributions.short_exit_pmf_by_tick
-            ),
-            relative_ticks=list(distributions.relative_ticks),
-            buy_entry_pmf_by_tick=dict(distributions.buy_entry_pmf_by_tick),
-            sell_entry_pmf_by_tick=dict(distributions.sell_entry_pmf_by_tick),
-            long_exit_pmf_by_tick=dict(distributions.long_exit_pmf_by_tick),
-            short_exit_pmf_by_tick=dict(distributions.short_exit_pmf_by_tick),
+        return MDFState(
+            buy_entry_mdf_by_price=self._project_tick_mdf(current_tick, mdf.buy_entry_mdf),
+            sell_entry_mdf_by_price=self._project_tick_mdf(current_tick, mdf.sell_entry_mdf),
+            long_exit_mdf_by_price=self._project_tick_mdf(current_tick, mdf.long_exit_mdf),
+            short_exit_mdf_by_price=self._project_tick_mdf(current_tick, mdf.short_exit_mdf),
+            relative_ticks=list(mdf.relative_ticks),
+            buy_entry_mdf=dict(mdf.buy_entry_mdf),
+            sell_entry_mdf=dict(mdf.sell_entry_mdf),
+            long_exit_mdf=dict(mdf.long_exit_mdf),
+            short_exit_mdf=dict(mdf.short_exit_mdf),
         )
 
     def _entry_limit_volumes(
         self,
         intensity: IntensityState,
-        distributions: DistributionState,
+        mdf: MDFState,
         latent: LatentState,
         price: float,
     ) -> tuple[PriceMap, PriceMap]:
@@ -1083,56 +1096,126 @@ class Market:
         ask_floor = price + self.gap
         buy = {
             price: intensity.buy * passive_share * probability
-            for price, probability in distributions.buy_entry_pmf.items()
+            for price, probability in mdf.buy_entry_mdf_by_price.items()
             if price <= bid_ceiling
         }
         sell = {
             price: intensity.sell * passive_share * probability
-            for price, probability in distributions.sell_entry_pmf.items()
+            for price, probability in mdf.sell_entry_mdf_by_price.items()
             if price >= ask_floor
         }
         return self._drop_zeroes(buy), self._drop_zeroes(sell)
 
-    def _smooth_tick_pmf(
-        self, key: str, values: list[float], *, update_inertia: bool
+    def _model_scores(
+        self,
+        side: str,
+        intent: str,
+        relative_ticks: list[int],
+        context: MDFContext,
+        signals: MDFSignals,
+    ) -> list[float]:
+        if self._mdf_model_accepts_signals:
+            return self.mdf_model.scores(side, intent, relative_ticks, context, signals)
+        return self.mdf_model.scores(side, intent, relative_ticks, context)
+
+    @staticmethod
+    def _scores_accepts_signals(scores) -> bool:
+        try:
+            parameters = list(inspect.signature(scores).parameters.values())
+        except (TypeError, ValueError):
+            return True
+        if any(
+            parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+            for parameter in parameters
+        ):
+            return True
+        return len(parameters) >= 5
+
+    def _mdf_signals(self, price: float) -> MDFSignals:
+        orderbook = self._snapshot_orderbook()
+        liquidity = self._price_map_to_relative_ticks(
+            price,
+            self._merge_maps(orderbook.bid_volume_by_price, orderbook.ask_volume_by_price),
+        )
+        position = self._snapshot_position_mass()
+        return MDFSignals(
+            orderbook_imbalance=self._last_imbalance,
+            last_return_ticks=self._last_return_ticks,
+            last_execution_volume=self._last_execution_volume,
+            executed_volume_by_tick=self._price_map_to_relative_ticks(
+                price, self._last_executed_by_price
+            ),
+            liquidity_by_tick=liquidity,
+            long_position_mass_by_tick=self._price_map_to_relative_ticks(
+                price, position.long_exit_mass_by_price
+            ),
+            short_position_mass_by_tick=self._price_map_to_relative_ticks(
+                price, position.short_exit_mass_by_price
+            ),
+        )
+
+    def _evolve_mdf(
+        self, key: str, scores: list[float], *, temperature: float, update_memory: bool
     ) -> dict[int, float]:
         ticks = self.relative_tick_grid()
-        normalized = self._normalize_list(values, len(ticks))
-        fresh = {tick: probability for tick, probability in zip(ticks, normalized, strict=False)}
-        previous = self._previous_tick_pmfs.get(key)
-        if previous is None or self.pmf_inertia <= 0:
-            smoothed = fresh
-        else:
-            inertia = self.pmf_inertia
-            smoothed = {
-                tick: inertia * previous.get(tick, 0.0) + (1.0 - inertia) * fresh[tick]
+        if len(scores) != len(ticks):
+            raise ValueError("mdf_model.scores must return one score per relative tick")
+        previous = self._mdf_memory.get(key)
+        if previous is None:
+            uniform = 1.0 / len(ticks)
+            previous = {tick: uniform for tick in ticks}
+        cleaned = [score if isfinite(score) else 0.0 for score in scores]
+        logits = [
+            self._mdf_persistence * log(max(previous.get(tick, 0.0), self._mdf_eps))
+            + score / temperature
+            for tick, score in zip(ticks, cleaned, strict=False)
+        ]
+        anchor = max(logits, default=0.0)
+        weights = [exp(self._clamp(logit - anchor, -50.0, 0.0)) for logit in logits]
+        proposal = self._normalize_tick_map(
+            {tick: weight for tick, weight in zip(ticks, weights, strict=False)}
+        )
+        diffused = self._diffuse_tick_mdf(proposal, self._mdf_diffusion)
+        uniform = 1.0 / len(ticks)
+        evolved = self._normalize_tick_map(
+            {
+                tick: (1.0 - self._mdf_floor_mix) * diffused.get(tick, 0.0)
+                + self._mdf_floor_mix * uniform
                 for tick in ticks
             }
-            smoothed = self._normalize_tick_map(smoothed)
-        if update_inertia:
-            self._previous_tick_pmfs[key] = smoothed
-        return smoothed
+        )
+        if update_memory:
+            self._mdf_memory[key] = evolved
+        return evolved
 
-    def _project_tick_pmf(self, current_tick: int, pmf_by_tick: dict[int, float]) -> PriceMap:
+    def _diffuse_tick_mdf(self, values: dict[int, float], diffusion: float) -> dict[int, float]:
+        if diffusion <= 0:
+            return dict(values)
+        ticks = self.relative_tick_grid()
+        diffused = {}
+        for index, tick in enumerate(ticks):
+            neighbors = []
+            if index > 0:
+                neighbors.append(ticks[index - 1])
+            if index < len(ticks) - 1:
+                neighbors.append(ticks[index + 1])
+            neighbor_mass = (
+                sum(values.get(neighbor, 0.0) for neighbor in neighbors) / len(neighbors)
+                if neighbors
+                else values.get(tick, 0.0)
+            )
+            diffused[tick] = (1.0 - diffusion) * values.get(tick, 0.0) + diffusion * neighbor_mass
+        return self._normalize_tick_map(diffused)
+
+    def _project_tick_mdf(self, current_tick: int, mdf_by_tick: dict[int, float]) -> PriceMap:
         projected: PriceMap = {}
-        for relative_tick, probability in pmf_by_tick.items():
+        for relative_tick, probability in mdf_by_tick.items():
             price = self._price_from_relative_tick(current_tick, relative_tick)
             projected[price] = projected.get(price, 0.0) + probability
         total = sum(projected.values())
         if total <= 0:
             return {}
-        return self._drop_zeroes(
-            {price: probability / total for price, probability in projected.items()}
-        )
-
-    def _normalize_list(self, values: list[float], expected_length: int) -> list[float]:
-        if len(values) != expected_length:
-            raise ValueError("distribution_model.pmf must return one probability per relative tick")
-        cleaned = [value if isfinite(value) and value > 0 else 0.0 for value in values]
-        total = sum(cleaned)
-        if total <= 0:
-            return [1.0 / expected_length for _ in range(expected_length)]
-        return [value / total for value in cleaned]
+        return {price: probability / total for price, probability in sorted(projected.items())}
 
     def _normalize_tick_map(self, values: dict[int, float]) -> dict[int, float]:
         total = sum(max(0.0, value) for value in values.values())
@@ -1172,7 +1255,7 @@ class Market:
         side: str,
         current_price: float,
         latent: LatentState,
-        exit_pmf: PriceMap,
+        exit_mdf: PriceMap,
     ) -> tuple[float, PriceMap]:
         cohorts = self._long_cohorts if side == "long" else self._short_cohorts
         market_volume = 0.0
@@ -1201,13 +1284,13 @@ class Market:
         if side == "long":
             limit_map = {
                 price: passive_volume * probability
-                for price, probability in exit_pmf.items()
+                for price, probability in exit_mdf.items()
                 if passive_volume > 0 and price >= current_price + self.gap
             }
         else:
             limit_map = {
                 price: passive_volume * probability
-                for price, probability in exit_pmf.items()
+                for price, probability in exit_mdf.items()
                 if passive_volume > 0 and price <= current_price - self.gap
             }
         return market_volume, self._drop_zeroes(limit_map)
@@ -1273,7 +1356,7 @@ class Market:
         volume: float,
         kind: str,
         fallback_price: float,
-        distributions: DistributionState,
+        mdf: MDFState,
         stats: _TradeStats,
     ) -> None:
         if volume <= 0:
@@ -1296,11 +1379,11 @@ class Market:
                 price = self._snap_price(price)
                 fill_volume = remaining
                 remaining = 0.0
-                actual = self._apply_fill(kind, fill_volume, price, distributions)
+                actual = self._apply_fill(kind, fill_volume, price, mdf)
                 if kind == "buy_entry":
-                    self._apply_fill("sell_entry", actual, price, distributions)
+                    self._apply_fill("sell_entry", actual, price, mdf)
                 elif kind == "sell_entry":
-                    self._apply_fill("buy_entry", actual, price, distributions)
+                    self._apply_fill("buy_entry", actual, price, mdf)
                 stats.record(price, actual)
                 break
 
@@ -1318,8 +1401,8 @@ class Market:
                 break
             resting_lot.volume -= actual
             remaining -= actual
-            self._apply_fill(kind, actual, price, distributions)
-            self._apply_fill(resting_lot.kind, actual, price, distributions)
+            self._apply_fill(kind, actual, price, mdf)
+            self._apply_fill(resting_lot.kind, actual, price, mdf)
             stats.record(price, actual)
             self._discard_empty_head(price, "ask" if side == "buy" else "bid")
 
@@ -1330,7 +1413,7 @@ class Market:
         short_exit: float,
         sell_entry: float,
         long_exit: float,
-        distributions: DistributionState,
+        mdf: MDFState,
         stats: _TradeStats,
     ) -> tuple[float, float, float, float, float]:
         buy_total = buy_entry + short_exit
@@ -1361,10 +1444,10 @@ class Market:
         sell_entry_actual = actual_sell_entry * sell_scale
         long_exit_actual = actual_long_exit * sell_scale
 
-        self._apply_fill("buy_entry", buy_entry_actual, price, distributions)
-        self._apply_fill("short_exit", short_exit_actual, price, distributions)
-        self._apply_fill("sell_entry", sell_entry_actual, price, distributions)
-        self._apply_fill("long_exit", long_exit_actual, price, distributions)
+        self._apply_fill("buy_entry", buy_entry_actual, price, mdf)
+        self._apply_fill("short_exit", short_exit_actual, price, mdf)
+        self._apply_fill("sell_entry", sell_entry_actual, price, mdf)
+        self._apply_fill("long_exit", long_exit_actual, price, mdf)
         stats.record(price, actual_cross)
 
         return (
@@ -1375,7 +1458,7 @@ class Market:
             actual_cross,
         )
 
-    def _match_crossed_book(self, distributions: DistributionState, stats: _TradeStats) -> None:
+    def _match_crossed_book(self, mdf: MDFState, stats: _TradeStats) -> None:
         while self._best_bid() is not None and self._best_ask() is not None:
             bid_price = self._best_bid()
             ask_price = self._best_ask()
@@ -1403,8 +1486,8 @@ class Market:
                 continue
             bid_lot.volume -= actual
             ask_lot.volume -= actual
-            self._apply_fill(bid_lot.kind, actual, execution_price, distributions)
-            self._apply_fill(ask_lot.kind, actual, execution_price, distributions)
+            self._apply_fill(bid_lot.kind, actual, execution_price, mdf)
+            self._apply_fill(ask_lot.kind, actual, execution_price, mdf)
             stats.record(execution_price, actual)
             self._discard_empty_head(bid_price, "bid")
             self._discard_empty_head(ask_price, "ask")
@@ -1414,7 +1497,7 @@ class Market:
         kind: str,
         volume: float,
         execution_price: float,
-        distributions: DistributionState,
+        mdf: MDFState,
     ) -> float:
         if volume <= 0:
             return 0.0
@@ -1464,16 +1547,22 @@ class Market:
         return kind in {"long_exit", "short_exit"}
 
     def _position_mass_from_cohorts(
-        self, long_exit_pmf: PriceMap, short_exit_pmf: PriceMap
+        self, long_exit_mdf_by_price: PriceMap, short_exit_mdf_by_price: PriceMap
     ) -> PositionMassState:
         long_total = sum(cohort.mass for cohort in self._long_cohorts)
         short_total = sum(cohort.mass for cohort in self._short_cohorts)
         return PositionMassState(
             long_exit_mass_by_price=self._drop_zeroes(
-                {price: long_total * probability for price, probability in long_exit_pmf.items()}
+                {
+                    price: long_total * probability
+                    for price, probability in long_exit_mdf_by_price.items()
+                }
             ),
             short_exit_mass_by_price=self._drop_zeroes(
-                {price: short_total * probability for price, probability in short_exit_pmf.items()}
+                {
+                    price: short_total * probability
+                    for price, probability in short_exit_mdf_by_price.items()
+                }
             ),
         )
 
@@ -1556,6 +1645,17 @@ class Market:
             for price, volume in values.items():
                 merged[price] = merged.get(price, 0.0) + volume
         return self._drop_zeroes(merged)
+
+    def _price_map_to_relative_ticks(self, reference_price: float, values: PriceMap) -> TickMap:
+        reference_tick = self.price_to_tick(reference_price)
+        by_tick: TickMap = {}
+        min_tick = -self.grid_radius
+        max_tick = self.grid_radius
+        for price, value in values.items():
+            relative_tick = self.price_to_tick(price) - reference_tick
+            if min_tick <= relative_tick <= max_tick:
+                by_tick[relative_tick] = by_tick.get(relative_tick, 0.0) + value
+        return by_tick
 
     def _single_price_volume(self, price: float, volume: float) -> PriceMap:
         if volume <= 0:
