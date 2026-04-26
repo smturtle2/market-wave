@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, isfinite
 from random import Random
 
 from .distribution import DiscreteMixtureDistribution, MixtureComponent
@@ -59,15 +59,18 @@ class Market:
         seed: int | None = None,
         grid_radius: int = 20,
     ) -> None:
-        if gap <= 0:
-            raise ValueError("gap must be positive")
+        if not isfinite(initial_price) or initial_price <= 0:
+            raise ValueError("initial_price must be a positive finite number")
+        if not isfinite(gap) or gap <= 0:
+            raise ValueError("gap must be a positive finite number")
         if grid_radius < 1:
             raise ValueError("grid_radius must be at least 1")
-        if popularity < 0:
-            raise ValueError("popularity must be non-negative")
+        if not isfinite(popularity) or popularity < 0:
+            raise ValueError("popularity must be a non-negative finite number")
 
         self.gap = float(gap)
         self.popularity = float(popularity)
+        self._min_price = self.gap
         self.grid_radius = int(grid_radius)
         self._rng = Random(seed)
         self._seed = seed
@@ -121,6 +124,9 @@ class Market:
         steps = [self._step_once() for _ in range(n)]
         self.history.extend(steps)
         return steps
+
+    def history_records(self) -> list[dict]:
+        return [step.to_dict() for step in self.history]
 
     def plot_history(
         self,
@@ -362,8 +368,19 @@ class Market:
         distributions = self._next_distributions(price_before, price_grid, latent)
 
         cancelled_volume = self._cancel_orders(price_before, latent)
-        entry_limit_buy, entry_limit_sell = self._entry_limit_volumes(intensity, distributions)
-        market_buy, market_sell = self._market_entry_volumes(intensity, latent, pre_imbalance)
+        entry_limit_buy, entry_limit_sell = self._entry_limit_volumes(
+            intensity,
+            distributions,
+            latent,
+            price_before,
+        )
+        initial_market_buy, initial_market_sell = self._market_entry_volumes(
+            intensity,
+            latent,
+            pre_imbalance,
+        )
+        market_buy = initial_market_buy
+        market_sell = initial_market_sell
         long_exit_market, long_exit_limit = self._exit_flow(
             "long",
             price_before,
@@ -384,14 +401,18 @@ class Market:
         self._add_lots(long_exit_limit, side="ask", kind="long_exit")
 
         stats = _TradeStats(executed_by_price={})
-        market_buy, short_exit_market, market_sell, long_exit_market = self._cross_taker_flow(
-            price_before,
-            market_buy,
-            short_exit_market,
-            market_sell,
-            long_exit_market,
-            distributions,
-            stats,
+        initial_short_exit_market = short_exit_market
+        initial_long_exit_market = long_exit_market
+        market_buy, short_exit_market, market_sell, long_exit_market, crossed_market_volume = (
+            self._cross_taker_flow(
+                price_before,
+                market_buy,
+                short_exit_market,
+                market_sell,
+                long_exit_market,
+                distributions,
+                stats,
+            )
         )
         taker_calls = [
             ("buy", market_buy, "buy_entry"),
@@ -419,16 +440,22 @@ class Market:
         self._last_abs_return_ticks = abs(self._last_return_ticks)
         self._last_execution_volume = stats.total_volume
 
+        state_grid = self._price_grid(price_after)
+        state_distributions = self._next_distributions(price_after, state_grid, latent)
         position_after = self._position_mass_from_cohorts(
-            distributions.long_exit_pmf,
-            distributions.short_exit_pmf,
+            state_distributions.long_exit_pmf,
+            state_distributions.short_exit_pmf,
         )
         orderbook_after = self._snapshot_orderbook()
         best_bid_after = self._best_bid()
         best_ask_after = self._best_ask()
         spread_after = self._spread(best_bid_after, best_ask_after)
-        market_flow_delta = (market_buy + short_exit_market) - (market_sell + long_exit_market)
-        market_flow_total = market_buy + short_exit_market + market_sell + long_exit_market
+        total_market_buy = initial_market_buy + initial_short_exit_market
+        total_market_sell = initial_market_sell + initial_long_exit_market
+        residual_market_buy = market_buy + short_exit_market
+        residual_market_sell = market_sell + long_exit_market
+        market_flow_delta = total_market_buy - total_market_sell
+        market_flow_total = total_market_buy + total_market_sell
         order_flow_imbalance = (
             self._clamp(market_flow_delta / market_flow_total, -1.0, 1.0)
             if market_flow_total > 1e-12
@@ -441,16 +468,14 @@ class Market:
         buy_volume = self._merge_maps(
             entry_limit_buy,
             short_exit_limit,
-            self._single_price_volume(
-                best_ask_before or price_before, market_buy + short_exit_market
-            ),
+            self._single_price_volume(price_before, crossed_market_volume),
+            self._single_price_volume(best_ask_before or price_before, residual_market_buy),
         )
         sell_volume = self._merge_maps(
             entry_limit_sell,
             long_exit_limit,
-            self._single_price_volume(
-                best_bid_before or price_before, market_sell + long_exit_market
-            ),
+            self._single_price_volume(price_before, crossed_market_volume),
+            self._single_price_volume(best_bid_before or price_before, residual_market_sell),
         )
         vwap = stats.notional / stats.total_volume if stats.total_volume > 0 else None
         step_index = state.step_index + 1
@@ -475,8 +500,11 @@ class Market:
             cancelled_volume_by_price=cancelled_volume,
             executed_volume_by_price=self._drop_zeroes(stats.executed_by_price),
             total_executed_volume=stats.total_volume,
-            market_buy_volume=market_buy + short_exit_market,
-            market_sell_volume=market_sell + long_exit_market,
+            market_buy_volume=total_market_buy,
+            market_sell_volume=total_market_sell,
+            crossed_market_volume=crossed_market_volume,
+            residual_market_buy_volume=residual_market_buy,
+            residual_market_sell_volume=residual_market_sell,
             trade_count=stats.trade_count,
             vwap_price=vwap,
             best_bid_before=best_bid_before,
@@ -497,8 +525,8 @@ class Market:
             step_index=step_index,
             intensity=intensity,
             latent=latent,
-            price_grid=self._price_grid(price_after),
-            distributions=distributions,
+            price_grid=state_grid,
+            distributions=state_distributions,
             orderbook=orderbook_after,
             position_mass=position_after,
         )
@@ -516,20 +544,32 @@ class Market:
         if stats.total_volume <= 0 or stats.last_price is None:
             return price_before
         vwap = stats.notional / stats.total_volume
-        micro_noise_ticks = self._clamp(self._rng.gauss(0.0, 0.58), -1.15, 1.15)
-        micro_noise = micro_noise_ticks * self.gap
-        anchor_pull = 0.04 * (self._anchor_price - price_before)
-        return 0.58 * stats.last_price + 0.42 * vwap + micro_noise + anchor_pull
+        execution_price = 0.68 * stats.last_price + 0.32 * vwap
+        execution_move_ticks = (execution_price - price_before) / self.gap
+        if abs(execution_move_ticks) <= 1e-12:
+            return price_before
+        jitter_ticks = self._clamp(self._rng.gauss(0.0, 0.18), -0.35, 0.35)
+        anchor_pull_ticks = self._clamp(
+            0.025 * (self._anchor_price - price_before) / self.gap,
+            -0.30,
+            0.30,
+        )
+        proposed_ticks = execution_move_ticks + jitter_ticks + anchor_pull_ticks
+        if execution_move_ticks > 0:
+            proposed_ticks = max(0.0, proposed_ticks)
+        else:
+            proposed_ticks = min(0.0, proposed_ticks)
+        return max(self._min_price, price_before + proposed_ticks * self.gap)
 
     def _price_grid(self, center_price: float) -> list[float]:
         center = self._snap_price(center_price)
-        return [
+        return self._dedupe_prices(
             self._snap_price(center + offset * self.gap)
             for offset in range(-self.grid_radius, self.grid_radius + 1)
-        ]
+        )
 
     def _snap_price(self, price: float) -> float:
-        snapped = round(price / self.gap) * self.gap
+        snapped = max(self._min_price, round(price / self.gap) * self.gap)
         return self._clean_number(snapped)
 
     def _clean_number(self, value: float) -> float:
@@ -646,10 +686,12 @@ class Market:
         self,
         intensity: IntensityState,
         distributions: DistributionState,
+        latent: LatentState,
+        price: float,
     ) -> tuple[PriceMap, PriceMap]:
-        passive_share = 1.0 - self._taker_share(self.state.latent, self._last_imbalance)
-        bid_ceiling = self.state.price - self.gap
-        ask_floor = self.state.price + self.gap
+        passive_share = 1.0 - self._taker_share(latent, self._last_imbalance)
+        bid_ceiling = price - self.gap
+        ask_floor = price + self.gap
         buy = {
             price: intensity.buy * passive_share * probability
             for price, probability in distributions.buy_entry_pmf.items()
@@ -717,11 +759,18 @@ class Market:
             market_volume += desired * (0.55 + 0.20 * latent.volatility / (1.0 + latent.volatility))
             passive_volume += desired * 0.35
 
-        limit_map = {
-            price: passive_volume * probability
-            for price, probability in exit_pmf.items()
-            if passive_volume > 0
-        }
+        if side == "long":
+            limit_map = {
+                price: passive_volume * probability
+                for price, probability in exit_pmf.items()
+                if passive_volume > 0 and price >= current_price + self.gap
+            }
+        else:
+            limit_map = {
+                price: passive_volume * probability
+                for price, probability in exit_pmf.items()
+                if passive_volume > 0 and price <= current_price - self.gap
+            }
         return market_volume, self._drop_zeroes(limit_map)
 
     def _cancel_orders(self, current_price: float, latent: LatentState) -> PriceMap:
@@ -801,22 +850,35 @@ class Market:
                 if side == "buy":
                     price = fallback_price + impact_ticks * self.gap
                 else:
-                    price = fallback_price - impact_ticks * self.gap
+                    price = max(self._min_price, fallback_price - impact_ticks * self.gap)
                 price = self._snap_price(price)
                 fill_volume = remaining
                 remaining = 0.0
-                self._apply_fill(kind, fill_volume, price, distributions)
-                stats.record(price, fill_volume)
+                actual = self._apply_fill(kind, fill_volume, price, distributions)
+                if kind == "buy_entry":
+                    self._apply_fill("sell_entry", actual, price, distributions)
+                elif kind == "sell_entry":
+                    self._apply_fill("buy_entry", actual, price, distributions)
+                stats.record(price, actual)
                 break
 
             lots_by_price = self._ask_lots if side == "buy" else self._bid_lots
             resting_lot = lots_by_price[price][0]
             fill_volume = min(remaining, resting_lot.volume)
-            resting_lot.volume -= fill_volume
-            remaining -= fill_volume
-            self._apply_fill(kind, fill_volume, price, distributions)
-            self._apply_fill(resting_lot.kind, fill_volume, price, distributions)
-            stats.record(price, fill_volume)
+            taker_actual = self._available_fill_volume(kind, fill_volume)
+            resting_actual = self._available_fill_volume(resting_lot.kind, fill_volume)
+            actual = min(taker_actual, resting_actual)
+            if actual <= 1e-12:
+                if self._is_exit_kind(resting_lot.kind) and resting_actual <= 1e-12:
+                    resting_lot.volume = 0.0
+                    self._discard_empty_head(price, "ask" if side == "buy" else "bid")
+                    continue
+                break
+            resting_lot.volume -= actual
+            remaining -= actual
+            self._apply_fill(kind, actual, price, distributions)
+            self._apply_fill(resting_lot.kind, actual, price, distributions)
+            stats.record(price, actual)
             self._discard_empty_head(price, "ask" if side == "buy" else "bid")
 
     def _cross_taker_flow(
@@ -828,29 +890,47 @@ class Market:
         long_exit: float,
         distributions: DistributionState,
         stats: _TradeStats,
-    ) -> tuple[float, float, float, float]:
+    ) -> tuple[float, float, float, float, float]:
         buy_total = buy_entry + short_exit
         sell_total = sell_entry + long_exit
         cross_volume = min(buy_total, sell_total) * 0.85
         if cross_volume <= 1e-12:
-            return buy_entry, short_exit, sell_entry, long_exit
+            return buy_entry, short_exit, sell_entry, long_exit, 0.0
 
         buy_entry_fill = cross_volume * buy_entry / buy_total if buy_total > 0 else 0.0
         short_exit_fill = cross_volume * short_exit / buy_total if buy_total > 0 else 0.0
         sell_entry_fill = cross_volume * sell_entry / sell_total if sell_total > 0 else 0.0
         long_exit_fill = cross_volume * long_exit / sell_total if sell_total > 0 else 0.0
 
-        self._apply_fill("buy_entry", buy_entry_fill, price, distributions)
-        self._apply_fill("short_exit", short_exit_fill, price, distributions)
-        self._apply_fill("sell_entry", sell_entry_fill, price, distributions)
-        self._apply_fill("long_exit", long_exit_fill, price, distributions)
-        stats.record(price, cross_volume)
+        actual_buy_entry = self._available_fill_volume("buy_entry", buy_entry_fill)
+        actual_short_exit = self._available_fill_volume("short_exit", short_exit_fill)
+        actual_sell_entry = self._available_fill_volume("sell_entry", sell_entry_fill)
+        actual_long_exit = self._available_fill_volume("long_exit", long_exit_fill)
+        actual_buy_side = actual_buy_entry + actual_short_exit
+        actual_sell_side = actual_sell_entry + actual_long_exit
+        actual_cross = min(actual_buy_side, actual_sell_side)
+        if actual_cross <= 1e-12:
+            return buy_entry, short_exit, sell_entry, long_exit, 0.0
+
+        buy_scale = actual_cross / actual_buy_side if actual_buy_side > 0 else 0.0
+        sell_scale = actual_cross / actual_sell_side if actual_sell_side > 0 else 0.0
+        buy_entry_actual = actual_buy_entry * buy_scale
+        short_exit_actual = actual_short_exit * buy_scale
+        sell_entry_actual = actual_sell_entry * sell_scale
+        long_exit_actual = actual_long_exit * sell_scale
+
+        self._apply_fill("buy_entry", buy_entry_actual, price, distributions)
+        self._apply_fill("short_exit", short_exit_actual, price, distributions)
+        self._apply_fill("sell_entry", sell_entry_actual, price, distributions)
+        self._apply_fill("long_exit", long_exit_actual, price, distributions)
+        stats.record(price, actual_cross)
 
         return (
-            max(0.0, buy_entry - buy_entry_fill),
-            max(0.0, short_exit - short_exit_fill),
-            max(0.0, sell_entry - sell_entry_fill),
-            max(0.0, long_exit - long_exit_fill),
+            max(0.0, buy_entry - buy_entry_actual),
+            max(0.0, short_exit - short_exit_actual),
+            max(0.0, sell_entry - sell_entry_actual),
+            max(0.0, long_exit - long_exit_actual),
+            actual_cross,
         )
 
     def _match_crossed_book(self, distributions: DistributionState, stats: _TradeStats) -> None:
@@ -868,11 +948,22 @@ class Market:
                 self._discard_empty_head(ask_price, "ask")
                 continue
             execution_price = ask_price
-            bid_lot.volume -= volume
-            ask_lot.volume -= volume
-            self._apply_fill(bid_lot.kind, volume, execution_price, distributions)
-            self._apply_fill(ask_lot.kind, volume, execution_price, distributions)
-            stats.record(execution_price, volume)
+            bid_actual = self._available_fill_volume(bid_lot.kind, volume)
+            ask_actual = self._available_fill_volume(ask_lot.kind, volume)
+            actual = min(bid_actual, ask_actual)
+            if actual <= 1e-12:
+                if self._is_exit_kind(bid_lot.kind) and bid_actual <= 1e-12:
+                    bid_lot.volume = 0.0
+                if self._is_exit_kind(ask_lot.kind) and ask_actual <= 1e-12:
+                    ask_lot.volume = 0.0
+                self._discard_empty_head(bid_price, "bid")
+                self._discard_empty_head(ask_price, "ask")
+                continue
+            bid_lot.volume -= actual
+            ask_lot.volume -= actual
+            self._apply_fill(bid_lot.kind, actual, execution_price, distributions)
+            self._apply_fill(ask_lot.kind, actual, execution_price, distributions)
+            stats.record(execution_price, actual)
             self._discard_empty_head(bid_price, "bid")
             self._discard_empty_head(ask_price, "ask")
 
@@ -882,25 +973,29 @@ class Market:
         volume: float,
         execution_price: float,
         distributions: DistributionState,
-    ) -> None:
+    ) -> float:
         if volume <= 0:
-            return
+            return 0.0
         if kind == "buy_entry":
             self._long_cohorts.append(_PositionCohort("long", execution_price, volume))
+            return volume
         elif kind == "sell_entry":
             self._short_cohorts.append(_PositionCohort("short", execution_price, volume))
+            return volume
         elif kind == "long_exit":
-            self._remove_cohort_mass(self._long_cohorts, execution_price, volume)
+            return self._remove_cohort_mass(self._long_cohorts, execution_price, volume)
         elif kind == "short_exit":
-            self._remove_cohort_mass(self._short_cohorts, execution_price, volume)
+            return self._remove_cohort_mass(self._short_cohorts, execution_price, volume)
+        return 0.0
 
     def _remove_cohort_mass(
         self,
         cohorts: list[_PositionCohort],
         execution_price: float,
         volume: float,
-    ) -> None:
+    ) -> float:
         remaining = volume
+        removed_total = 0.0
         ordered = sorted(
             cohorts,
             key=lambda cohort: (abs(cohort.entry_price - execution_price), -cohort.age),
@@ -911,6 +1006,20 @@ class Market:
             removed = min(cohort.mass, remaining)
             cohort.mass -= removed
             remaining -= removed
+            removed_total += removed
+        return removed_total
+
+    def _available_fill_volume(self, kind: str, requested: float) -> float:
+        if requested <= 0:
+            return 0.0
+        if kind == "long_exit":
+            return min(requested, sum(cohort.mass for cohort in self._long_cohorts))
+        if kind == "short_exit":
+            return min(requested, sum(cohort.mass for cohort in self._short_cohorts))
+        return requested
+
+    def _is_exit_kind(self, kind: str) -> bool:
+        return kind in {"long_exit", "short_exit"}
 
     def _position_mass_from_cohorts(
         self, long_exit_pmf: PriceMap, short_exit_pmf: PriceMap
@@ -1013,6 +1122,9 @@ class Market:
 
     def _drop_zeroes(self, values: PriceMap) -> PriceMap:
         return {price: value for price, value in sorted(values.items()) if value > 1e-12}
+
+    def _dedupe_prices(self, prices) -> list[float]:
+        return sorted(set(prices))
 
     def _clamp(self, value: float, low: float, high: float) -> float:
         return max(low, min(high, value))

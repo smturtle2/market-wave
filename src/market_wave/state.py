@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 PriceMap = dict[float, float]
 
@@ -77,6 +79,9 @@ class StepInfo:
     total_executed_volume: float
     market_buy_volume: float
     market_sell_volume: float
+    crossed_market_volume: float
+    residual_market_buy_volume: float
+    residual_market_sell_volume: float
     trade_count: int
     vwap_price: float | None
     best_bid_before: float | None
@@ -90,3 +95,9 @@ class StepInfo:
     orderbook_after: OrderBookState
     position_mass_before: PositionMassState
     position_mass_after: PositionMassState
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def to_json(self, **kwargs: Any) -> str:
+        return json.dumps(self.to_dict(), **kwargs)

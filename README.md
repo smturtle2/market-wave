@@ -61,15 +61,71 @@ Python `>=3.10` is supported.
 from market_wave import Market
 
 market = Market(initial_price=10_000, gap=10, popularity=1.0, seed=42)
-steps = market.step(100)
+steps = market.step(500)
 
 last = steps[-1]
 print(last.price_before, "->", last.price_after)
-print(last.total_executed_volume)
+print("executed:", round(last.total_executed_volume, 3))
+print("imbalance:", round(last.order_flow_imbalance, 3))
+print("crossed flow:", round(last.crossed_market_volume, 3))
+print("residual flow:", round(last.residual_market_buy_volume, 3), round(last.residual_market_sell_volume, 3))
 ```
 
 `Market.step(n)` always returns `list[StepInfo]` and appends the same objects to
 `market.history`.
+
+For simple export workflows, use `step.to_dict()`, `step.to_json()`, or
+`market.history_records()`.
+
+Example output with `seed=42`:
+
+```text
+10010.0 -> 10000.0
+executed: 0.578
+imbalance: -0.046
+crossed flow: 0.394
+residual flow: 0.07 0.115
+```
+
+## Smoke Matrix
+
+The simulator is deterministic for a fixed seed, so it is easy to run the same
+invariants across different market conditions:
+
+```python
+from market_wave import Market
+
+cases = [
+    ("baseline", dict(initial_price=10_000, gap=10, popularity=1.0, seed=42, grid_radius=20), 500),
+    ("busy", dict(initial_price=10_000, gap=10, popularity=2.5, seed=7, grid_radius=24), 500),
+    ("thin", dict(initial_price=500, gap=5, popularity=0.25, seed=123, grid_radius=12), 500),
+    ("low_price", dict(initial_price=1, gap=1, popularity=3.0, seed=17, grid_radius=8), 500),
+    ("inactive", dict(initial_price=100, gap=1, popularity=0.0, seed=9, grid_radius=10), 100),
+]
+
+for name, kwargs, steps_count in cases:
+    market = Market(**kwargs)
+    steps = market.step(steps_count)
+    prices = [step.price_after for step in steps]
+    move_steps = sum(step.price_change != 0 for step in steps)
+    exec_steps = sum(step.total_executed_volume > 0 for step in steps)
+    print(name, min(prices), max(prices), move_steps, exec_steps, market.state.price)
+```
+
+Recent verification on the current implementation:
+
+```text
+baseline   range=10000.0-10030.0 moves=232 exec_steps=500 final=10000.0
+busy       range= 9990.0-10070.0 moves=242 exec_steps=500 final=10050.0
+thin       range=  495.0-505.0   moves=224 exec_steps=500 final=  500.0
+low_price  range=    1.0-2.0     moves=237 exec_steps=500 final=    2.0
+inactive   range=  100.0-100.0   moves=  0 exec_steps=  0 final=  100.0
+```
+
+Those runs also checked that current-state PMFs stay aligned with
+`state.price_grid`, PMFs remain normalized, prices never fall below one tick,
+order book and position mass stay non-negative, and price changes only occur on
+steps with executed volume.
 
 ## Visualization
 
@@ -125,7 +181,8 @@ Price movement is execution-driven:
 
 - If a step has no executed volume, `price_after == price_before`.
 - If trades execute, `price_after` is derived from that step's execution
-  statistics.
+  statistics. Random quote jitter is bounded and cannot move the price by itself
+  when executions print at the previous price.
 - `seed` makes the simulation reproducible for the same version and inputs.
 
 This is a simulator, not a market data replay engine and not financial advice.
@@ -153,6 +210,8 @@ Useful `StepInfo` fields include:
 - `buy_entry_pmf`, `sell_entry_pmf`, `long_exit_pmf`, `short_exit_pmf`
 - `buy_volume_by_price`, `sell_volume_by_price`
 - `executed_volume_by_price`, `total_executed_volume`, `trade_count`
+- `market_buy_volume`, `market_sell_volume`, `crossed_market_volume`
+- `residual_market_buy_volume`, `residual_market_sell_volume`
 - `vwap_price`, `best_bid_before`, `best_ask_before`, `spread_after`
 - `orderbook_before`, `orderbook_after`
 - `position_mass_before`, `position_mass_after`

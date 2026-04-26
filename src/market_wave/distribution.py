@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp
+from math import exp, isfinite
 
 
 @dataclass(frozen=True)
@@ -16,6 +16,18 @@ class DiscreteMixtureDistribution:
     components: tuple[MixtureComponent, ...]
 
     def pmf(self, price_grid: list[float]) -> dict[float, float]:
+        if any(not isfinite(price) for price in price_grid):
+            raise ValueError("price_grid must contain only finite prices")
+        for component in self.components:
+            if not (
+                isfinite(component.weight)
+                and isfinite(component.center_price)
+                and isfinite(component.spread)
+            ):
+                raise ValueError("mixture components must contain only finite values")
+            if component.spread <= 0:
+                raise ValueError("mixture component spread must be positive")
+
         masses = {}
         for price in price_grid:
             mass = 0.0

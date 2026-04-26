@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 from collections.abc import Mapping, Sequence
 
@@ -35,6 +36,9 @@ PUBLIC_EXPORTS = (
 REALISM_STEPINFO_FIELDS = (
     "market_buy_volume",
     "market_sell_volume",
+    "crossed_market_volume",
+    "residual_market_buy_volume",
+    "residual_market_sell_volume",
     "trade_count",
     "vwap_price",
     "best_bid_before",
@@ -272,9 +276,7 @@ def _lag1_correlation(values):
     right = values[1:]
     left_mean = sum(left) / len(left)
     right_mean = sum(right) / len(right)
-    numerator = sum(
-        (a - left_mean) * (b - right_mean) for a, b in zip(left, right, strict=False)
-    )
+    numerator = sum((a - left_mean) * (b - right_mean) for a, b in zip(left, right, strict=False))
     left_var = sum((a - left_mean) ** 2 for a in left)
     right_var = sum((b - right_mean) ** 2 for b in right)
     denominator = math.sqrt(left_var * right_var)
@@ -290,9 +292,7 @@ def _lag_correlation(values, lag):
     right = values[lag:]
     left_mean = sum(left) / len(left)
     right_mean = sum(right) / len(right)
-    numerator = sum(
-        (a - left_mean) * (b - right_mean) for a, b in zip(left, right, strict=False)
-    )
+    numerator = sum((a - left_mean) * (b - right_mean) for a, b in zip(left, right, strict=False))
     left_var = sum((a - left_mean) ** 2 for a in left)
     right_var = sum((b - right_mean) ** 2 for b in right)
     denominator = math.sqrt(left_var * right_var)
@@ -326,6 +326,19 @@ def test_distribution_pmfs_are_normalized_from_initial_market_state():
         assert sum(vector) == pytest.approx(1.0, abs=1e-9), f"{owner}.{name} should be normalized"
 
 
+def test_market_state_distributions_stay_aligned_with_current_price_grid_after_moves():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.2, seed=99, grid_radius=16)
+
+    market.step(80)
+    state = _state_from_market(market)
+
+    assert any(abs(step.price_change) > 1e-12 for step in market.history)
+    grid = set(state.price_grid)
+    for name, pmf in dataclasses.asdict(state.distributions).items():
+        assert set(pmf) == grid, f"{name} keys should match current state.price_grid"
+        assert sum(pmf.values()) == pytest.approx(1.0, abs=1e-9)
+
+
 def test_step_returns_stepinfo_items_and_appends_history():
     market = Market(initial_price=100.0, gap=1.0, seed=11, grid_radius=6)
     before_history_len = len(_history(market))
@@ -344,6 +357,18 @@ def test_seeded_markets_are_deterministic():
 
     assert _freeze(left.step(12)) == _freeze(right.step(12))
     assert _freeze(_state_from_market(left)) == _freeze(_state_from_market(right))
+
+
+def test_stepinfo_json_and_history_records_are_exportable():
+    market = Market(initial_price=100.0, gap=1.0, seed=101, grid_radius=8)
+    step = market.step(1)[0]
+
+    payload = json.loads(step.to_json())
+    records = market.history_records()
+
+    assert payload["step_index"] == step.step_index
+    assert payload["price_after"] == step.price_after
+    assert records == [step.to_dict()]
 
 
 def test_price_changes_only_on_steps_with_executions():
@@ -414,6 +439,9 @@ def test_stepinfo_exposes_market_realism_diagnostics():
     numeric_fields = (
         "market_buy_volume",
         "market_sell_volume",
+        "crossed_market_volume",
+        "residual_market_buy_volume",
+        "residual_market_sell_volume",
         "trade_count",
         "order_flow_imbalance",
     )
@@ -455,6 +483,34 @@ def test_stepinfo_exposes_market_realism_diagnostics():
             <= (step.vwap_price)
             <= max(step.price_before, step.price_after) + market.gap * market.grid_radius
         )
+
+
+def test_market_rejects_non_positive_or_non_finite_inputs():
+    with pytest.raises(ValueError, match="initial_price"):
+        Market(initial_price=0.0, gap=1.0)
+    with pytest.raises(ValueError, match="gap"):
+        Market(initial_price=100.0, gap=math.nan)
+    with pytest.raises(ValueError, match="popularity"):
+        Market(initial_price=100.0, gap=1.0, popularity=math.inf)
+
+
+def test_distribution_rejects_non_finite_or_non_positive_component_values():
+    with pytest.raises(ValueError, match="finite"):
+        DiscreteMixtureDistribution((MixtureComponent(math.nan, 100.0, 1.0),)).pmf([100.0])
+    with pytest.raises(ValueError, match="spread"):
+        DiscreteMixtureDistribution((MixtureComponent(1.0, 100.0, 0.0),)).pmf([100.0])
+    with pytest.raises(ValueError, match="price_grid"):
+        DiscreteMixtureDistribution((MixtureComponent(1.0, 100.0, 1.0),)).pmf([math.inf])
+
+
+def test_low_price_markets_do_not_print_zero_or_negative_prices():
+    market = Market(initial_price=1.0, gap=1.0, popularity=2.0, seed=17, grid_radius=8)
+
+    steps = market.step(250)
+
+    assert min(step.price_before for step in steps) >= market.gap
+    assert min(step.price_after for step in steps) >= market.gap
+    assert min(market.state.price_grid) >= market.gap
 
 
 def test_realism_seeded_determinism_is_tolerant_for_longer_runs():
