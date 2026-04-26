@@ -9,14 +9,20 @@ import pytest
 
 from market_wave import (
     DiscreteMixtureDistribution,
+    DistributionContext,
     DistributionState,
+    FatTailPMF,
     IntensityState,
+    LaplaceMixturePMF,
     LatentState,
     Market,
     MarketState,
     MixtureComponent,
+    NoisyPMF,
     OrderBookState,
     PositionMassState,
+    RelativeMixtureComponent,
+    SkewedPMF,
     StepInfo,
 )
 
@@ -26,7 +32,13 @@ PUBLIC_EXPORTS = (
     IntensityState,
     LatentState,
     MixtureComponent,
+    RelativeMixtureComponent,
+    DistributionContext,
     DiscreteMixtureDistribution,
+    LaplaceMixturePMF,
+    SkewedPMF,
+    FatTailPMF,
+    NoisyPMF,
     DistributionState,
     OrderBookState,
     PositionMassState,
@@ -334,8 +346,24 @@ def test_market_state_distributions_stay_aligned_with_current_price_grid_after_m
 
     assert any(abs(step.price_change) > 1e-12 for step in market.history)
     grid = set(state.price_grid)
-    for name, pmf in dataclasses.asdict(state.distributions).items():
+    price_pmfs = (
+        ("buy_entry_pmf", state.distributions.buy_entry_pmf),
+        ("sell_entry_pmf", state.distributions.sell_entry_pmf),
+        ("long_exit_pmf", state.distributions.long_exit_pmf),
+        ("short_exit_pmf", state.distributions.short_exit_pmf),
+    )
+    for name, pmf in price_pmfs:
         assert set(pmf) == grid, f"{name} keys should match current state.price_grid"
+        assert sum(pmf.values()) == pytest.approx(1.0, abs=1e-9)
+    tick_grid = set(state.tick_grid)
+    tick_pmfs = (
+        state.distributions.buy_entry_pmf_by_tick,
+        state.distributions.sell_entry_pmf_by_tick,
+        state.distributions.long_exit_pmf_by_tick,
+        state.distributions.short_exit_pmf_by_tick,
+    )
+    for pmf in tick_pmfs:
+        assert set(pmf) == tick_grid
         assert sum(pmf.values()) == pytest.approx(1.0, abs=1e-9)
 
 
@@ -369,6 +397,102 @@ def test_stepinfo_json_and_history_records_are_exportable():
     assert payload["step_index"] == step.step_index
     assert payload["price_after"] == step.price_after
     assert records == [step.to_dict()]
+
+
+def test_step_can_skip_history_and_stream_steps():
+    market = Market(initial_price=100.0, gap=1.0, seed=13, grid_radius=6)
+
+    steps = market.step(3, keep_history=False)
+
+    assert len(steps) == 3
+    assert market.history == []
+
+    streamed = list(market.stream(2, keep_history=True))
+
+    assert len(streamed) == 2
+    assert market.history == streamed
+    assert [step.step_index for step in streamed] == [4, 5]
+
+
+def test_stepinfo_exposes_relative_tick_pmfs():
+    market = Market(initial_price=100.0, gap=1.0, seed=23, grid_radius=4)
+
+    step = market.step(1)[0]
+
+    assert step.tick_before == 100
+    assert step.relative_ticks == list(range(-4, 5))
+    tick_grid = set(step.relative_ticks)
+    for pmf in (
+        step.buy_entry_pmf_by_tick,
+        step.sell_entry_pmf_by_tick,
+        step.long_exit_pmf_by_tick,
+        step.short_exit_pmf_by_tick,
+    ):
+        assert set(pmf) == tick_grid
+        assert sum(pmf.values()) == pytest.approx(1.0, abs=1e-9)
+    assert step.price_change == pytest.approx(step.tick_change * market.tick_size)
+
+
+def test_custom_distribution_model_is_pluggable_and_normalized():
+    class CenterWeightedModel:
+        def __init__(self):
+            self.calls = []
+
+        def pmf(self, side, intent, relative_ticks, context):
+            self.calls.append(
+                (side, intent, tuple(relative_ticks), context.regime, context.step_index)
+            )
+            return [1.0 if tick == 0 else 0.05 for tick in relative_ticks]
+
+    model = CenterWeightedModel()
+    market = Market(
+        initial_price=100.0,
+        gap=1.0,
+        seed=29,
+        grid_radius=3,
+        distribution_model=model,
+        regime="trend_up",
+        augmentation_strength=0.4,
+    )
+
+    step = market.step(1, keep_history=False)[0]
+
+    assert len(model.calls) == 4
+    assert {call[3] for call in model.calls} == {"trend_up"}
+    assert {call[4] for call in model.calls} == {1}
+    assert step.regime == "trend_up"
+    assert step.augmentation_strength == pytest.approx(0.4)
+    assert step.buy_entry_pmf_by_tick[0] > step.buy_entry_pmf_by_tick[-1]
+
+
+def test_pmf_inertia_controls_previous_distribution_weight():
+    class StepShiftingModel:
+        def pmf(self, side, intent, relative_ticks, context):
+            target = -1 if context.step_index == 1 else 1
+            return [1.0 if tick == target else 0.01 for tick in relative_ticks]
+
+    fresh_market = Market(
+        initial_price=100.0,
+        gap=1.0,
+        seed=37,
+        grid_radius=3,
+        distribution_model=StepShiftingModel(),
+        pmf_inertia=0.0,
+    )
+    frozen_market = Market(
+        initial_price=100.0,
+        gap=1.0,
+        seed=37,
+        grid_radius=3,
+        distribution_model=StepShiftingModel(),
+        pmf_inertia=1.0,
+    )
+
+    fresh_steps = fresh_market.step(2, keep_history=False)
+    frozen_steps = frozen_market.step(2, keep_history=False)
+
+    assert fresh_steps[1].buy_entry_pmf_by_tick[1] > fresh_steps[1].buy_entry_pmf_by_tick[-1]
+    assert frozen_steps[1].buy_entry_pmf_by_tick[-1] > frozen_steps[1].buy_entry_pmf_by_tick[1]
 
 
 def test_price_changes_only_on_steps_with_executions():

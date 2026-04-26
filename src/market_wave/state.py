@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 PriceMap = dict[float, float]
+TickMap = dict[int, float]
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,11 @@ class DistributionState:
     sell_entry_pmf: PriceMap
     long_exit_pmf: PriceMap
     short_exit_pmf: PriceMap
+    relative_ticks: list[int] = field(default_factory=list)
+    buy_entry_pmf_by_tick: TickMap = field(default_factory=dict)
+    sell_entry_pmf_by_tick: TickMap = field(default_factory=dict)
+    long_exit_pmf_by_tick: TickMap = field(default_factory=dict)
+    short_exit_pmf_by_tick: TickMap = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,8 @@ class PositionMassState:
 class MarketState:
     price: float
     step_index: int
+    current_tick: int
+    tick_grid: list[int]
     intensity: IntensityState
     latent: LatentState
     price_grid: list[float]
@@ -61,15 +69,25 @@ class StepInfo:
     price_before: float
     price_after: float
     price_change: float
+    tick_before: int
+    tick_after: int
+    tick_change: int
     intensity: IntensityState
     mood: float
     trend: float
     volatility: float
+    regime: str
+    augmentation_strength: float
     price_grid: list[float]
+    relative_ticks: list[int]
     buy_entry_pmf: PriceMap
     sell_entry_pmf: PriceMap
     long_exit_pmf: PriceMap
     short_exit_pmf: PriceMap
+    buy_entry_pmf_by_tick: TickMap
+    sell_entry_pmf_by_tick: TickMap
+    long_exit_pmf_by_tick: TickMap
+    short_exit_pmf_by_tick: TickMap
     buy_volume_by_price: PriceMap
     sell_volume_by_price: PriceMap
     entry_volume_by_price: PriceMap

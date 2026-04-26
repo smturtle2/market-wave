@@ -4,7 +4,11 @@ from dataclasses import dataclass
 from math import ceil, isfinite
 from random import Random
 
-from .distribution import DiscreteMixtureDistribution, MixtureComponent
+from .distribution import (
+    DistributionContext,
+    DistributionModel,
+    LaplaceMixturePMF,
+)
 from .state import (
     DistributionState,
     IntensityState,
@@ -51,6 +55,104 @@ class _TradeStats:
 
 
 class Market:
+    @staticmethod
+    def _regime_names() -> set[str]:
+        return {"normal", "trend_up", "trend_down", "high_vol", "thin_liquidity", "squeeze"}
+
+    def _next_regime(self) -> str:
+        if self.regime != "auto":
+            return self.regime
+        switch_probability = self._clamp(0.015 + 0.08 * self.augmentation_strength, 0.0, 0.18)
+        if self._rng.random() >= switch_probability:
+            return self._active_regime
+        regimes = sorted(self._regime_names())
+        weights = {
+            "normal": 0.42,
+            "trend_up": 0.14,
+            "trend_down": 0.14,
+            "high_vol": 0.12,
+            "thin_liquidity": 0.10,
+            "squeeze": 0.08,
+        }
+        draw = self._rng.random() * sum(weights.values())
+        cumulative = 0.0
+        for regime in regimes:
+            cumulative += weights[regime]
+            if draw <= cumulative:
+                return regime
+        return "normal"
+
+    def _regime_settings(self, regime: str) -> dict[str, float]:
+        settings = {
+            "normal": {
+                "mood": 0.0,
+                "trend": 0.0,
+                "volatility": 1.0,
+                "volatility_bias": 0.0,
+                "intensity": 1.0,
+                "taker": 1.0,
+                "cancel": 1.0,
+                "liquidity": 1.0,
+                "spread": 1.0,
+            },
+            "trend_up": {
+                "mood": 0.04,
+                "trend": 0.08,
+                "volatility": 1.05,
+                "volatility_bias": 0.01,
+                "intensity": 1.12,
+                "taker": 1.08,
+                "cancel": 1.02,
+                "liquidity": 1.0,
+                "spread": 1.05,
+            },
+            "trend_down": {
+                "mood": -0.04,
+                "trend": -0.08,
+                "volatility": 1.08,
+                "volatility_bias": 0.015,
+                "intensity": 1.14,
+                "taker": 1.10,
+                "cancel": 1.04,
+                "liquidity": 0.98,
+                "spread": 1.08,
+            },
+            "high_vol": {
+                "mood": 0.0,
+                "trend": 0.0,
+                "volatility": 1.35,
+                "volatility_bias": 0.06,
+                "intensity": 1.35,
+                "taker": 1.24,
+                "cancel": 1.25,
+                "liquidity": 0.9,
+                "spread": 1.35,
+            },
+            "thin_liquidity": {
+                "mood": 0.0,
+                "trend": 0.0,
+                "volatility": 1.18,
+                "volatility_bias": 0.025,
+                "intensity": 0.74,
+                "taker": 1.16,
+                "cancel": 1.28,
+                "liquidity": 0.42,
+                "spread": 1.22,
+            },
+            "squeeze": {
+                "mood": 0.06,
+                "trend": 0.12,
+                "volatility": 1.45,
+                "volatility_bias": 0.08,
+                "intensity": 1.55,
+                "taker": 1.34,
+                "cancel": 1.18,
+                "liquidity": 0.7,
+                "spread": 1.4,
+            },
+        }
+        return settings.get(regime, settings["normal"])
+
     def __init__(
         self,
         initial_price: float,
@@ -58,6 +160,10 @@ class Market:
         popularity: float = 1.0,
         seed: int | None = None,
         grid_radius: int = 20,
+        distribution_model: DistributionModel | None = None,
+        augmentation_strength: float = 0.0,
+        pmf_inertia: float = 0.35,
+        regime: str = "normal",
     ) -> None:
         if not isfinite(initial_price) or initial_price <= 0:
             raise ValueError("initial_price must be a positive finite number")
@@ -67,11 +173,22 @@ class Market:
             raise ValueError("grid_radius must be at least 1")
         if not isfinite(popularity) or popularity < 0:
             raise ValueError("popularity must be a non-negative finite number")
+        if not isfinite(augmentation_strength) or augmentation_strength < 0:
+            raise ValueError("augmentation_strength must be a non-negative finite number")
+        if not isfinite(pmf_inertia) or not 0 <= pmf_inertia <= 1:
+            raise ValueError("pmf_inertia must be between 0 and 1")
+        if regime not in self._regime_names() | {"auto"}:
+            raise ValueError("regime must be one of the supported regimes or 'auto'")
 
         self.gap = float(gap)
         self.popularity = float(popularity)
         self._min_price = self.gap
         self.grid_radius = int(grid_radius)
+        self.distribution_model = distribution_model or LaplaceMixturePMF()
+        self.augmentation_strength = float(augmentation_strength)
+        self.pmf_inertia = float(pmf_inertia)
+        self.regime = regime
+        self._active_regime = "normal" if regime == "auto" else regime
         self._rng = Random(seed)
         self._seed = seed
         self.history: list[StepInfo] = []
@@ -83,25 +200,36 @@ class Market:
         self._last_abs_return_ticks = 0.0
         self._last_imbalance = 0.0
         self._last_execution_volume = 0.0
+        self._previous_tick_pmfs: dict[str, dict[int, float]] = {}
         self._anchor_price: float
 
         price = self._snap_price(float(initial_price))
         self._anchor_price = price
         grid = self._price_grid(price)
+        tick_grid = self.relative_tick_grid()
+        current_tick = self.price_to_tick(price)
         intensity = IntensityState(total=0.0, buy=0.0, sell=0.0, buy_ratio=0.5, sell_ratio=0.5)
         latent = LatentState(mood=0.0, trend=0.0, volatility=0.25)
         uniform = 1.0 / len(grid)
         initial_pmf = {price_level: uniform for price_level in grid}
+        initial_tick_pmf = {tick: 1.0 / len(tick_grid) for tick in tick_grid}
         zero_mass = {price_level: 0.0 for price_level in grid}
         distributions = DistributionState(
             initial_pmf,
             initial_pmf.copy(),
             initial_pmf.copy(),
             initial_pmf.copy(),
+            relative_ticks=tick_grid,
+            buy_entry_pmf_by_tick=initial_tick_pmf,
+            sell_entry_pmf_by_tick=initial_tick_pmf.copy(),
+            long_exit_pmf_by_tick=initial_tick_pmf.copy(),
+            short_exit_pmf_by_tick=initial_tick_pmf.copy(),
         )
         self.state = MarketState(
             price=price,
             step_index=0,
+            current_tick=current_tick,
+            tick_grid=tick_grid,
             intensity=intensity,
             latent=latent,
             price_grid=grid,
@@ -117,13 +245,27 @@ class Market:
     def seed(self) -> int | None:
         return self._seed
 
-    def step(self, n: int) -> list[StepInfo]:
+    @property
+    def tick_size(self) -> float:
+        return self.gap
+
+    def step(self, n: int, *, keep_history: bool = True) -> list[StepInfo]:
         if n < 0:
             raise ValueError("n must be non-negative")
 
         steps = [self._step_once() for _ in range(n)]
-        self.history.extend(steps)
+        if keep_history:
+            self.history.extend(steps)
         return steps
+
+    def stream(self, n: int, *, keep_history: bool = False):
+        if n < 0:
+            raise ValueError("n must be non-negative")
+        for _ in range(n):
+            step = self._step_once()
+            if keep_history:
+                self.history.append(step)
+            yield step
 
     def history_records(self) -> list[dict]:
         return [step.to_dict() for step in self.history]
@@ -135,6 +277,9 @@ class Market:
         style: str = "market_wave",
         last: int | None = None,
         layout: str = "panel",
+        orderbook: bool | None = None,
+        orderbook_snapshot: str = "after",
+        orderbook_depth: int | None = None,
     ):
         if not self.history:
             raise ValueError("history is empty; call step(n) before plotting")
@@ -142,6 +287,13 @@ class Market:
             raise ValueError("last must be positive")
         if layout not in {"panel", "overlay"}:
             raise ValueError("layout must be 'panel' or 'overlay'")
+        if orderbook_snapshot not in {"before", "after"}:
+            raise ValueError("orderbook_snapshot must be 'before' or 'after'")
+        if orderbook_depth is not None and orderbook_depth <= 0:
+            raise ValueError("orderbook_depth must be positive")
+        include_orderbook = layout == "panel" if orderbook is None else orderbook
+        if layout == "overlay" and include_orderbook:
+            raise ValueError("orderbook heatmap is only supported with layout='panel'")
 
         import matplotlib.pyplot as plt
 
@@ -149,7 +301,14 @@ class Market:
         context = self._plot_style_context(style)
         with plt.style.context(context):
             if layout == "panel" and ax is None:
-                return self._plot_history_panel(plt, steps, style)
+                return self._plot_history_panel(
+                    plt,
+                    steps,
+                    style,
+                    orderbook=include_orderbook,
+                    orderbook_snapshot=orderbook_snapshot,
+                    orderbook_depth=orderbook_depth,
+                )
             return self._plot_history_overlay(plt, steps, ax, style)
 
     def plot(
@@ -159,8 +318,19 @@ class Market:
         style: str = "market_wave",
         last: int | None = None,
         layout: str = "panel",
+        orderbook: bool | None = None,
+        orderbook_snapshot: str = "after",
+        orderbook_depth: int | None = None,
     ):
-        return self.plot_history(ax=ax, style=style, last=last, layout=layout)
+        return self.plot_history(
+            ax=ax,
+            style=style,
+            last=last,
+            layout=layout,
+            orderbook=orderbook,
+            orderbook_snapshot=orderbook_snapshot,
+            orderbook_depth=orderbook_depth,
+        )
 
     def _plot_style_context(self, style: str) -> str:
         if style == "market_wave":
@@ -169,16 +339,36 @@ class Market:
             return "dark_background"
         return style
 
-    def _plot_history_panel(self, plt, steps: list[StepInfo], style: str):
-        fig, axes = plt.subplots(
-            3,
-            1,
-            figsize=(12, 7.8),
-            sharex=True,
-            constrained_layout=True,
-            gridspec_kw={"height_ratios": [3.4, 1.25, 1.25]},
-        )
-        price_ax, volume_ax, imbalance_ax = axes
+    def _plot_history_panel(
+        self,
+        plt,
+        steps: list[StepInfo],
+        style: str,
+        *,
+        orderbook: bool,
+        orderbook_snapshot: str,
+        orderbook_depth: int | None,
+    ):
+        if orderbook:
+            fig, axes = plt.subplots(
+                5,
+                1,
+                figsize=(12, 10.4),
+                sharex=True,
+                constrained_layout=True,
+                gridspec_kw={"height_ratios": [3.2, 1.25, 1.25, 1.1, 1.1]},
+            )
+            price_ax, ask_ax, bid_ax, volume_ax, imbalance_ax = axes
+        else:
+            fig, axes = plt.subplots(
+                3,
+                1,
+                figsize=(12, 7.8),
+                sharex=True,
+                constrained_layout=True,
+                gridspec_kw={"height_ratios": [3.4, 1.25, 1.25]},
+            )
+            price_ax, volume_ax, imbalance_ax = axes
         x_values, prices, vwap_x, vwap_y, volumes, imbalances = self._plot_series(steps)
         colors = self._plot_colors(style)
 
@@ -192,6 +382,16 @@ class Market:
                 linestyle="--",
                 alpha=0.9,
                 label="vwap",
+            )
+        if orderbook:
+            self._plot_orderbook_heatmap_axes(
+                fig,
+                bid_ax,
+                ask_ax,
+                steps,
+                colors,
+                snapshot=orderbook_snapshot,
+                depth=orderbook_depth,
             )
         volume_ax.bar(x_values, volumes, width=0.86, color=colors["volume"], alpha=0.72)
         imbalance_colors = [
@@ -214,6 +414,9 @@ class Market:
         imbalance_ax.set_xlabel("step")
         price_ax.legend(loc="upper left", frameon=False, ncols=2)
         self._style_market_wave_axes(fig, axes, colors)
+        if orderbook:
+            bid_ax.grid(False)
+            ask_ax.grid(False)
         return fig, price_ax
 
     def _plot_history_overlay(self, plt, steps: list[StepInfo], ax, style: str):
@@ -308,6 +511,109 @@ class Market:
         imbalances = [step.order_flow_imbalance for step in steps]
         return x_values, prices, vwap_x, vwap_y, volumes, imbalances
 
+    def _plot_orderbook_heatmap_axes(
+        self,
+        fig,
+        bid_ax,
+        ask_ax,
+        steps: list[StepInfo],
+        colors: dict[str, str],
+        *,
+        snapshot: str,
+        depth: int | None,
+    ) -> None:
+        import matplotlib.colors as mcolors
+
+        x_values, levels, bid_matrix, ask_matrix = self._orderbook_heatmap_matrices(
+            steps, snapshot=snapshot, depth=depth
+        )
+        extent = self._heatmap_extent(x_values, levels)
+        bid_map = mcolors.LinearSegmentedColormap.from_list(
+            "market_wave_bid_depth",
+            [colors["panel"], colors["bid_depth_mid"], colors["bid_depth"]],
+        )
+        ask_map = mcolors.LinearSegmentedColormap.from_list(
+            "market_wave_ask_depth",
+            [colors["panel"], colors["ask_depth_mid"], colors["ask_depth"]],
+        )
+        bid_ax.imshow(
+            bid_matrix,
+            aspect="auto",
+            origin="lower",
+            interpolation="nearest",
+            extent=extent,
+            cmap=bid_map,
+            vmin=0.0,
+            vmax=self._heatmap_vmax(bid_matrix),
+        )
+        ask_ax.imshow(
+            ask_matrix,
+            aspect="auto",
+            origin="lower",
+            interpolation="nearest",
+            extent=extent,
+            cmap=ask_map,
+            vmin=0.0,
+            vmax=self._heatmap_vmax(ask_matrix),
+        )
+        for axis, label in ((bid_ax, "bid level"), (ask_ax, "ask level")):
+            axis.set_ylabel(label)
+            axis.set_yticks(self._level_ticks(levels))
+            axis.set_ylim(0.5, max(levels) + 0.5)
+        bid_ax.invert_yaxis()
+
+    def _orderbook_heatmap_matrices(
+        self,
+        steps: list[StepInfo],
+        *,
+        snapshot: str,
+        depth: int | None,
+    ):
+        depth = depth or min(self.grid_radius, 20)
+        x_values = [step.step_index for step in steps]
+        levels = list(range(1, depth + 1))
+        bid_matrix = [[0.0 for _ in steps] for _ in levels]
+        ask_matrix = [[0.0 for _ in steps] for _ in levels]
+        for column, step in enumerate(steps):
+            orderbook = step.orderbook_after if snapshot == "after" else step.orderbook_before
+            bid_levels = sorted(orderbook.bid_volume_by_price.items(), reverse=True)[:depth]
+            ask_levels = sorted(orderbook.ask_volume_by_price.items())[:depth]
+            for row, (_, volume) in enumerate(bid_levels):
+                bid_matrix[row][column] = volume
+            for row, (_, volume) in enumerate(ask_levels):
+                ask_matrix[row][column] = volume
+        return x_values, levels, bid_matrix, ask_matrix
+
+    def _heatmap_extent(self, x_values: list[int], levels: list[int]) -> list[float]:
+        if not x_values:
+            return [0.5, 1.5, 0.5, len(levels) + 0.5]
+        if len(x_values) == 1:
+            left = x_values[0] - 0.5
+            right = x_values[0] + 0.5
+        else:
+            step_width = min(
+                abs(right - left) for left, right in zip(x_values, x_values[1:], strict=False)
+            )
+            left = x_values[0] - step_width / 2
+            right = x_values[-1] + step_width / 2
+        return [left, right, 0.5, len(levels) + 0.5]
+
+    def _heatmap_vmax(self, matrix: list[list[float]]) -> float:
+        values = sorted(value for row in matrix for value in row if value > 0)
+        if not values:
+            return 1.0
+        index = min(len(values) - 1, int(0.95 * (len(values) - 1)))
+        return max(values[index], 1e-12)
+
+    def _level_ticks(self, levels: list[int]) -> list[int]:
+        if len(levels) <= 6:
+            return levels
+        stride = max(1, len(levels) // 4)
+        ticks = [levels[0], *levels[stride - 1 :: stride]]
+        if ticks[-1] != levels[-1]:
+            ticks.append(levels[-1])
+        return sorted(set(ticks))
+
     def _plot_colors(self, style: str) -> dict[str, str]:
         if style == "market_wave_dark":
             return {
@@ -319,8 +625,12 @@ class Market:
                 "price": "#22d3ee",
                 "vwap": "#f472b6",
                 "volume": "#64748b",
-                "buy_imbalance": "#34d399",
-                "sell_imbalance": "#fb7185",
+                "buy_imbalance": "#fb7185",
+                "sell_imbalance": "#38bdf8",
+                "bid_depth_mid": "#7f1d1d",
+                "bid_depth": "#fb7185",
+                "ask_depth_mid": "#075985",
+                "ask_depth": "#38bdf8",
                 "zero": "#94a3b8",
             }
         return {
@@ -332,8 +642,12 @@ class Market:
             "price": "#2563eb",
             "vwap": "#9333ea",
             "volume": "#94a3b8",
-            "buy_imbalance": "#16a34a",
-            "sell_imbalance": "#dc2626",
+            "buy_imbalance": "#dc2626",
+            "sell_imbalance": "#2563eb",
+            "bid_depth_mid": "#fecaca",
+            "bid_depth": "#dc2626",
+            "ask_depth_mid": "#bfdbfe",
+            "ask_depth": "#2563eb",
             "zero": "#94a3b8",
         }
 
@@ -352,6 +666,7 @@ class Market:
 
     def _step_once(self) -> StepInfo:
         state = self.state
+        step_index = state.step_index + 1
         price_before = state.price
         self._age_state()
 
@@ -363,9 +678,16 @@ class Market:
         spread_before = self._spread(best_bid_before, best_ask_before)
         pre_imbalance = self._near_touch_imbalance(price_before)
 
+        self._active_regime = self._next_regime()
         latent = self._next_latent(state.latent)
         intensity = self._next_intensity(latent)
-        distributions = self._next_distributions(price_before, price_grid, latent)
+        distributions = self._next_distributions(
+            price_before,
+            price_grid,
+            latent,
+            step_index=step_index,
+            update_inertia=True,
+        )
 
         cancelled_volume = self._cancel_orders(price_before, latent)
         entry_limit_buy, entry_limit_sell = self._entry_limit_volumes(
@@ -441,7 +763,7 @@ class Market:
         self._last_execution_volume = stats.total_volume
 
         state_grid = self._price_grid(price_after)
-        state_distributions = self._next_distributions(price_after, state_grid, latent)
+        state_distributions = self._reproject_distributions(price_after, distributions)
         position_after = self._position_mass_from_cohorts(
             state_distributions.long_exit_pmf,
             state_distributions.short_exit_pmf,
@@ -478,21 +800,30 @@ class Market:
             self._single_price_volume(best_bid_before or price_before, residual_market_sell),
         )
         vwap = stats.notional / stats.total_volume if stats.total_volume > 0 else None
-        step_index = state.step_index + 1
         step_info = StepInfo(
             step_index=step_index,
             price_before=price_before,
             price_after=price_after,
             price_change=price_after - price_before,
+            tick_before=self.price_to_tick(price_before),
+            tick_after=self.price_to_tick(price_after),
+            tick_change=self.price_to_tick(price_after) - self.price_to_tick(price_before),
             intensity=intensity,
             mood=latent.mood,
             trend=latent.trend,
             volatility=latent.volatility,
+            regime=self._active_regime,
+            augmentation_strength=self.augmentation_strength,
             price_grid=price_grid,
+            relative_ticks=distributions.relative_ticks,
             buy_entry_pmf=distributions.buy_entry_pmf,
             sell_entry_pmf=distributions.sell_entry_pmf,
             long_exit_pmf=distributions.long_exit_pmf,
             short_exit_pmf=distributions.short_exit_pmf,
+            buy_entry_pmf_by_tick=distributions.buy_entry_pmf_by_tick,
+            sell_entry_pmf_by_tick=distributions.sell_entry_pmf_by_tick,
+            long_exit_pmf_by_tick=distributions.long_exit_pmf_by_tick,
+            short_exit_pmf_by_tick=distributions.short_exit_pmf_by_tick,
             buy_volume_by_price=buy_volume,
             sell_volume_by_price=sell_volume,
             entry_volume_by_price=entry_volume,
@@ -523,6 +854,8 @@ class Market:
         self.state = MarketState(
             price=price_after,
             step_index=step_index,
+            current_tick=self.price_to_tick(price_after),
+            tick_grid=self.relative_tick_grid(),
             intensity=intensity,
             latent=latent,
             price_grid=state_grid,
@@ -568,6 +901,18 @@ class Market:
             for offset in range(-self.grid_radius, self.grid_radius + 1)
         )
 
+    def price_to_tick(self, price: float) -> int:
+        return max(1, int(round(self._snap_price(price) / self.gap)))
+
+    def tick_to_price(self, tick: int) -> float:
+        return self._snap_price(max(1, int(tick)) * self.gap)
+
+    def relative_tick_grid(self) -> list[int]:
+        return list(range(-self.grid_radius, self.grid_radius + 1))
+
+    def _price_from_relative_tick(self, current_tick: int, relative_tick: int) -> float:
+        return self.tick_to_price(current_tick + relative_tick)
+
     def _snap_price(self, price: float) -> float:
         snapped = max(self._min_price, round(price / self.gap) * self.gap)
         return self._clean_number(snapped)
@@ -579,9 +924,11 @@ class Market:
         return rounded
 
     def _next_latent(self, latent: LatentState) -> LatentState:
+        regime = self._regime_settings(self._active_regime)
         mood_noise = self._rng.gauss(0.0, 0.13)
         trend_noise = self._rng.gauss(0.0, 0.08)
-        jump = self._rng.gauss(0.0, 0.55) if self._rng.random() < 0.018 else 0.0
+        jump_probability = 0.018 * regime["volatility"] * (1.0 + self.augmentation_strength)
+        jump = self._rng.gauss(0.0, 0.55) if self._rng.random() < jump_probability else 0.0
         signed_flow = 0.10 * self._last_imbalance + 0.035 * self._last_return_ticks
         anchor_pressure = self._clamp(
             (self._anchor_price - self.state.price) / (self.grid_radius * self.gap),
@@ -593,6 +940,7 @@ class Market:
             0.55 * latent.mood
             + 0.08 * latent.trend
             + signed_flow
+            + regime["mood"]
             + 0.12 * anchor_pressure
             + mood_noise
             + 0.25 * jump,
@@ -603,6 +951,7 @@ class Market:
             0.58 * latent.trend
             + 0.08 * mood
             + 0.04 * self._last_return_ticks
+            + regime["trend"]
             + 0.10 * anchor_pressure
             + trend_noise,
             -1.0,
@@ -611,14 +960,22 @@ class Market:
         shock = abs(mood_noise) + abs(jump) * 0.75
         realized = 0.12 * self._last_abs_return_ticks + 0.025 * self._last_execution_volume
         volatility = self._clamp(
-            0.78 * latent.volatility + shock + realized + 0.03 * abs(self._last_imbalance),
+            0.78 * latent.volatility
+            + shock
+            + realized
+            + 0.03 * abs(self._last_imbalance)
+            + regime["volatility_bias"],
             0.04,
             2.2,
         )
         return LatentState(mood=mood, trend=trend, volatility=volatility)
 
     def _next_intensity(self, latent: LatentState) -> IntensityState:
-        total = self.popularity * (1.0 + 2.2 * latent.volatility)
+        regime = self._regime_settings(self._active_regime)
+        augmentation = 1.0 + self.augmentation_strength * self._rng.uniform(-0.18, 0.28)
+        total = (
+            self.popularity * (1.0 + 2.2 * latent.volatility) * regime["intensity"] * augmentation
+        )
         buy_ratio = self._clamp(
             0.5 + 0.18 * latent.mood + 0.12 * latent.trend + 0.06 * self._last_imbalance,
             0.12,
@@ -638,48 +995,80 @@ class Market:
         price: float,
         price_grid: list[float],
         latent: LatentState,
+        *,
+        step_index: int,
+        update_inertia: bool,
     ) -> DistributionState:
-        spread_base = self.gap * (1.0 + 5.5 * latent.volatility)
-        trend_shift = latent.trend * self.gap * (2.5 + 3.0 * latent.volatility)
-        mood_shift = latent.mood * self.gap * 2.0
-
-        buy_entry = DiscreteMixtureDistribution(
-            (
-                MixtureComponent(
-                    0.72 + max(latent.mood, 0.0) * 0.18,
-                    price - self.gap + trend_shift,
-                    spread_base,
-                ),
-                MixtureComponent(0.28, price - 4 * self.gap + mood_shift, spread_base * 1.8),
-            )
-        ).pmf(price_grid)
-        sell_entry = DiscreteMixtureDistribution(
-            (
-                MixtureComponent(
-                    0.72 + max(-latent.mood, 0.0) * 0.18,
-                    price + self.gap + trend_shift,
-                    spread_base,
-                ),
-                MixtureComponent(0.28, price + 4 * self.gap + mood_shift, spread_base * 1.8),
-            )
-        ).pmf(price_grid)
-        long_exit = DiscreteMixtureDistribution(
-            (
-                MixtureComponent(0.58, price + self.gap * 3.0, spread_base * 1.2),
-                MixtureComponent(0.42, price - self.gap * 2.0, spread_base * 1.1),
-            )
-        ).pmf(price_grid)
-        short_exit = DiscreteMixtureDistribution(
-            (
-                MixtureComponent(0.58, price - self.gap * 3.0, spread_base * 1.2),
-                MixtureComponent(0.42, price + self.gap * 2.0, spread_base * 1.1),
-            )
-        ).pmf(price_grid)
+        del price_grid
+        relative_ticks = self.relative_tick_grid()
+        context = DistributionContext(
+            current_price=price,
+            current_tick=self.price_to_tick(price),
+            tick_size=self.gap,
+            mood=latent.mood,
+            trend=latent.trend,
+            volatility=latent.volatility * self._regime_settings(self._active_regime)["spread"],
+            regime=self._active_regime,
+            augmentation_strength=self.augmentation_strength,
+            step_index=step_index,
+            rng=self._rng,
+        )
+        buy_entry_ticks = self._smooth_tick_pmf(
+            "buy_entry",
+            self.distribution_model.pmf("buy", "entry", relative_ticks, context),
+            update_inertia=update_inertia,
+        )
+        sell_entry_ticks = self._smooth_tick_pmf(
+            "sell_entry",
+            self.distribution_model.pmf("sell", "entry", relative_ticks, context),
+            update_inertia=update_inertia,
+        )
+        long_exit_ticks = self._smooth_tick_pmf(
+            "long_exit",
+            self.distribution_model.pmf("long", "exit", relative_ticks, context),
+            update_inertia=update_inertia,
+        )
+        short_exit_ticks = self._smooth_tick_pmf(
+            "short_exit",
+            self.distribution_model.pmf("short", "exit", relative_ticks, context),
+            update_inertia=update_inertia,
+        )
+        buy_entry = self._project_tick_pmf(context.current_tick, buy_entry_ticks)
+        sell_entry = self._project_tick_pmf(context.current_tick, sell_entry_ticks)
+        long_exit = self._project_tick_pmf(context.current_tick, long_exit_ticks)
+        short_exit = self._project_tick_pmf(context.current_tick, short_exit_ticks)
         return DistributionState(
             buy_entry_pmf=buy_entry,
             sell_entry_pmf=sell_entry,
             long_exit_pmf=long_exit,
             short_exit_pmf=short_exit,
+            relative_ticks=relative_ticks,
+            buy_entry_pmf_by_tick=buy_entry_ticks,
+            sell_entry_pmf_by_tick=sell_entry_ticks,
+            long_exit_pmf_by_tick=long_exit_ticks,
+            short_exit_pmf_by_tick=short_exit_ticks,
+        )
+
+    def _reproject_distributions(
+        self,
+        price: float,
+        distributions: DistributionState,
+    ) -> DistributionState:
+        current_tick = self.price_to_tick(price)
+        return DistributionState(
+            buy_entry_pmf=self._project_tick_pmf(current_tick, distributions.buy_entry_pmf_by_tick),
+            sell_entry_pmf=self._project_tick_pmf(
+                current_tick, distributions.sell_entry_pmf_by_tick
+            ),
+            long_exit_pmf=self._project_tick_pmf(current_tick, distributions.long_exit_pmf_by_tick),
+            short_exit_pmf=self._project_tick_pmf(
+                current_tick, distributions.short_exit_pmf_by_tick
+            ),
+            relative_ticks=list(distributions.relative_ticks),
+            buy_entry_pmf_by_tick=dict(distributions.buy_entry_pmf_by_tick),
+            sell_entry_pmf_by_tick=dict(distributions.sell_entry_pmf_by_tick),
+            long_exit_pmf_by_tick=dict(distributions.long_exit_pmf_by_tick),
+            short_exit_pmf_by_tick=dict(distributions.short_exit_pmf_by_tick),
         )
 
     def _entry_limit_volumes(
@@ -704,6 +1093,54 @@ class Market:
         }
         return self._drop_zeroes(buy), self._drop_zeroes(sell)
 
+    def _smooth_tick_pmf(
+        self, key: str, values: list[float], *, update_inertia: bool
+    ) -> dict[int, float]:
+        ticks = self.relative_tick_grid()
+        normalized = self._normalize_list(values, len(ticks))
+        fresh = {tick: probability for tick, probability in zip(ticks, normalized, strict=False)}
+        previous = self._previous_tick_pmfs.get(key)
+        if previous is None or self.pmf_inertia <= 0:
+            smoothed = fresh
+        else:
+            inertia = self.pmf_inertia
+            smoothed = {
+                tick: inertia * previous.get(tick, 0.0) + (1.0 - inertia) * fresh[tick]
+                for tick in ticks
+            }
+            smoothed = self._normalize_tick_map(smoothed)
+        if update_inertia:
+            self._previous_tick_pmfs[key] = smoothed
+        return smoothed
+
+    def _project_tick_pmf(self, current_tick: int, pmf_by_tick: dict[int, float]) -> PriceMap:
+        projected: PriceMap = {}
+        for relative_tick, probability in pmf_by_tick.items():
+            price = self._price_from_relative_tick(current_tick, relative_tick)
+            projected[price] = projected.get(price, 0.0) + probability
+        total = sum(projected.values())
+        if total <= 0:
+            return {}
+        return self._drop_zeroes(
+            {price: probability / total for price, probability in projected.items()}
+        )
+
+    def _normalize_list(self, values: list[float], expected_length: int) -> list[float]:
+        if len(values) != expected_length:
+            raise ValueError("distribution_model.pmf must return one probability per relative tick")
+        cleaned = [value if isfinite(value) and value > 0 else 0.0 for value in values]
+        total = sum(cleaned)
+        if total <= 0:
+            return [1.0 / expected_length for _ in range(expected_length)]
+        return [value / total for value in cleaned]
+
+    def _normalize_tick_map(self, values: dict[int, float]) -> dict[int, float]:
+        total = sum(max(0.0, value) for value in values.values())
+        if total <= 0:
+            uniform = 1.0 / len(values)
+            return {tick: uniform for tick in values}
+        return {tick: max(0.0, value) / total for tick, value in values.items()}
+
     def _market_entry_volumes(
         self,
         intensity: IntensityState,
@@ -726,7 +1163,9 @@ class Market:
         )
 
     def _taker_share(self, latent: LatentState, imbalance: float) -> float:
-        return self._clamp(0.10 + 0.06 * latent.volatility + 0.05 * abs(imbalance), 0.08, 0.38)
+        regime = self._regime_settings(self._active_regime)
+        base = 0.10 + 0.06 * latent.volatility + 0.05 * abs(imbalance)
+        return self._clamp(base * regime["taker"], 0.08, 0.55)
 
     def _exit_flow(
         self,
@@ -774,6 +1213,7 @@ class Market:
         return market_volume, self._drop_zeroes(limit_map)
 
     def _cancel_orders(self, current_price: float, latent: LatentState) -> PriceMap:
+        regime = self._regime_settings(self._active_regime)
         cancelled: PriceMap = {}
         for lots_by_price in (self._bid_lots, self._ask_lots):
             for price, lots in list(lots_by_price.items()):
@@ -781,7 +1221,8 @@ class Market:
                 distance = abs(price - current_price) / self.gap
                 for lot in lots:
                     probability = self._clamp(
-                        0.025 + 0.018 * lot.age + 0.012 * distance + 0.035 * latent.volatility,
+                        (0.025 + 0.018 * lot.age + 0.012 * distance + 0.035 * latent.volatility)
+                        * regime["cancel"],
                         0.02,
                         0.70,
                     )
@@ -804,7 +1245,8 @@ class Market:
         latent: LatentState,
         imbalance: float,
     ) -> None:
-        base = self.popularity * (0.18 + 0.20 / (1.0 + latent.volatility))
+        regime = self._regime_settings(self._active_regime)
+        base = self.popularity * (0.18 + 0.20 / (1.0 + latent.volatility)) * regime["liquidity"]
         for level in range(1, min(7, self.grid_radius + 1)):
             shape = base / (level**1.35)
             bid_volume = shape * self._clamp(1.0 - 0.25 * imbalance, 0.55, 1.45)

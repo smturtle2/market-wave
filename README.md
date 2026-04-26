@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Aggregate market intent simulation with discrete mixture distributions.</strong>
+  <strong>Fast, lightweight synthetic market data from relative-tick intent PMFs.</strong>
 </p>
 
 <p align="center">
@@ -19,10 +19,11 @@
   English | <a href="README.ko.md">한국어</a>
 </p>
 
-`market-wave` is a Python library for simulating market-wide entry and exit intent
-without creating individual participants. It models aggregate buy/sell pressure,
-position exits, order-book depth, cancellations, taker flow, and execution-driven
-price movement on a discrete price grid.
+`market-wave` is a Python library for generating synthetic market paths from
+market-wide entry and exit intent. It does not create individual participants.
+Instead, it models aggregate buy/sell pressure, position exits, order-book depth,
+cancellations, taker flow, and execution-driven price movement from probability
+mass over relative ticks.
 
 It is not a forecasting model. It is a lightweight simulation primitive for
 experiments, visualization, teaching, and strategy-environment prototyping.
@@ -30,10 +31,16 @@ experiments, visualization, teaching, and strategy-environment prototyping.
 ## Why market-wave?
 
 - **Aggregate intent, not agents**: market participants are represented by
-  probability mass over price, not by individual objects.
-- **Discrete mixture distributions**: entry and exit pressure are PMFs on the
-  current price grid.
+  probability mass over relative ticks, not by individual objects.
+- **Relative tick PMFs**: entry and exit pressure are modeled as
+  `P(relative_tick)`, then projected onto the current price grid.
+- **Pluggable distributions**: swap only the PMF generator with
+  `LaplaceMixturePMF`, `SkewedPMF`, `FatTailPMF`, `NoisyPMF`, or a custom model.
+- **Separated shape and size**: PMFs decide where intent sits; intensity decides
+  how much order flow appears.
 - **Execution-driven prices**: prices stay flat unless trades execute.
+- **Batch generation**: generate many reproducible synthetic paths without
+  keeping every path in `market.history`.
 - **Inspectable state**: every step returns a `StepInfo` snapshot with PMFs,
   volumes, order book state, position mass, VWAP, spread, and imbalance.
 - **Built-in plotting**: `matplotlib` is included, with a clean light chart style
@@ -60,7 +67,14 @@ Python `>=3.10` is supported.
 ```python
 from market_wave import Market
 
-market = Market(initial_price=10_000, gap=10, popularity=1.0, seed=42)
+market = Market(
+    initial_price=10_000,
+    gap=10,
+    popularity=1.0,
+    seed=42,
+    regime="auto",
+    augmentation_strength=0.25,
+)
 steps = market.step(500)
 
 last = steps[-1]
@@ -74,17 +88,26 @@ print("residual flow:", round(last.residual_market_buy_volume, 3), round(last.re
 `Market.step(n)` always returns `list[StepInfo]` and appends the same objects to
 `market.history`.
 
+For high-volume generation, skip in-memory history:
+
+```python
+steps = market.step(512, keep_history=False)
+
+for step in market.stream(512, keep_history=False):
+    consume(step)
+```
+
 For simple export workflows, use `step.to_dict()`, `step.to_json()`, or
 `market.history_records()`.
 
 Example output with `seed=42`:
 
 ```text
-10010.0 -> 10000.0
-executed: 0.578
-imbalance: -0.046
-crossed flow: 0.394
-residual flow: 0.07 0.115
+10030.0 -> 10030.0
+executed: 1.03
+imbalance: 0.054
+crossed flow: 0.693
+residual flow: 0.215 0.122
 ```
 
 ## Smoke Matrix
@@ -115,10 +138,10 @@ for name, kwargs, steps_count in cases:
 Recent verification on the current implementation:
 
 ```text
-baseline   range=10000.0-10030.0 moves=232 exec_steps=500 final=10000.0
-busy       range= 9990.0-10070.0 moves=242 exec_steps=500 final=10050.0
-thin       range=  495.0-505.0   moves=224 exec_steps=500 final=  500.0
-low_price  range=    1.0-2.0     moves=237 exec_steps=500 final=    2.0
+baseline   range= 9930.0-10010.0 moves=235 exec_steps=500 final= 9950.0
+busy       range= 9920.0-10010.0 moves=248 exec_steps=500 final= 9950.0
+thin       range=  470.0-500.0   moves=242 exec_steps=500 final=  475.0
+low_price  range=    1.0-3.0     moves=236 exec_steps=500 final=    1.0
 inactive   range=  100.0-100.0   moves=  0 exec_steps=  0 final=  100.0
 ```
 
@@ -139,25 +162,85 @@ fig, ax = market.plot(last=180)
 ```
 
 <p align="center">
-  <img src="docs/assets/market-wave-plot.png" alt="market-wave light pyplot chart showing price, volume, and imbalance" />
+  <img src="docs/assets/market-wave-plot.png" alt="market-wave light pyplot chart showing price, orderbook depth heatmaps, volume, and imbalance" />
 </p>
 
-The default `market_wave` style uses a light three-panel chart: price/VWAP,
-executed volume, and order-flow imbalance. Dark overlay mode is still available:
+The default `market_wave` style uses a light multi-panel chart: price/VWAP,
+bid and ask orderbook depth heatmaps by simple level, executed volume, and
+order-flow imbalance. To keep the legacy three-panel view, pass
+`orderbook=False`.
+
+Dark overlay mode is still available:
 
 ```python
 fig, ax = market.plot(layout="overlay", style="market_wave_dark")
 ```
 
-## Core Concepts
+## Synthetic Data
 
-At every step, the market builds a price grid around the current price:
+```python
+from market_wave import compute_metrics, generate_paths
 
-```text
-price_grid = current_price +/- k * gap
+paths = generate_paths(
+    n_paths=100,
+    horizon=512,
+    config_sampler=lambda path_id: {
+        "initial_price": 10_000,
+        "gap": 10,
+        "popularity": 1.0,
+        "seed": 10_000 + path_id,
+        "regime": "auto",
+        "augmentation_strength": 0.35,
+    },
+)
+
+metrics = compute_metrics(paths)
+print(metrics.return_std, metrics.volume_mean, metrics.max_drawdown)
+print(paths[0].metadata.config_hash)
 ```
 
-The simulator maintains four probability mass functions on that grid:
+`GeneratedPath.metadata` stores `seed`, `config_hash`, package `version`,
+`regime`, and `augmentation_strength` so synthetic runs can be traced. Pandas is
+optional: install `market-wave[dataframe]` to use `to_dataframe()`.
+
+## Pluggable PMFs
+
+```python
+from market_wave import FatTailPMF, Market, NoisyPMF
+
+market = Market(
+    initial_price=100,
+    gap=1,
+    distribution_model=NoisyPMF(FatTailPMF()),
+    augmentation_strength=0.5,
+    seed=7,
+)
+
+step = market.step(1)[0]
+print(step.relative_ticks)
+print(step.buy_entry_pmf_by_tick)
+```
+
+Custom models only need one method:
+
+```python
+class MyPMF:
+    def pmf(self, side, intent, relative_ticks, context):
+        weights = [1.0 / (1.0 + abs(tick)) for tick in relative_ticks]
+        total = sum(weights)
+        return [weight / total for weight in weights]
+```
+
+## Core Concepts
+
+At every step, the market builds relative ticks around the current price:
+
+```text
+relative_tick = (price - current_price) / tick_size
+relative_ticks = [-grid_radius, ..., 0, ..., +grid_radius]
+```
+
+The simulator maintains four probability mass functions on that relative grid:
 
 - `buy_entry_pmf`
 - `sell_entry_pmf`
@@ -167,13 +250,20 @@ The simulator maintains four probability mass functions on that grid:
 Each PMF is a normalized discrete mixture:
 
 ```text
-pmf[x] = sum(component_weight * kernel(x, center_price, spread))
-kernel(x, center, spread) proportional to exp(-abs(x - center) / spread)
+pmf[tick] = sum(component_weight * kernel(tick, center_tick, spread_ticks))
+kernel(tick, center, spread) proportional to exp(-abs(tick - center) / spread)
 ```
 
-The PMFs generate aggregate intent. The order book and execution layer then turn
-that intent into limit flow, taker flow, cancellations, exits, matched volume, and
-price changes.
+Those relative PMFs are projected onto `price_grid = current_price +/- k * gap`
+for order-book formation. `pmf_inertia` keeps intent from jumping abruptly:
+
+```text
+pmf_t = pmf_inertia * pmf_prev + (1 - pmf_inertia) * pmf_new
+```
+
+PMFs generate aggregate intent. Intensity controls total size. The order book and
+execution layer then turn that intent into limit flow, taker flow, cancellations,
+exits, matched volume, and price changes.
 
 ## Execution Guarantee
 
@@ -192,6 +282,12 @@ This is a simulator, not a market data replay engine and not financial advice.
 ```python
 from market_wave import (
     Market,
+    LaplaceMixturePMF,
+    SkewedPMF,
+    FatTailPMF,
+    NoisyPMF,
+    generate_paths,
+    compute_metrics,
     MarketState,
     IntensityState,
     LatentState,
@@ -207,7 +303,9 @@ from market_wave import (
 Useful `StepInfo` fields include:
 
 - `price_before`, `price_after`, `price_change`
+- `tick_before`, `tick_after`, `tick_change`, `relative_ticks`
 - `buy_entry_pmf`, `sell_entry_pmf`, `long_exit_pmf`, `short_exit_pmf`
+- `buy_entry_pmf_by_tick`, `sell_entry_pmf_by_tick`
 - `buy_volume_by_price`, `sell_volume_by_price`
 - `executed_volume_by_price`, `total_executed_volume`, `trade_count`
 - `market_buy_volume`, `market_sell_volume`, `crossed_market_volume`

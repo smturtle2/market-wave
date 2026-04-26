@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "market-wave"
-version = "0.1.1"
+version = "0.1.2"
 description = "Discrete mixture distribution market intent simulator"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,6 +28,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dataframe = [
+  "pandas>=2",
+]
 dev = [
   "pytest>=8",
   "ruff>=0.5",
