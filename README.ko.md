@@ -50,6 +50,12 @@ relative tick 위의 확률질량으로 다룹니다.
 pip install market-wave
 ```
 
+dataframe export가 필요하면:
+
+```bash
+pip install "market-wave[dataframe]"
+```
+
 로컬 개발:
 
 ```bash
@@ -206,6 +212,8 @@ print(paths[0].metadata.config_hash)
 `GeneratedPath.metadata`에는 `seed`, `config_hash`, package `version`, `regime`,
 `augmentation_strength`가 저장되어 synthetic run을 추적할 수 있습니다. Pandas는
 optional입니다. `to_dataframe()`을 쓰려면 `market-wave[dataframe]`으로 설치하세요.
+`ValidationMetrics.volatility_clustering_score`는 각 generated path 내부에서 계산한 뒤
+집계하므로 독립 path 사이의 경계가 diagnostic에 섞이지 않습니다.
 
 ## 교체 가능한 MDF
 
@@ -330,10 +338,15 @@ from market_wave import (
 예시와 public API는 MDF 이름만 사용합니다. 초기 prototype의 오래된 PMF 예시는
 obsolete로 보아야 합니다.
 
+API 안정성: 현재 alpha line에서 `Market`, `generate_paths`, `compute_metrics`,
+export된 MDF model type, export된 state dataclass 이름은 stable public surface로 봅니다.
+`StepInfo`와 state mapping은 plain snapshot container입니다. 기존 필드는 가능한 한
+호환성을 유지하지만, alpha release 중 새 diagnostic field가 추가될 수 있습니다.
+
 ## 개발
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra dataframe
 uv run ruff check .
 uv run pytest
 uv build

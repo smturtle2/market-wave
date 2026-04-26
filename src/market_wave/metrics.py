@@ -49,7 +49,8 @@ class ValidationMetrics:
             import pandas as pd
         except ImportError as exc:
             raise ImportError(
-                "ValidationMetrics.to_dataframe() requires pandas; install pandas to use it"
+                "ValidationMetrics.to_dataframe() requires pandas; "
+                "install market-wave[dataframe] to use it"
             ) from exc
         return pd.DataFrame.from_records([self.to_dict()])
 
@@ -61,7 +62,9 @@ def compute_metrics(paths: Iterable[GeneratedPath]) -> ValidationMetrics:
     price_changes = [step.price_change for step in steps]
     tick_returns = [float(step.tick_change) for step in steps]
     abs_price_changes = [abs(change) for change in price_changes]
-    abs_tick_returns = [abs(value) for value in tick_returns]
+    abs_tick_returns_by_path = [
+        [abs(float(step.tick_change)) for step in path.steps] for path in path_list
+    ]
     executed_volumes = [step.total_executed_volume for step in steps]
     trade_counts = [float(step.trade_count) for step in steps]
     imbalances = [step.order_flow_imbalance for step in steps]
@@ -83,7 +86,7 @@ def compute_metrics(paths: Iterable[GeneratedPath]) -> ValidationMetrics:
         return_tail_ratio=_tail_ratio(tick_returns, return_std),
         volume_mean=volume_mean,
         volume_std=_population_stddev(executed_volumes),
-        volatility_clustering_score=_lag1_correlation(abs_tick_returns),
+        volatility_clustering_score=_path_weighted_lag1_correlation(abs_tick_returns_by_path),
         max_drawdown=max(drawdowns) if drawdowns else 0.0,
         price_move_ratio=_rate(abs(value) > 1e-12 for value in tick_returns),
         zero_volume_ratio=_rate(volume <= 1e-12 for volume in executed_volumes),
@@ -142,6 +145,18 @@ def _tail_ratio(values: Sequence[float], stddev: float) -> float:
         return 0.0
     threshold = 2.0 * stddev
     return sum(abs(value) >= threshold for value in values) / len(values)
+
+
+def _path_weighted_lag1_correlation(paths: Sequence[Sequence[float]]) -> float:
+    weighted_total = 0.0
+    total_pairs = 0
+    for values in paths:
+        if len(values) < 3:
+            continue
+        pair_count = max(0, len(values) - 1)
+        weighted_total += _lag1_correlation(values) * pair_count
+        total_pairs += pair_count
+    return weighted_total / total_pairs if total_pairs else 0.0
 
 
 def _lag1_correlation(values: Sequence[float]) -> float:

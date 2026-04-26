@@ -303,6 +303,8 @@ class Market:
         include_orderbook = layout == "panel" if orderbook is None else orderbook
         if layout == "overlay" and include_orderbook:
             raise ValueError("orderbook heatmap is only supported with layout='panel'")
+        if ax is not None and layout == "panel":
+            raise ValueError("ax is only supported with layout='overlay'")
 
         import matplotlib.pyplot as plt
 

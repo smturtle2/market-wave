@@ -69,7 +69,8 @@ class GeneratedPath:
             import pandas as pd
         except ImportError as exc:
             raise ImportError(
-                "GeneratedPath.to_dataframe() requires pandas; install pandas to use it"
+                "GeneratedPath.to_dataframe() requires pandas; "
+                "install market-wave[dataframe] to use it"
             ) from exc
         return pd.DataFrame.from_records(self.to_records())
 

@@ -634,6 +634,7 @@ def test_mdf_update_accumulates_previous_distribution_state():
     assert second.buy_entry_mdf[1] > second.buy_entry_mdf[-1]
 
 
+@pytest.mark.slow
 def test_dynamic_mdf_acceptance_does_not_collapse_for_default_temperature_seed_matrix():
     peak_ticks = []
     for seed in range(10, 20):
@@ -791,6 +792,7 @@ def test_market_rejects_non_positive_or_non_finite_inputs():
         Market(initial_price=100.0, gap=1.0, popularity=math.inf)
 
 
+@pytest.mark.slow
 def test_low_price_markets_do_not_print_zero_or_negative_prices():
     market = Market(initial_price=1.0, gap=1.0, popularity=2.0, seed=17, grid_radius=8)
 
@@ -801,6 +803,7 @@ def test_low_price_markets_do_not_print_zero_or_negative_prices():
     assert min(market.state.price_grid) >= market.gap
 
 
+@pytest.mark.slow
 def test_realism_seeded_determinism_is_tolerant_for_longer_runs():
     left = Market(initial_price=100.0, gap=0.5, popularity=1.4, seed=2024, grid_radius=12)
     right = Market(initial_price=100.0, gap=0.5, popularity=1.4, seed=2024, grid_radius=12)
@@ -812,6 +815,7 @@ def test_realism_seeded_determinism_is_tolerant_for_longer_runs():
     assert _freeze(_state_from_market(left)) == _freeze(_state_from_market(right))
 
 
+@pytest.mark.slow
 def test_realism_orderbook_stays_bounded_over_long_simulation():
     market = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=77, grid_radius=16)
     max_depth = 0.0
@@ -831,6 +835,7 @@ def test_realism_orderbook_stays_bounded_over_long_simulation():
     assert max_depth <= 1000.0 * max(1.0, market.popularity)
 
 
+@pytest.mark.slow
 def test_realism_position_mass_remains_nonnegative_over_long_simulation():
     market = Market(initial_price=100.0, gap=1.0, popularity=1.3, seed=88, grid_radius=14)
 
@@ -843,6 +848,7 @@ def test_realism_position_mass_remains_nonnegative_over_long_simulation():
                 )
 
 
+@pytest.mark.slow
 def test_realism_price_moves_over_thousand_steps():
     market = Market(initial_price=100.0, gap=1.0, popularity=1.1, seed=99, grid_radius=16)
     steps = _realism_steps_or_skip(market, 1000)
@@ -854,6 +860,7 @@ def test_realism_price_moves_over_thousand_steps():
     assert sum(1 for change in changes if abs(change) > 1e-12) >= 3
 
 
+@pytest.mark.slow
 def test_realism_price_path_moves_without_overly_periodic_returns():
     market = Market(initial_price=100.0, gap=1.0, popularity=1.2, seed=2026, grid_radius=16)
     steps = _realism_steps_or_skip(market, 1500)
@@ -868,6 +875,7 @@ def test_realism_price_path_moves_without_overly_periodic_returns():
     assert max(abs(value) for value in lag_correlations) < 0.85
 
 
+@pytest.mark.slow
 def test_realism_volatility_clustering_diagnostic_is_positiveish():
     correlations = []
     follower_ratios = []
@@ -895,6 +903,7 @@ def test_realism_volatility_clustering_diagnostic_is_positiveish():
     assert sum(follower_ratios) / len(follower_ratios) >= 0.9
 
 
+@pytest.mark.slow
 def test_realism_imbalance_sign_matches_flow_and_price_direction_tolerantly():
     market = Market(initial_price=100.0, gap=1.0, popularity=1.5, seed=987, grid_radius=16)
     steps = _realism_steps_or_skip(market, 1000)
@@ -917,6 +926,7 @@ def test_realism_imbalance_sign_matches_flow_and_price_direction_tolerantly():
         )
 
 
+@pytest.mark.slow
 def test_realism_price_path_is_not_overly_periodic():
     market = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=42, grid_radius=16)
     steps = _realism_steps_or_skip(market, 500)

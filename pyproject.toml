@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "market-wave"
-version = "0.2.0"
+version = "0.2.1"
 description = "Dynamic MDF synthetic market data generator"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,6 +22,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
 ]
 dependencies = [
   "matplotlib>=3.8",
@@ -32,6 +33,7 @@ dataframe = [
   "pandas>=2",
 ]
 dev = [
+  "pandas>=2",
   "pytest>=8",
   "ruff>=0.5",
 ]
@@ -45,6 +47,10 @@ packages = ["src/market_wave"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = ["-m", "not slow"]
+markers = [
+  "slow: long-running realism and stress tests",
+]
 
 [tool.ruff]
 line-length = 100

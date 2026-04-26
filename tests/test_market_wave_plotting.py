@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import matplotlib
 import pytest
 from matplotlib.axes import Axes
@@ -161,6 +159,19 @@ def test_plot_history_overlay_layout_keeps_single_primary_axes_contract():
         assert all(_axes_same_position(ax, other) for other in fig.axes if other is not ax)
         assert any(length == len(market.history) for length in _line_lengths(ax))
         assert not any(axis.images for axis in fig.axes)
+    finally:
+        _close(fig)
+
+
+def test_plot_history_rejects_panel_layout_with_existing_axes():
+    from matplotlib import pyplot as plt
+
+    market = _market_with_history(2)
+    fig, ax = plt.subplots()
+
+    try:
+        with pytest.raises(ValueError, match="ax.*layout='overlay'"):
+            market.plot_history(ax=ax, layout="panel")
     finally:
         _close(fig)
 

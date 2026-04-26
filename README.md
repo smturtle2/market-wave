@@ -52,6 +52,12 @@ experiments, visualization, teaching, and strategy-environment prototyping.
 pip install market-wave
 ```
 
+For dataframe export:
+
+```bash
+pip install "market-wave[dataframe]"
+```
+
 For local development:
 
 ```bash
@@ -209,6 +215,8 @@ print(paths[0].metadata.config_hash)
 `GeneratedPath.metadata` stores `seed`, `config_hash`, package `version`,
 `regime`, and `augmentation_strength` so synthetic runs can be traced. Pandas is
 optional: install `market-wave[dataframe]` to use `to_dataframe()`.
+`ValidationMetrics.volatility_clustering_score` is computed within each generated
+path and aggregated, so independent path boundaries do not affect the diagnostic.
 
 ## Pluggable MDF
 
@@ -332,10 +340,16 @@ The `*_mdf_by_price` fields are pre-trade MDF projections keyed by
 post-trade state price. Examples and public APIs use MDF names only; stale PMF
 examples from earlier prototypes should be considered obsolete.
 
+API stability: `Market`, `generate_paths`, `compute_metrics`, the exported MDF
+model types, and the exported state dataclass names are the stable public surface
+for the current alpha line. `StepInfo` and state mappings are plain snapshot
+containers; their existing fields are kept compatible where practical, but new
+diagnostic fields may be added during alpha releases.
+
 ## Development
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra dataframe
 uv run ruff check .
 uv run pytest
 uv build

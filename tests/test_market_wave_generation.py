@@ -1,10 +1,36 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from market_wave import GeneratedPath, Market, ValidationMetrics, compute_metrics, generate_paths
+
+
+def _metric_path(tick_changes):
+    steps = []
+    price = 100.0
+    for index, tick_change in enumerate(tick_changes, start=1):
+        price_after = price + tick_change
+        steps.append(
+            SimpleNamespace(
+                step_index=index,
+                price_before=price,
+                price_after=price_after,
+                price_change=tick_change,
+                tick_change=tick_change,
+                total_executed_volume=1.0,
+                trade_count=1,
+                order_flow_imbalance=0.0,
+            )
+        )
+        price = price_after
+    return SimpleNamespace(
+        steps=tuple(steps),
+        final_price=price,
+        metadata=SimpleNamespace(initial_price=100.0),
+    )
 
 
 def test_generate_paths_returns_batch_of_generated_paths():
@@ -184,6 +210,23 @@ def test_compute_metrics_summarizes_paths():
     assert json.loads(metrics.to_json())["path_count"] == 3
 
 
+def test_compute_metrics_volatility_clustering_ignores_path_boundaries():
+    paths = [
+        _metric_path([1.0, 2.0, 3.0]),
+        _metric_path([9.0, 8.0, 7.0]),
+    ]
+
+    metrics = compute_metrics(paths)
+
+    assert metrics.volatility_clustering_score == pytest.approx(1.0)
+
+
+def test_compute_metrics_volatility_clustering_handles_short_paths():
+    metrics = compute_metrics([_metric_path([1.0]), _metric_path([])])
+
+    assert metrics.volatility_clustering_score == 0.0
+
+
 def test_compute_metrics_handles_empty_input():
     metrics = compute_metrics([])
 
@@ -197,6 +240,25 @@ def test_compute_metrics_handles_empty_input():
     assert metrics.mean_final_price is None
     assert metrics.min_price is None
     assert metrics.max_price is None
+
+
+def test_to_dataframe_errors_name_dataframe_extra(monkeypatch):
+    real_import = __import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "pandas":
+            raise ImportError("blocked pandas")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    path = generate_paths(1, 1)[0]
+    metrics = compute_metrics([path])
+
+    with pytest.raises(ImportError, match=r"market-wave\[dataframe\]"):
+        path.to_dataframe()
+    with pytest.raises(ImportError, match=r"market-wave\[dataframe\]"):
+        metrics.to_dataframe()
 
 
 def test_generation_validates_inputs():
