@@ -26,6 +26,27 @@ PUBLIC_TYPE_EXPORTS = (
     "StepInfo",
 )
 
+PUBLIC_CONTRACT_EXPORTS = (
+    "DynamicMDFModel",
+    "GeneratedPath",
+    "GenerationMetadata",
+    "IntensityState",
+    "LatentState",
+    "MDFContext",
+    "MDFModel",
+    "MDFSignals",
+    "MDFState",
+    "Market",
+    "MarketState",
+    "OrderBookState",
+    "PositionMassState",
+    "RelativeMDFComponent",
+    "StepInfo",
+    "ValidationMetrics",
+    "compute_metrics",
+    "generate_paths",
+)
+
 REMOVED_PUBLIC_PMF_EXPORTS = (
     "DistributionModel",
     "DistributionState",
@@ -351,10 +372,38 @@ def test_public_api_exports_expected_types():
     assert all(isinstance(getattr(mw, name), type) for name in PUBLIC_TYPE_EXPORTS)
 
 
+def test_public_api_contract_exports_are_inventoried():
+    assert tuple(mw.__all__) == PUBLIC_CONTRACT_EXPORTS
+
+
 def test_public_api_removes_dynamic_pmf_exports():
     leaked = [name for name in REMOVED_PUBLIC_PMF_EXPORTS if hasattr(mw, name)]
 
     assert not leaked, "Dynamic PMF names should not remain public: " + ", ".join(leaked)
+
+
+def test_state_snapshots_are_attribute_frozen_but_nested_containers_are_plain_mutable():
+    market = Market(initial_price=100.0, gap=1.0, seed=107, grid_radius=4)
+    step = market.step(1)[0]
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        step.price_after = 0.0
+
+    step.buy_entry_mdf[0] = 0.0
+
+    assert step.buy_entry_mdf[0] == 0.0
+
+
+def test_market_snapshot_returns_mutation_safe_copy_of_current_state():
+    market = Market(initial_price=100.0, gap=1.0, seed=109, grid_radius=4)
+    market.step(3)
+
+    snapshot = market.snapshot()
+    snapshot.mdf.buy_entry_mdf[0] = 0.0
+    snapshot.price_grid.clear()
+
+    assert market.state.mdf.buy_entry_mdf[0] > 0.0
+    assert market.state.price_grid
 
 
 def test_distribution_mdfs_are_normalized_from_initial_market_state():

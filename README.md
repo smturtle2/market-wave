@@ -340,11 +340,28 @@ The `*_mdf_by_price` fields are pre-trade MDF projections keyed by
 post-trade state price. Examples and public APIs use MDF names only; stale PMF
 examples from earlier prototypes should be considered obsolete.
 
-API stability: `Market`, `generate_paths`, `compute_metrics`, the exported MDF
-model types, and the exported state dataclass names are the stable public surface
-for the current alpha line. `StepInfo` and state mappings are plain snapshot
-containers; their existing fields are kept compatible where practical, but new
-diagnostic fields may be added during alpha releases.
+### Public Contract and Snapshot Policy
+
+The public import surface is the package `__all__`: `Market`, `generate_paths`,
+`compute_metrics`, generated-path metadata, MDF model/protocol types, metrics,
+and the state dataclasses shown above. The entrypoints are intentionally small,
+but the observation contract is broad because `StepInfo` and `MarketState`
+expose detailed simulator diagnostics.
+
+During the current alpha line, existing public names and existing `StepInfo` /
+state fields are kept compatible where practical. New diagnostic fields may be
+added in alpha releases. MDF names are the supported public distribution names;
+stale PMF names from earlier prototypes are obsolete.
+
+Snapshot mutability: state dataclasses are `frozen=True` at the attribute level,
+but nested `dict` and `list` fields are plain mutable containers so `to_dict()`
+and JSON export remain simple. Treat `Market.state`, `StepInfo`, and
+`GeneratedPath.hidden_states` as read-only observations. Use `Market.snapshot()`
+when downstream code needs a mutation-safe deep copy of the current state.
+
+Compatibility note: `Market.state` remains available as the live current-state
+attribute for the alpha line. Future releases may add a more explicit read-model
+API or deprecation path for code that mutates state containers in place.
 
 ## Development
 

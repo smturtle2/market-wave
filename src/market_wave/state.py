@@ -7,6 +7,12 @@ from typing import Any
 PriceMap = dict[float, float]
 TickMap = dict[int, float]
 
+MUTABLE_SNAPSHOT_NOTE = (
+    "State dataclasses are frozen at the attribute level, but their list and dict "
+    "fields are plain mutable containers for JSON-friendly exports. Treat them as "
+    "read-only observations unless you explicitly copy them."
+)
+
 
 @dataclass(frozen=True)
 class IntensityState:
@@ -26,6 +32,12 @@ class LatentState:
 
 @dataclass(frozen=True)
 class MDFState:
+    """Market Distribution Function snapshot.
+
+    The dataclass is frozen, but the contained maps and lists remain mutable plain
+    containers for compatibility with ``to_dict()``/JSON export workflows.
+    """
+
     relative_ticks: list[int] = field(default_factory=list)
     buy_entry_mdf: TickMap = field(default_factory=dict)
     sell_entry_mdf: TickMap = field(default_factory=dict)
@@ -39,18 +51,28 @@ class MDFState:
 
 @dataclass(frozen=True)
 class OrderBookState:
+    """Aggregated order-book snapshot with plain mutable price maps."""
+
     bid_volume_by_price: PriceMap = field(default_factory=dict)
     ask_volume_by_price: PriceMap = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class PositionMassState:
+    """Position mass snapshot with plain mutable price maps."""
+
     long_exit_mass_by_price: PriceMap = field(default_factory=dict)
     short_exit_mass_by_price: PriceMap = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class MarketState:
+    """Current market observation.
+
+    See ``MUTABLE_SNAPSHOT_NOTE``: nested containers are not deeply immutable.
+    Use ``Market.snapshot()`` when you need a mutation-safe copy of current state.
+    """
+
     price: float
     step_index: int
     current_tick: int
@@ -65,6 +87,12 @@ class MarketState:
 
 @dataclass(frozen=True)
 class StepInfo:
+    """Per-step observation and diagnostics.
+
+    Existing fields are kept compatible where practical during the alpha line,
+    but the nested dict/list fields are plain mutable snapshot containers.
+    """
+
     step_index: int
     price_before: float
     price_after: float

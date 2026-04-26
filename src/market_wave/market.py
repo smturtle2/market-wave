@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from copy import deepcopy
 from dataclasses import dataclass
 from math import ceil, exp, isfinite, log
 from random import Random
@@ -55,6 +56,103 @@ class _TradeStats:
         self.notional += price * volume
         self.trade_count += 1
         self.last_price = price
+
+
+@dataclass
+class _ExecutionResult:
+    residual_market_buy: float
+    residual_short_exit: float
+    residual_market_sell: float
+    residual_long_exit: float
+    crossed_market_volume: float
+
+
+@dataclass
+class _OrderBook:
+    bid_lots: dict[float, list[_OrderLot]]
+    ask_lots: dict[float, list[_OrderLot]]
+
+    def age(self) -> None:
+        for lots_by_price in (self.bid_lots, self.ask_lots):
+            for lots in lots_by_price.values():
+                for lot in lots:
+                    lot.age += 1
+
+    def add_lots(self, volume_by_price: PriceMap, side: str, kind: str) -> None:
+        lots_by_price = self.lots_for_side(side)
+        for price, volume in volume_by_price.items():
+            if volume <= 0:
+                continue
+            lots_by_price.setdefault(price, []).append(_OrderLot(volume=volume, kind=kind))
+
+    def lots_for_side(self, side: str) -> dict[float, list[_OrderLot]]:
+        return self.bid_lots if side == "bid" else self.ask_lots
+
+    def lots_for_taker_side(self, side: str) -> dict[float, list[_OrderLot]]:
+        return self.ask_lots if side == "buy" else self.bid_lots
+
+    def best_bid(self) -> float | None:
+        prices = [
+            price
+            for price, lots in self.bid_lots.items()
+            if sum(lot.volume for lot in lots) > 1e-12
+        ]
+        return max(prices) if prices else None
+
+    def best_ask(self) -> float | None:
+        prices = [
+            price
+            for price, lots in self.ask_lots.items()
+            if sum(lot.volume for lot in lots) > 1e-12
+        ]
+        return min(prices) if prices else None
+
+    def discard_empty_head(self, price: float, side: str) -> None:
+        lots_by_price = self.lots_for_side(side)
+        lots = lots_by_price.get(price, [])
+        while lots and lots[0].volume <= 1e-12:
+            lots.pop(0)
+        if not lots and price in lots_by_price:
+            del lots_by_price[price]
+
+    def clean(self) -> None:
+        for lots_by_price in (self.bid_lots, self.ask_lots):
+            for price in list(lots_by_price):
+                lots_by_price[price] = [lot for lot in lots_by_price[price] if lot.volume > 1e-12]
+                if not lots_by_price[price]:
+                    del lots_by_price[price]
+
+    def snapshot(self) -> OrderBookState:
+        return OrderBookState(
+            bid_volume_by_price=self._aggregate_lots(self.bid_lots),
+            ask_volume_by_price=self._aggregate_lots(self.ask_lots),
+        )
+
+    def near_touch_imbalance(self, current_price: float, gap: float) -> float:
+        bid_depth = 0.0
+        ask_depth = 0.0
+        for price, lots in self.bid_lots.items():
+            distance = max(1.0, abs(current_price - price) / gap)
+            if distance <= 5:
+                bid_depth += sum(lot.volume for lot in lots) / distance
+        for price, lots in self.ask_lots.items():
+            distance = max(1.0, abs(price - current_price) / gap)
+            if distance <= 5:
+                ask_depth += sum(lot.volume for lot in lots) / distance
+        total = bid_depth + ask_depth
+        if total <= 1e-12:
+            return 0.0
+        return max(-1.0, min(1.0, (bid_depth - ask_depth) / total))
+
+    @staticmethod
+    def _aggregate_lots(lots_by_price: dict[float, list[_OrderLot]]) -> PriceMap:
+        return {
+            price: volume
+            for price, volume in sorted(
+                (price, sum(lot.volume for lot in lots)) for price, lots in lots_by_price.items()
+            )
+            if volume > 1e-12
+        }
 
 
 class Market:
@@ -199,8 +297,7 @@ class Market:
         self._rng = Random(seed)
         self._seed = seed
         self.history: list[StepInfo] = []
-        self._bid_lots: dict[float, list[_OrderLot]] = {}
-        self._ask_lots: dict[float, list[_OrderLot]] = {}
+        self._orderbook = _OrderBook(bid_lots={}, ask_lots={})
         self._long_cohorts: list[_PositionCohort] = []
         self._short_cohorts: list[_PositionCohort] = []
         self._last_return_ticks = 0.0
@@ -257,6 +354,17 @@ class Market:
     @property
     def tick_size(self) -> float:
         return self.gap
+
+    def snapshot(self) -> MarketState:
+        """Return a deep copy of the current public market state.
+
+        ``Market.state`` is retained as the current alpha-compatible state object
+        and contains mutable plain containers. Use this method when downstream
+        code needs to inspect state without risking accidental mutation of the
+        live market object.
+        """
+
+        return deepcopy(self.state)
 
     def step(self, n: int, *, keep_history: bool = True) -> list[StepInfo]:
         if n < 0:
@@ -733,37 +841,18 @@ class Market:
         self._add_lots(short_exit_limit, side="bid", kind="short_exit")
         self._add_lots(long_exit_limit, side="ask", kind="long_exit")
 
-        stats = _TradeStats(executed_by_price={})
         initial_short_exit_market = short_exit_market
         initial_long_exit_market = long_exit_market
-        market_buy, short_exit_market, market_sell, long_exit_market, crossed_market_volume = (
-            self._cross_taker_flow(
-                price_before,
-                market_buy,
-                short_exit_market,
-                market_sell,
-                long_exit_market,
-                mdf,
-                stats,
-            )
+        stats = _TradeStats(executed_by_price={})
+        execution = self._execute_market_flows(
+            price_before=price_before,
+            market_buy=market_buy,
+            short_exit_market=short_exit_market,
+            market_sell=market_sell,
+            long_exit_market=long_exit_market,
+            mdf=mdf,
+            stats=stats,
         )
-        taker_calls = [
-            ("buy", market_buy, "buy_entry"),
-            ("sell", market_sell, "sell_entry"),
-            ("buy", short_exit_market, "short_exit"),
-            ("sell", long_exit_market, "long_exit"),
-        ]
-        self._rng.shuffle(taker_calls)
-        for side, volume, kind in taker_calls:
-            self._consume_taker(
-                side=side,
-                volume=volume,
-                kind=kind,
-                fallback_price=price_before,
-                mdf=mdf,
-                stats=stats,
-            )
-        self._match_crossed_book(mdf, stats)
         self._clean_orderbook()
         self._clean_cohorts()
 
@@ -786,8 +875,8 @@ class Market:
         spread_after = self._spread(best_bid_after, best_ask_after)
         total_market_buy = initial_market_buy + initial_short_exit_market
         total_market_sell = initial_market_sell + initial_long_exit_market
-        residual_market_buy = market_buy + short_exit_market
-        residual_market_sell = market_sell + long_exit_market
+        residual_market_buy = execution.residual_market_buy + execution.residual_short_exit
+        residual_market_sell = execution.residual_market_sell + execution.residual_long_exit
         market_flow_delta = total_market_buy - total_market_sell
         market_flow_total = total_market_buy + total_market_sell
         order_flow_imbalance = (
@@ -802,13 +891,13 @@ class Market:
         buy_volume = self._merge_maps(
             entry_limit_buy,
             short_exit_limit,
-            self._single_price_volume(price_before, crossed_market_volume),
+            self._single_price_volume(price_before, execution.crossed_market_volume),
             self._single_price_volume(best_ask_before or price_before, residual_market_buy),
         )
         sell_volume = self._merge_maps(
             entry_limit_sell,
             long_exit_limit,
-            self._single_price_volume(price_before, crossed_market_volume),
+            self._single_price_volume(price_before, execution.crossed_market_volume),
             self._single_price_volume(best_bid_before or price_before, residual_market_sell),
         )
         vwap = stats.notional / stats.total_volume if stats.total_volume > 0 else None
@@ -846,7 +935,7 @@ class Market:
             total_executed_volume=stats.total_volume,
             market_buy_volume=total_market_buy,
             market_sell_volume=total_market_sell,
-            crossed_market_volume=crossed_market_volume,
+            crossed_market_volume=execution.crossed_market_volume,
             residual_market_buy_volume=residual_market_buy,
             residual_market_sell_volume=residual_market_sell,
             trade_count=stats.trade_count,
@@ -879,10 +968,7 @@ class Market:
         return step_info
 
     def _age_state(self) -> None:
-        for lots_by_price in (self._bid_lots, self._ask_lots):
-            for lots in lots_by_price.values():
-                for lot in lots:
-                    lot.age += 1
+        self._orderbook.age()
         for cohort in (*self._long_cohorts, *self._short_cohorts):
             cohort.age += 1
 
@@ -1300,7 +1386,7 @@ class Market:
     def _cancel_orders(self, current_price: float, latent: LatentState) -> PriceMap:
         regime = self._regime_settings(self._active_regime)
         cancelled: PriceMap = {}
-        for lots_by_price in (self._bid_lots, self._ask_lots):
+        for lots_by_price in (self._orderbook.bid_lots, self._orderbook.ask_lots):
             for price, lots in list(lots_by_price.items()):
                 survivors = []
                 distance = abs(price - current_price) / self.gap
@@ -1346,11 +1432,54 @@ class Market:
             )
 
     def _add_lots(self, volume_by_price: PriceMap, side: str, kind: str) -> None:
-        lots_by_price = self._bid_lots if side == "bid" else self._ask_lots
-        for price, volume in volume_by_price.items():
-            if volume <= 0:
-                continue
-            lots_by_price.setdefault(price, []).append(_OrderLot(volume=volume, kind=kind))
+        self._orderbook.add_lots(volume_by_price, side, kind)
+
+    def _execute_market_flows(
+        self,
+        *,
+        price_before: float,
+        market_buy: float,
+        short_exit_market: float,
+        market_sell: float,
+        long_exit_market: float,
+        mdf: MDFState,
+        stats: _TradeStats,
+    ) -> _ExecutionResult:
+        market_buy, short_exit_market, market_sell, long_exit_market, crossed_market_volume = (
+            self._cross_taker_flow(
+                price_before,
+                market_buy,
+                short_exit_market,
+                market_sell,
+                long_exit_market,
+                mdf,
+                stats,
+            )
+        )
+        taker_calls = [
+            ("buy", market_buy, "buy_entry"),
+            ("sell", market_sell, "sell_entry"),
+            ("buy", short_exit_market, "short_exit"),
+            ("sell", long_exit_market, "long_exit"),
+        ]
+        self._rng.shuffle(taker_calls)
+        for side, volume, kind in taker_calls:
+            self._consume_taker(
+                side=side,
+                volume=volume,
+                kind=kind,
+                fallback_price=price_before,
+                mdf=mdf,
+                stats=stats,
+            )
+        self._match_crossed_book(mdf, stats)
+        return _ExecutionResult(
+            residual_market_buy=market_buy,
+            residual_short_exit=short_exit_market,
+            residual_market_sell=market_sell,
+            residual_long_exit=long_exit_market,
+            crossed_market_volume=crossed_market_volume,
+        )
 
     def _consume_taker(
         self,
@@ -1389,7 +1518,7 @@ class Market:
                 stats.record(price, actual)
                 break
 
-            lots_by_price = self._ask_lots if side == "buy" else self._bid_lots
+            lots_by_price = self._orderbook.lots_for_taker_side(side)
             resting_lot = lots_by_price[price][0]
             fill_volume = min(remaining, resting_lot.volume)
             taker_actual = self._available_fill_volume(kind, fill_volume)
@@ -1467,8 +1596,8 @@ class Market:
             if bid_price is None or ask_price is None or bid_price < ask_price:
                 break
 
-            bid_lot = self._bid_lots[bid_price][0]
-            ask_lot = self._ask_lots[ask_price][0]
+            bid_lot = self._orderbook.bid_lots[bid_price][0]
+            ask_lot = self._orderbook.ask_lots[ask_price][0]
             volume = min(bid_lot.volume, ask_lot.volume)
             if volume <= 1e-12:
                 self._discard_empty_head(bid_price, "bid")
@@ -1573,20 +1702,10 @@ class Market:
         self._short_cohorts = [cohort for cohort in self._short_cohorts if cohort.mass > 1e-12]
 
     def _best_bid(self) -> float | None:
-        prices = [
-            price
-            for price, lots in self._bid_lots.items()
-            if sum(lot.volume for lot in lots) > 1e-12
-        ]
-        return max(prices) if prices else None
+        return self._orderbook.best_bid()
 
     def _best_ask(self) -> float | None:
-        prices = [
-            price
-            for price, lots in self._ask_lots.items()
-            if sum(lot.volume for lot in lots) > 1e-12
-        ]
-        return min(prices) if prices else None
+        return self._orderbook.best_ask()
 
     def _spread(self, bid: float | None, ask: float | None) -> float | None:
         if bid is None or ask is None:
@@ -1594,51 +1713,21 @@ class Market:
         return ask - bid
 
     def _near_touch_imbalance(self, current_price: float) -> float:
-        bid_depth = 0.0
-        ask_depth = 0.0
-        for price, lots in self._bid_lots.items():
-            distance = max(1.0, abs(current_price - price) / self.gap)
-            if distance <= 5:
-                bid_depth += sum(lot.volume for lot in lots) / distance
-        for price, lots in self._ask_lots.items():
-            distance = max(1.0, abs(price - current_price) / self.gap)
-            if distance <= 5:
-                ask_depth += sum(lot.volume for lot in lots) / distance
-        total = bid_depth + ask_depth
-        if total <= 1e-12:
-            return 0.0
-        return self._clamp((bid_depth - ask_depth) / total, -1.0, 1.0)
+        return self._orderbook.near_touch_imbalance(current_price, self.gap)
 
     def _discard_empty_head(self, price: float, side: str) -> None:
-        lots_by_price = self._bid_lots if side == "bid" else self._ask_lots
-        lots = lots_by_price.get(price, [])
-        while lots and lots[0].volume <= 1e-12:
-            lots.pop(0)
-        if not lots and price in lots_by_price:
-            del lots_by_price[price]
+        self._orderbook.discard_empty_head(price, side)
 
     def _clean_orderbook(self) -> None:
-        for lots_by_price in (self._bid_lots, self._ask_lots):
-            for price in list(lots_by_price):
-                lots_by_price[price] = [lot for lot in lots_by_price[price] if lot.volume > 1e-12]
-                if not lots_by_price[price]:
-                    del lots_by_price[price]
+        self._orderbook.clean()
 
     def _snapshot_orderbook(self) -> OrderBookState:
-        return OrderBookState(
-            bid_volume_by_price=self._aggregate_lots(self._bid_lots),
-            ask_volume_by_price=self._aggregate_lots(self._ask_lots),
-        )
+        return self._orderbook.snapshot()
 
     def _snapshot_position_mass(self) -> PositionMassState:
         return PositionMassState(
             long_exit_mass_by_price=dict(self.state.position_mass.long_exit_mass_by_price),
             short_exit_mass_by_price=dict(self.state.position_mass.short_exit_mass_by_price),
-        )
-
-    def _aggregate_lots(self, lots_by_price: dict[float, list[_OrderLot]]) -> PriceMap:
-        return self._drop_zeroes(
-            {price: sum(lot.volume for lot in lots) for price, lots in lots_by_price.items()}
         )
 
     def _merge_maps(self, *maps: PriceMap) -> PriceMap:

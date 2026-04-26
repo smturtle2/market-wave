@@ -338,10 +338,29 @@ from market_wave import (
 예시와 public API는 MDF 이름만 사용합니다. 초기 prototype의 오래된 PMF 예시는
 obsolete로 보아야 합니다.
 
-API 안정성: 현재 alpha line에서 `Market`, `generate_paths`, `compute_metrics`,
-export된 MDF model type, export된 state dataclass 이름은 stable public surface로 봅니다.
-`StepInfo`와 state mapping은 plain snapshot container입니다. 기존 필드는 가능한 한
-호환성을 유지하지만, alpha release 중 새 diagnostic field가 추가될 수 있습니다.
+### Public Contract와 Snapshot 정책
+
+public import surface는 package `__all__`입니다. 여기에는 `Market`,
+`generate_paths`, `compute_metrics`, generated path metadata, MDF model/protocol
+type, metric, 그리고 위에 보인 state dataclass들이 포함됩니다. entrypoint는
+작지만, `StepInfo`와 `MarketState`가 상세 simulator diagnostic을 노출하므로
+observation contract는 넓습니다.
+
+현재 alpha line에서는 기존 public name과 기존 `StepInfo` / state field를 가능한
+한 호환되게 유지합니다. alpha release 중 새 diagnostic field가 추가될 수 있습니다.
+MDF 이름이 지원되는 public distribution 이름이며, 초기 prototype의 오래된 PMF
+이름은 obsolete입니다.
+
+Snapshot mutability: state dataclass는 attribute level에서 `frozen=True`이지만,
+nested `dict`와 `list` field는 `to_dict()`와 JSON export를 단순하게 유지하기 위한
+plain mutable container입니다. `Market.state`, `StepInfo`,
+`GeneratedPath.hidden_states`는 read-only observation처럼 다루세요. downstream
+code에서 현재 상태를 안전하게 수정하며 확인해야 한다면 mutation-safe deep copy를
+반환하는 `Market.snapshot()`을 사용하세요.
+
+호환성 메모: `Market.state`는 alpha line에서 live current-state attribute로
+유지됩니다. 향후 release에서는 in-place state container mutation에 의존하는
+코드를 위한 더 명시적인 read-model API 또는 deprecation path가 추가될 수 있습니다.
 
 ## 개발
 
