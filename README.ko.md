@@ -21,7 +21,7 @@
 
 `market-wave`는 개별 참여자를 만들지 않고 시장 전체의 진입 가격과 탈출 가격
 의도로 synthetic market path를 만드는 Python 라이브러리입니다. 집계된 매수/매도
-압력, 포지션 청산, 호가창 깊이, 주문 취소, taker flow, 체결 기반 가격 변화를
+진입 의도, 포지션 청산, 호가창 깊이, 주문 취소, taker flow, 체결 기반 가격 변화를
 relative tick 위의 확률질량으로 다룹니다.
 
 이 라이브러리는 가격 예측 모델이 아닙니다. 실험, 시각화, 교육, 전략 환경
@@ -32,7 +32,7 @@ relative tick 위의 확률질량으로 다룹니다.
 - **개별 agent가 아닌 집계 의도**: 참여자 객체를 만들지 않고 relative tick별 확률질량으로
   시장 의도를 표현합니다.
 - **Dynamic MDF**: 네 개의 `MDF(relative_tick)`가 이전 step의 상태를 이어받아
-  진입/탈출 압력을 표현합니다.
+  진입/탈출 의도를 표현합니다.
 - **교체 가능한 score 모델**: `DynamicMDFModel` 또는 custom `MDFModel`로 MDF
   score 함수만 바꿀 수 있습니다.
 - **분포와 거래강도 분리**: MDF는 의도가 어느 가격대에 있는지, intensity는 총
@@ -76,8 +76,6 @@ market = Market(
     gap=10,
     popularity=1.0,
     seed=42,
-    regime="auto",
-    augmentation_strength=0.25,
 )
 steps = market.step(500)
 
@@ -107,11 +105,11 @@ for step in market.stream(512, keep_history=False):
 `seed=42` 기준 예시 출력:
 
 ```text
-10020.0 -> 10010.0
-executed: 1.586
-imbalance: 0.059
-crossed flow: 1.057
-residual flow: 0.343 0.187
+9920.0 -> 9950.0
+executed: 3.043
+imbalance: 0.024
+crossed flow: 1.68
+residual flow: 0.738 0.626
 ```
 
 ## 스모크 매트릭스
@@ -123,11 +121,13 @@ residual flow: 0.343 0.187
 from market_wave import Market
 
 cases = [
-    ("baseline", dict(initial_price=10_000, gap=10, popularity=1.0, seed=42, grid_radius=20), 500),
-    ("busy", dict(initial_price=10_000, gap=10, popularity=2.5, seed=7, grid_radius=24), 500),
-    ("thin", dict(initial_price=500, gap=5, popularity=0.25, seed=123, grid_radius=12), 500),
-    ("low_price", dict(initial_price=1, gap=1, popularity=3.0, seed=17, grid_radius=8), 500),
-    ("inactive", dict(initial_price=100, gap=1, popularity=0.0, seed=9, grid_radius=10), 100),
+    ("baseline", dict(initial_price=10_000, gap=10, popularity=1.0, seed=42), 500),
+    ("busy", dict(initial_price=10_000, gap=10, popularity=2.5, seed=7), 500),
+    ("thin", dict(initial_price=500, gap=5, popularity=0.25, seed=123), 500),
+    ("low_price", dict(initial_price=1, gap=1, popularity=3.0, seed=17), 500),
+    ("trend_up", dict(initial_price=10_000, gap=10, popularity=1.0, seed=42, regime="trend_up"), 500),
+    ("high_vol", dict(initial_price=10_000, gap=10, popularity=1.0, seed=7, regime="high_vol"), 500),
+    ("inactive", dict(initial_price=100, gap=1, popularity=0.0, seed=9), 100),
 ]
 
 for name, kwargs, steps_count in cases:
@@ -142,11 +142,13 @@ for name, kwargs, steps_count in cases:
 현재 구현에서 최근 검증한 결과:
 
 ```text
-baseline   range= 10000.0- 10010.0 moves=228 exec_steps=500 final= 10000.0
-busy       range=  9940.0- 10010.0 moves=214 exec_steps=500 final=  9940.0
-thin       range=   495.0-   505.0 moves=229 exec_steps=500 final=   505.0
-low_price  range=     1.0-     3.0 moves=223 exec_steps=500 final=     2.0
-inactive   range=   100.0-   100.0 moves=  0 exec_steps=  0 final=   100.0
+baseline  range=  9880.0- 10320.0 unique= 44 moves=482 exec_steps=500 final=  9950.0
+busy      range=  9920.0- 10290.0 unique= 38 moves=486 exec_steps=500 final=  9990.0
+thin      range=   470.0-   665.0 unique= 40 moves=407 exec_steps=500 final=   575.0
+low_price range=     1.0-    63.0 unique= 63 moves=494 exec_steps=500 final=    55.0
+trend_up  range=  9820.0- 10270.0 unique= 46 moves=485 exec_steps=500 final=  9860.0
+high_vol  range=  9660.0- 10390.0 unique= 73 moves=484 exec_steps=500 final= 10290.0
+inactive  range=   100.0-   100.0 unique=  1 moves=  0 exec_steps=  0 final=   100.0
 ```
 
 이 실행들은 현재 state의 MDF projection이 `state.price_grid`와 정렬되는지, MDF가 정규화되는지,
@@ -156,12 +158,13 @@ Dynamic MDF acceptance는 `mdf_temperature=1.0`에서 seed `10..19`도 실행해
 모든 MDF가 finite, non-negative, normalized 상태를 유지하고 한 가격으로
 붕괴하지 않는지도 확인합니다.
 
-`0.2.5` 진단 메모: 현재 MDF update는 위 smoke metric 기준으로 수치적으로
-안정적이지만, 행동적으로 calibration된 상태는 아닙니다. 위 range, move count,
-execution count는 실제 시장과의 일치 주장이 아니라 regression diagnostic으로
-보아야 합니다.
+`0.3.0` 진단 메모: 시뮬레이터는 저장된 목표 가격이나 가격을 초기값으로
+되돌리는 값을 갖지 않습니다. seed로 정해진 `mood`, `trend`, `volatility`는
+매 step 전이되며 MDF 형태를 바꿉니다. 가격은 여전히 체결 print에서만
+움직입니다. 위 range, move count, execution count는 실제 시장과의 일치 주장이
+아니라 regression diagnostic으로 보아야 합니다.
 
-`0.2.5` 성능 메모: live orderbook과 position total을 price/side별로 cache하면서도
+`0.3.0` 성능 메모: live orderbook과 position total을 price/side별로 cache하면서도
 개별 lot과 cohort의 age 의미는 유지합니다. 긴 실행에서도 best-price lookup, snapshot,
 near-touch imbalance 계산에서 모든 live lot을 반복 합산하지 않으며, 이 개선은
 `keep_history` 값과 무관하게 적용됩니다.
@@ -173,14 +176,11 @@ from market_wave import Market
 
 market = Market(
     initial_price=10_000,
-    gap=5,
-    popularity=1.4,
+    gap=10,
+    popularity=1.0,
     seed=42,
-    regime="auto",
-    augmentation_strength=0.25,
-    grid_radius=20,
 )
-market.step(320)
+market.step(500)
 
 fig, ax = market.plot(last=220, orderbook_depth=12)
 ```
@@ -212,8 +212,6 @@ paths = generate_paths(
         "gap": 10,
         "popularity": 1.0,
         "seed": 10_000 + path_id,
-        "regime": "auto",
-        "augmentation_strength": 0.35,
     },
 )
 
@@ -276,13 +274,12 @@ proposal = softmax(clamp(logits - max(logits), -50, 0))
 MDF_next = Normalize((1 - floor_mix) * Diffuse(proposal) + floor_mix * Uniform)
 ```
 
-`score(tick)`에는 value, trend, liquidity attraction, memory, risk,
-orderbook pressure가 반영될 수 있습니다. `mdf_temperature`는 score가 분포를
-얼마나 날카롭게 바꾸는지 조절합니다. effective temperature에는 현재
-volatility도 반영되므로 high-volatility regime에서 한 tick이 모든 질량을
-흡수하지 않도록 score update가 완만해집니다. persistence, diffusion, uniform
-floor mixing은 작은 score 우위가 반복되면서 MDF가 한 tick으로 붕괴되는 일을
-막습니다.
+`score(tick)`에는 placement shape, trend, liquidity attraction, memory, risk,
+orderbook imbalance가 반영될 수 있습니다. `mdf_temperature`는 score가 분포를
+얼마나 날카롭게 바꾸는지 조절합니다. effective temperature에는 현재 volatility도
+반영되므로 high-volatility regime에서 한 tick이 모든 질량을 흡수하지 않도록
+score update가 완만해집니다. persistence, diffusion, uniform floor mixing은 작은
+score 우위가 반복되면서 MDF가 한 tick으로 붕괴되는 일을 막습니다.
 
 relative MDF는 호가 형성을 위해
 pre-trade grid인 `price_grid = price_before +/- k * gap`에 투영됩니다.

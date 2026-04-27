@@ -9,6 +9,7 @@ import pytest
 
 import market_wave as mw
 from market_wave import Market, MarketState, StepInfo
+from market_wave.market import _TradeStats
 
 PUBLIC_TYPE_EXPORTS = (
     "Market",
@@ -506,28 +507,59 @@ def test_step_can_skip_history_and_stream_steps():
     assert [step.step_index for step in streamed] == [4, 5]
 
 
-def test_default_step_preserves_seeded_plot_path_shape():
+def test_default_step_produces_active_seeded_price_discovery():
     market = Market(initial_price=10_000.0, gap=10.0, popularity=1.0, seed=42)
 
-    steps = market.step(260)
+    steps = market.step(500)
     prices = [step.price_after for step in steps]
+    changes = [step.price_change for step in steps]
 
-    assert min(prices) == 10_000.0
-    assert max(prices) == 10_010.0
-    assert prices[-1] == 10_000.0
-    assert sum(1 for step in steps if abs(step.price_change) > 1e-12) == 110
-    assert prices[-10:] == [
-        10_000.0,
-        10_000.0,
-        10_000.0,
-        10_000.0,
-        10_000.0,
-        10_000.0,
-        10_000.0,
-        10_010.0,
-        10_010.0,
-        10_000.0,
-    ]
+    assert not hasattr(market, "_anchor_price")
+    assert not hasattr(market, "_price_pressure_ticks")
+    assert len(set(prices)) > 2
+    assert max(prices) > min(prices)
+    assert any(change > 0 for change in changes)
+    assert any(change < 0 for change in changes)
+
+
+def test_inactive_market_has_no_executions_or_price_changes():
+    market = Market(initial_price=100.0, gap=1.0, popularity=0.0, seed=9)
+    steps = market.step(100)
+
+    assert all(step.total_executed_volume == 0 for step in steps)
+    assert {step.price_after for step in steps} == {100.0}
+
+
+def test_price_update_stays_flat_when_executions_print_at_previous_price():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=44)
+    stats = _TradeStats(executed_by_price={})
+    stats.record(100.0, 1.0)
+
+    assert market._next_price_after_trading(100.0, stats) == 100.0
+
+
+def test_latent_mdf_context_is_seeded_and_evolves_over_steps():
+    left = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=91)
+    right = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=91)
+    other = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=92)
+
+    assert left.state.latent == right.state.latent
+    assert left.state.latent != other.state.latent
+
+    steps = left.step(80)
+    latent_path = {
+        (
+            round(step.mood, 4),
+            round(step.trend, 4),
+            round(step.volatility, 4),
+        )
+        for step in steps
+    }
+
+    assert len(latent_path) > 1
+    assert any(step.mood != left.state.latent.mood for step in steps)
+    assert any(step.trend != left.state.latent.trend for step in steps)
+    assert any(step.volatility != left.state.latent.volatility for step in steps)
 
 
 def test_default_step_keeps_full_history_and_updates_live_aggregates():

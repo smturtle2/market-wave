@@ -331,15 +331,13 @@ class Market:
         self._last_executed_by_price: PriceMap = {}
         self._mdf_model_accepts_signals = self._scores_accepts_signals(self.mdf_model.scores)
         self._mdf_memory: dict[str, dict[int, float]] = {}
-        self._anchor_price: float
 
         price = self._snap_price(float(initial_price))
-        self._anchor_price = price
         grid = self._price_grid(price)
         tick_grid = self.relative_tick_grid()
         current_tick = self.price_to_tick(price)
         intensity = IntensityState(total=0.0, buy=0.0, sell=0.0, buy_ratio=0.5, sell_ratio=0.5)
-        latent = LatentState(mood=0.0, trend=0.0, volatility=0.25)
+        latent = self._initial_latent()
         uniform = 1.0 / len(grid)
         initial_mdf_by_price = {price_level: uniform for price_level in grid}
         initial_mdf = {tick: 1.0 / len(tick_grid) for tick in tick_grid}
@@ -370,6 +368,28 @@ class Market:
                 short_exit_mass_by_price=zero_mass.copy(),
             ),
         )
+
+    def _initial_latent(self) -> LatentState:
+        regime = self._regime_settings(self._active_regime)
+        mood = self._clamp(
+            self._rng.gauss(regime["mood"], 0.18),
+            -0.7,
+            0.7,
+        )
+        trend = self._clamp(
+            self._rng.gauss(regime["trend"] + 0.20 * mood, 0.14),
+            -0.7,
+            0.7,
+        )
+        volatility = self._clamp(
+            0.12
+            + 0.18 * self._rng.random()
+            + abs(self._rng.gauss(0.0, 0.11))
+            + regime["volatility_bias"],
+            0.05,
+            0.75,
+        )
+        return LatentState(mood=mood, trend=trend, volatility=volatility)
 
     @property
     def seed(self) -> int | None:
@@ -1004,17 +1024,13 @@ class Market:
         execution_move_ticks = (execution_price - price_before) / self.gap
         if abs(execution_move_ticks) <= 1e-12:
             return price_before
-        jitter_ticks = self._clamp(self._rng.gauss(0.0, 0.18), -0.35, 0.35)
-        anchor_pull_ticks = self._clamp(
-            0.025 * (self._anchor_price - price_before) / self.gap,
-            -0.30,
-            0.30,
+        volume_confidence = self._clamp(
+            stats.total_volume / max(0.7, self.popularity),
+            0.35,
+            1.40,
         )
-        proposed_ticks = execution_move_ticks + jitter_ticks + anchor_pull_ticks
-        if execution_move_ticks > 0:
-            proposed_ticks = max(0.0, proposed_ticks)
-        else:
-            proposed_ticks = min(0.0, proposed_ticks)
+        proposed_ticks = execution_move_ticks * (0.85 + 0.25 * volume_confidence)
+        proposed_ticks = self._clamp(proposed_ticks, -3.0, 3.0)
         return max(self._min_price, price_before + proposed_ticks * self.gap)
 
     def _price_grid(self, center_price: float) -> list[float]:
@@ -1048,34 +1064,28 @@ class Market:
 
     def _next_latent(self, latent: LatentState) -> LatentState:
         regime = self._regime_settings(self._active_regime)
-        mood_noise = self._rng.gauss(0.0, 0.13)
-        trend_noise = self._rng.gauss(0.0, 0.08)
-        jump_probability = 0.018 * regime["volatility"] * (1.0 + self.augmentation_strength)
+        mood_noise = self._rng.gauss(0.0, 0.15)
+        trend_noise = self._rng.gauss(0.0, 0.10)
+        jump_probability = 0.024 * regime["volatility"] * (1.0 + self.augmentation_strength)
         jump = self._rng.gauss(0.0, 0.55) if self._rng.random() < jump_probability else 0.0
-        signed_flow = 0.10 * self._last_imbalance + 0.035 * self._last_return_ticks
-        anchor_pressure = self._clamp(
-            (self._anchor_price - self.state.price) / (self.grid_radius * self.gap),
-            -1.0,
-            1.0,
-        )
+        signed_flow = 0.12 * self._last_imbalance + 0.04 * self._last_return_ticks
 
         mood = self._clamp(
-            0.55 * latent.mood
-            + 0.08 * latent.trend
+            0.66 * latent.mood
+            + 0.12 * latent.trend
             + signed_flow
             + regime["mood"]
-            + 0.12 * anchor_pressure
             + mood_noise
-            + 0.25 * jump,
+            + 0.30 * jump,
             -1.0,
             1.0,
         )
         trend = self._clamp(
-            0.58 * latent.trend
-            + 0.08 * mood
-            + 0.04 * self._last_return_ticks
+            0.74 * latent.trend
+            + 0.13 * mood
+            + 0.10 * self._last_return_ticks
             + regime["trend"]
-            + 0.10 * anchor_pressure
+            + 0.12 * jump
             + trend_noise,
             -1.0,
             1.0,
@@ -1100,9 +1110,12 @@ class Market:
             self.popularity * (1.0 + 2.2 * latent.volatility) * regime["intensity"] * augmentation
         )
         buy_ratio = self._clamp(
-            0.5 + 0.18 * latent.mood + 0.12 * latent.trend + 0.06 * self._last_imbalance,
-            0.12,
-            0.88,
+            0.5
+            + 0.24 * latent.mood
+            + 0.20 * latent.trend
+            + 0.08 * self._last_imbalance,
+            0.08,
+            0.92,
         )
         sell_ratio = 1.0 - buy_ratio
         return IntensityState(
@@ -1282,8 +1295,8 @@ class Market:
             + score / temperature
             for tick, score in zip(ticks, cleaned, strict=False)
         ]
-        anchor = max(logits, default=0.0)
-        weights = [exp(self._clamp(logit - anchor, -50.0, 0.0)) for logit in logits]
+        logit_peak = max(logits, default=0.0)
+        weights = [exp(self._clamp(logit - logit_peak, -50.0, 0.0)) for logit in logits]
         proposal = self._normalize_tick_map(
             {tick: weight for tick, weight in zip(ticks, weights, strict=False)}
         )
@@ -1347,10 +1360,18 @@ class Market:
         buy_noise = self._clamp(self._rng.lognormvariate(0.0, 0.16), 0.65, 1.45)
         sell_noise = self._clamp(self._rng.lognormvariate(0.0, 0.16), 0.65, 1.45)
         buy_bias = self._clamp(
-            1.0 + 0.24 * max(latent.trend, 0.0) + 0.16 * max(imbalance, 0.0), 0.65, 1.45
+            1.0
+            + 0.30 * max(latent.trend, 0.0)
+            + 0.14 * max(imbalance, 0.0),
+            0.58,
+            1.65,
         )
         sell_bias = self._clamp(
-            1.0 + 0.24 * max(-latent.trend, 0.0) + 0.16 * max(-imbalance, 0.0), 0.65, 1.45
+            1.0
+            + 0.30 * max(-latent.trend, 0.0)
+            + 0.14 * max(-imbalance, 0.0),
+            0.58,
+            1.65,
         )
         return (
             intensity.buy * taker_share * burst * buy_bias * buy_noise,
@@ -1359,8 +1380,12 @@ class Market:
 
     def _taker_share(self, latent: LatentState, imbalance: float) -> float:
         regime = self._regime_settings(self._active_regime)
-        base = 0.10 + 0.06 * latent.volatility + 0.05 * abs(imbalance)
-        return self._clamp(base * regime["taker"], 0.08, 0.55)
+        base = (
+            0.12
+            + 0.08 * latent.volatility
+            + 0.04 * abs(imbalance)
+        )
+        return self._clamp(base * regime["taker"], 0.08, 0.62)
 
     def _exit_flow(
         self,
@@ -1450,8 +1475,8 @@ class Market:
         base = self.popularity * (0.18 + 0.20 / (1.0 + latent.volatility)) * regime["liquidity"]
         for level in range(1, min(7, self.grid_radius + 1)):
             shape = base / (level**1.35)
-            bid_volume = shape * self._clamp(1.0 - 0.25 * imbalance, 0.55, 1.45)
-            ask_volume = shape * self._clamp(1.0 + 0.25 * imbalance, 0.55, 1.45)
+            bid_volume = shape * self._clamp(1.0 + 0.20 * imbalance, 0.55, 1.55)
+            ask_volume = shape * self._clamp(1.0 - 0.20 * imbalance, 0.55, 1.55)
             self._add_lots(
                 {self._snap_price(current_price - level * self.gap): bid_volume}, "bid", "buy_entry"
             )
@@ -1583,7 +1608,10 @@ class Market:
     ) -> tuple[float, float, float, float, float]:
         buy_total = buy_entry + short_exit
         sell_total = sell_entry + long_exit
-        cross_volume = min(buy_total, sell_total) * 0.85
+        total = buy_total + sell_total
+        side_imbalance = abs(buy_total - sell_total) / total if total > 1e-12 else 0.0
+        cross_share = self._clamp(0.74 - 0.48 * side_imbalance, 0.24, 0.82)
+        cross_volume = min(buy_total, sell_total) * cross_share
         if cross_volume <= 1e-12:
             return buy_entry, short_exit, sell_entry, long_exit, 0.0
 
@@ -1781,13 +1809,13 @@ class Market:
                 merged[price] = merged.get(price, 0.0) + volume
         return self._drop_zeroes(merged)
 
-    def _price_map_to_relative_ticks(self, reference_price: float, values: PriceMap) -> TickMap:
-        reference_tick = self.price_to_tick(reference_price)
+    def _price_map_to_relative_ticks(self, basis_price: float, values: PriceMap) -> TickMap:
+        basis_tick = self.price_to_tick(basis_price)
         by_tick: TickMap = {}
         min_tick = -self.grid_radius
         max_tick = self.grid_radius
         for price, value in values.items():
-            relative_tick = self.price_to_tick(price) - reference_tick
+            relative_tick = self.price_to_tick(price) - basis_tick
             if min_tick <= relative_tick <= max_tick:
                 by_tick[relative_tick] = by_tick.get(relative_tick, 0.0) + value
         return by_tick

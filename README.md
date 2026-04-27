@@ -21,9 +21,9 @@
 
 `market-wave` is a Python library for generating synthetic market paths from
 market-wide entry and exit intent. It does not create individual participants.
-Instead, it models aggregate buy/sell pressure, position exits, order-book depth,
-cancellations, taker flow, and execution-driven price movement from probability
-mass over relative ticks.
+Instead, it models aggregate buy/sell entry intent, position exits,
+order-book depth, cancellations, taker flow, and execution-driven price movement
+from probability mass over relative ticks.
 
 It is not a forecasting model. It is a lightweight simulation primitive for
 experiments, visualization, teaching, and strategy-environment prototyping.
@@ -32,7 +32,7 @@ experiments, visualization, teaching, and strategy-environment prototyping.
 
 - **Aggregate intent, not agents**: market participants are represented by
   probability mass over relative ticks, not by individual objects.
-- **Dynamic MDF**: entry and exit pressure live in four stateful
+- **Dynamic MDF**: entry and exit intent live in four stateful
   `MDF(relative_tick)` fields that evolve from the previous step.
 - **Pluggable score model**: swap the MDF score function with
   `DynamicMDFModel` or a custom `MDFModel`.
@@ -78,8 +78,6 @@ market = Market(
     gap=10,
     popularity=1.0,
     seed=42,
-    regime="auto",
-    augmentation_strength=0.25,
 )
 steps = market.step(500)
 
@@ -109,11 +107,11 @@ For simple export workflows, use `step.to_dict()`, `step.to_json()`, or
 Example output with `seed=42`:
 
 ```text
-10020.0 -> 10010.0
-executed: 1.586
-imbalance: 0.059
-crossed flow: 1.057
-residual flow: 0.343 0.187
+9920.0 -> 9950.0
+executed: 3.043
+imbalance: 0.024
+crossed flow: 1.68
+residual flow: 0.738 0.626
 ```
 
 ## Smoke Matrix
@@ -125,11 +123,13 @@ invariants across different market conditions:
 from market_wave import Market
 
 cases = [
-    ("baseline", dict(initial_price=10_000, gap=10, popularity=1.0, seed=42, grid_radius=20), 500),
-    ("busy", dict(initial_price=10_000, gap=10, popularity=2.5, seed=7, grid_radius=24), 500),
-    ("thin", dict(initial_price=500, gap=5, popularity=0.25, seed=123, grid_radius=12), 500),
-    ("low_price", dict(initial_price=1, gap=1, popularity=3.0, seed=17, grid_radius=8), 500),
-    ("inactive", dict(initial_price=100, gap=1, popularity=0.0, seed=9, grid_radius=10), 100),
+    ("baseline", dict(initial_price=10_000, gap=10, popularity=1.0, seed=42), 500),
+    ("busy", dict(initial_price=10_000, gap=10, popularity=2.5, seed=7), 500),
+    ("thin", dict(initial_price=500, gap=5, popularity=0.25, seed=123), 500),
+    ("low_price", dict(initial_price=1, gap=1, popularity=3.0, seed=17), 500),
+    ("trend_up", dict(initial_price=10_000, gap=10, popularity=1.0, seed=42, regime="trend_up"), 500),
+    ("high_vol", dict(initial_price=10_000, gap=10, popularity=1.0, seed=7, regime="high_vol"), 500),
+    ("inactive", dict(initial_price=100, gap=1, popularity=0.0, seed=9), 100),
 ]
 
 for name, kwargs, steps_count in cases:
@@ -144,11 +144,13 @@ for name, kwargs, steps_count in cases:
 Recent verification on the current implementation:
 
 ```text
-baseline   range= 10000.0- 10010.0 moves=228 exec_steps=500 final= 10000.0
-busy       range=  9940.0- 10010.0 moves=214 exec_steps=500 final=  9940.0
-thin       range=   495.0-   505.0 moves=229 exec_steps=500 final=   505.0
-low_price  range=     1.0-     3.0 moves=223 exec_steps=500 final=     2.0
-inactive   range=   100.0-   100.0 moves=  0 exec_steps=  0 final=   100.0
+baseline  range=  9880.0- 10320.0 unique= 44 moves=482 exec_steps=500 final=  9950.0
+busy      range=  9920.0- 10290.0 unique= 38 moves=486 exec_steps=500 final=  9990.0
+thin      range=   470.0-   665.0 unique= 40 moves=407 exec_steps=500 final=   575.0
+low_price range=     1.0-    63.0 unique= 63 moves=494 exec_steps=500 final=    55.0
+trend_up  range=  9820.0- 10270.0 unique= 46 moves=485 exec_steps=500 final=  9860.0
+high_vol  range=  9660.0- 10390.0 unique= 73 moves=484 exec_steps=500 final= 10290.0
+inactive  range=   100.0-   100.0 unique=  1 moves=  0 exec_steps=  0 final=   100.0
 ```
 
 Those runs also checked that current-state MDF projections stay aligned with
@@ -158,12 +160,14 @@ steps with executed volume. Dynamic MDF acceptance also runs seeds `10..19` at
 `mdf_temperature=1.0` and checks that every MDF remains finite, non-negative,
 normalized, and broad enough not to collapse to a single price.
 
-Diagnostic note for `0.2.5`: the current MDF update is numerically stable under
-the smoke metrics above, but it is not behaviorally calibrated. Treat these
-ranges, move counts, and execution counts as regression diagnostics, not claims
-that the generated paths match any real market.
+Diagnostic note for `0.3.0`: the simulator does not keep a stored target price
+or any value that pulls prices back to the initial price. Seeded `mood`, `trend`,
+and `volatility` evolve each step and reshape the MDFs; prices still move only
+from executed prints. Treat these ranges, move counts, and execution counts as
+regression diagnostics, not claims that the generated paths match any real
+market.
 
-Performance note for `0.2.5`: live order-book and position totals are cached by
+Performance note for `0.3.0`: live order-book and position totals are cached by
 price/side while preserving individual lot and cohort age semantics. Long runs
 avoid repeatedly summing all live lots for best-price lookup, snapshots, and
 near-touch imbalance, regardless of `keep_history`.
@@ -175,14 +179,11 @@ from market_wave import Market
 
 market = Market(
     initial_price=10_000,
-    gap=5,
-    popularity=1.4,
+    gap=10,
+    popularity=1.0,
     seed=42,
-    regime="auto",
-    augmentation_strength=0.25,
-    grid_radius=20,
 )
-market.step(320)
+market.step(500)
 
 fig, ax = market.plot(last=220, orderbook_depth=12)
 ```
@@ -215,8 +216,6 @@ paths = generate_paths(
         "gap": 10,
         "popularity": 1.0,
         "seed": 10_000 + path_id,
-        "regime": "auto",
-        "augmentation_strength": 0.35,
     },
 )
 
@@ -279,9 +278,9 @@ proposal = softmax(clamp(logits - max(logits), -50, 0))
 MDF_next = Normalize((1 - floor_mix) * Diffuse(proposal) + floor_mix * Uniform)
 ```
 
-`score(tick)` can include value, trend, liquidity attraction, memory, risk, and
-order-book pressure. `mdf_temperature` controls how sharply scores reshape the
-distribution. The effective temperature also includes current volatility, so
+`score(tick)` can include placement shape, trend, liquidity attraction, memory,
+risk, and order-book imbalance. `mdf_temperature` controls how sharply scores
+reshape the distribution. The effective temperature also includes current volatility, so
 high-volatility regimes soften score updates instead of letting one tick absorb
 all mass. Persistence, diffusion, and uniform floor mixing prevent repeated
 small score advantages from collapsing the MDF into a single tick.
