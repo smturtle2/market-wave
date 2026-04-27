@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil, exp, isfinite, log
 from random import Random
 
@@ -71,6 +71,8 @@ class _ExecutionResult:
 class _OrderBook:
     bid_lots: dict[float, list[_OrderLot]]
     ask_lots: dict[float, list[_OrderLot]]
+    bid_volume_by_price: PriceMap = field(default_factory=dict)
+    ask_volume_by_price: PriceMap = field(default_factory=dict)
 
     def age(self) -> None:
         for lots_by_price in (self.bid_lots, self.ask_lots):
@@ -80,10 +82,12 @@ class _OrderBook:
 
     def add_lots(self, volume_by_price: PriceMap, side: str, kind: str) -> None:
         lots_by_price = self.lots_for_side(side)
+        volume_totals = self.volumes_for_side(side)
         for price, volume in volume_by_price.items():
             if volume <= 0:
                 continue
             lots_by_price.setdefault(price, []).append(_OrderLot(volume=volume, kind=kind))
+            volume_totals[price] = volume_totals.get(price, 0.0) + volume
 
     def lots_for_side(self, side: str) -> dict[float, list[_OrderLot]]:
         return self.bid_lots if side == "bid" else self.ask_lots
@@ -91,29 +95,42 @@ class _OrderBook:
     def lots_for_taker_side(self, side: str) -> dict[float, list[_OrderLot]]:
         return self.ask_lots if side == "buy" else self.bid_lots
 
+    def volumes_for_side(self, side: str) -> PriceMap:
+        return self.bid_volume_by_price if side == "bid" else self.ask_volume_by_price
+
+    def adjust_volume(self, side: str, price: float, delta: float) -> None:
+        if abs(delta) <= 1e-12:
+            return
+        volume_totals = self.volumes_for_side(side)
+        next_volume = volume_totals.get(price, 0.0) + delta
+        if next_volume > 1e-12:
+            volume_totals[price] = next_volume
+        else:
+            volume_totals.pop(price, None)
+
+    def rebuild_totals(self) -> None:
+        self.bid_volume_by_price = self._aggregate_lots(self.bid_lots)
+        self.ask_volume_by_price = self._aggregate_lots(self.ask_lots)
+
     def best_bid(self) -> float | None:
-        prices = [
-            price
-            for price, lots in self.bid_lots.items()
-            if sum(lot.volume for lot in lots) > 1e-12
-        ]
+        prices = [price for price, volume in self.bid_volume_by_price.items() if volume > 1e-12]
         return max(prices) if prices else None
 
     def best_ask(self) -> float | None:
-        prices = [
-            price
-            for price, lots in self.ask_lots.items()
-            if sum(lot.volume for lot in lots) > 1e-12
-        ]
+        prices = [price for price, volume in self.ask_volume_by_price.items() if volume > 1e-12]
         return min(prices) if prices else None
 
     def discard_empty_head(self, price: float, side: str) -> None:
         lots_by_price = self.lots_for_side(side)
+        volume_totals = self.volumes_for_side(side)
         lots = lots_by_price.get(price, [])
         while lots and lots[0].volume <= 1e-12:
             lots.pop(0)
         if not lots and price in lots_by_price:
             del lots_by_price[price]
+            volume_totals.pop(price, None)
+        elif not lots:
+            volume_totals.pop(price, None)
 
     def clean(self) -> None:
         for lots_by_price in (self.bid_lots, self.ask_lots):
@@ -121,38 +138,25 @@ class _OrderBook:
                 lots_by_price[price] = [lot for lot in lots_by_price[price] if lot.volume > 1e-12]
                 if not lots_by_price[price]:
                     del lots_by_price[price]
-
-    def compact(self, current_price: float, gap: float, retention_ticks: int) -> None:
-        lower_bound = current_price - retention_ticks * gap
-        upper_bound = current_price + retention_ticks * gap
-        for lots_by_price in (self.bid_lots, self.ask_lots):
-            for price in list(lots_by_price):
-                if price < lower_bound or price > upper_bound:
-                    del lots_by_price[price]
-                    continue
-                compacted = self._compact_lots(lots_by_price[price])
-                if compacted:
-                    lots_by_price[price] = compacted
-                else:
-                    del lots_by_price[price]
+        self.rebuild_totals()
 
     def snapshot(self) -> OrderBookState:
         return OrderBookState(
-            bid_volume_by_price=self._aggregate_lots(self.bid_lots),
-            ask_volume_by_price=self._aggregate_lots(self.ask_lots),
+            bid_volume_by_price=self._drop_zeroes(self.bid_volume_by_price),
+            ask_volume_by_price=self._drop_zeroes(self.ask_volume_by_price),
         )
 
     def near_touch_imbalance(self, current_price: float, gap: float) -> float:
         bid_depth = 0.0
         ask_depth = 0.0
-        for price, lots in self.bid_lots.items():
+        for price, volume in self.bid_volume_by_price.items():
             distance = max(1.0, abs(current_price - price) / gap)
             if distance <= 5:
-                bid_depth += sum(lot.volume for lot in lots) / distance
-        for price, lots in self.ask_lots.items():
+                bid_depth += volume / distance
+        for price, volume in self.ask_volume_by_price.items():
             distance = max(1.0, abs(price - current_price) / gap)
             if distance <= 5:
-                ask_depth += sum(lot.volume for lot in lots) / distance
+                ask_depth += volume / distance
         total = bid_depth + ask_depth
         if total <= 1e-12:
             return 0.0
@@ -169,25 +173,8 @@ class _OrderBook:
         }
 
     @staticmethod
-    def _compact_lots(lots: list[_OrderLot]) -> list[_OrderLot]:
-        by_kind: dict[str, tuple[float, float]] = {}
-        for lot in lots:
-            if lot.volume <= 1e-12:
-                continue
-            total_volume, weighted_age = by_kind.get(lot.kind, (0.0, 0.0))
-            by_kind[lot.kind] = (
-                total_volume + lot.volume,
-                weighted_age + lot.volume * lot.age,
-            )
-        return [
-            _OrderLot(
-                volume=volume,
-                kind=kind,
-                age=max(0, int(round(weighted_age / volume))),
-            )
-            for kind, (volume, weighted_age) in sorted(by_kind.items())
-            if volume > 1e-12
-        ]
+    def _drop_zeroes(values: PriceMap) -> PriceMap:
+        return {price: value for price, value in sorted(values.items()) if value > 1e-12}
 
 
 class Market:
@@ -335,6 +322,8 @@ class Market:
         self._orderbook = _OrderBook(bid_lots={}, ask_lots={})
         self._long_cohorts: list[_PositionCohort] = []
         self._short_cohorts: list[_PositionCohort] = []
+        self._long_mass_total = 0.0
+        self._short_mass_total = 0.0
         self._last_return_ticks = 0.0
         self._last_abs_return_ticks = 0.0
         self._last_imbalance = 0.0
@@ -890,7 +879,6 @@ class Market:
         )
         self._clean_orderbook()
         self._clean_cohorts()
-        self._compact_live_state(price_before)
 
         price_after = self._next_price_after_trading(price_before, stats)
         price_after = self._snap_price(price_after)
@@ -1422,7 +1410,10 @@ class Market:
     def _cancel_orders(self, current_price: float, latent: LatentState) -> PriceMap:
         regime = self._regime_settings(self._active_regime)
         cancelled: PriceMap = {}
-        for lots_by_price in (self._orderbook.bid_lots, self._orderbook.ask_lots):
+        for side, lots_by_price in (
+            ("bid", self._orderbook.bid_lots),
+            ("ask", self._orderbook.ask_lots),
+        ):
             for price, lots in list(lots_by_price.items()):
                 survivors = []
                 distance = abs(price - current_price) / self.gap
@@ -1438,8 +1429,11 @@ class Market:
                     lot.volume -= removed
                     if removed > 1e-12:
                         cancelled[price] = cancelled.get(price, 0.0) + removed
+                        self._orderbook.adjust_volume(side, price, -removed)
                     if lot.volume > 1e-12:
                         survivors.append(lot)
+                    elif lot.volume > 0:
+                        self._orderbook.adjust_volume(side, price, -lot.volume)
                 if survivors:
                     lots_by_price[price] = survivors
                 else:
@@ -1562,11 +1556,15 @@ class Market:
             actual = min(taker_actual, resting_actual)
             if actual <= 1e-12:
                 if self._is_exit_kind(resting_lot.kind) and resting_actual <= 1e-12:
+                    resting_side = "ask" if side == "buy" else "bid"
+                    self._orderbook.adjust_volume(resting_side, price, -resting_lot.volume)
                     resting_lot.volume = 0.0
-                    self._discard_empty_head(price, "ask" if side == "buy" else "bid")
+                    self._discard_empty_head(price, resting_side)
                     continue
                 break
             resting_lot.volume -= actual
+            resting_side = "ask" if side == "buy" else "bid"
+            self._orderbook.adjust_volume(resting_side, price, -actual)
             remaining -= actual
             self._apply_fill(kind, actual, price, mdf)
             self._apply_fill(resting_lot.kind, actual, price, mdf)
@@ -1645,14 +1643,18 @@ class Market:
             actual = min(bid_actual, ask_actual)
             if actual <= 1e-12:
                 if self._is_exit_kind(bid_lot.kind) and bid_actual <= 1e-12:
+                    self._orderbook.adjust_volume("bid", bid_price, -bid_lot.volume)
                     bid_lot.volume = 0.0
                 if self._is_exit_kind(ask_lot.kind) and ask_actual <= 1e-12:
+                    self._orderbook.adjust_volume("ask", ask_price, -ask_lot.volume)
                     ask_lot.volume = 0.0
                 self._discard_empty_head(bid_price, "bid")
                 self._discard_empty_head(ask_price, "ask")
                 continue
             bid_lot.volume -= actual
             ask_lot.volume -= actual
+            self._orderbook.adjust_volume("bid", bid_price, -actual)
+            self._orderbook.adjust_volume("ask", ask_price, -actual)
             self._apply_fill(bid_lot.kind, actual, execution_price, mdf)
             self._apply_fill(ask_lot.kind, actual, execution_price, mdf)
             stats.record(execution_price, actual)
@@ -1670,14 +1672,20 @@ class Market:
             return 0.0
         if kind == "buy_entry":
             self._long_cohorts.append(_PositionCohort("long", execution_price, volume))
+            self._long_mass_total += volume
             return volume
         elif kind == "sell_entry":
             self._short_cohorts.append(_PositionCohort("short", execution_price, volume))
+            self._short_mass_total += volume
             return volume
         elif kind == "long_exit":
-            return self._remove_cohort_mass(self._long_cohorts, execution_price, volume)
+            removed = self._remove_cohort_mass(self._long_cohorts, execution_price, volume)
+            self._long_mass_total = max(0.0, self._long_mass_total - removed)
+            return removed
         elif kind == "short_exit":
-            return self._remove_cohort_mass(self._short_cohorts, execution_price, volume)
+            removed = self._remove_cohort_mass(self._short_cohorts, execution_price, volume)
+            self._short_mass_total = max(0.0, self._short_mass_total - removed)
+            return removed
         return 0.0
 
     def _remove_cohort_mass(
@@ -1705,9 +1713,9 @@ class Market:
         if requested <= 0:
             return 0.0
         if kind == "long_exit":
-            return min(requested, sum(cohort.mass for cohort in self._long_cohorts))
+            return min(requested, self._long_mass_total)
         if kind == "short_exit":
-            return min(requested, sum(cohort.mass for cohort in self._short_cohorts))
+            return min(requested, self._short_mass_total)
         return requested
 
     def _is_exit_kind(self, kind: str) -> bool:
@@ -1716,18 +1724,16 @@ class Market:
     def _position_mass_from_cohorts(
         self, long_exit_mdf_by_price: PriceMap, short_exit_mdf_by_price: PriceMap
     ) -> PositionMassState:
-        long_total = sum(cohort.mass for cohort in self._long_cohorts)
-        short_total = sum(cohort.mass for cohort in self._short_cohorts)
         return PositionMassState(
             long_exit_mass_by_price=self._drop_zeroes(
                 {
-                    price: long_total * probability
+                    price: self._long_mass_total * probability
                     for price, probability in long_exit_mdf_by_price.items()
                 }
             ),
             short_exit_mass_by_price=self._drop_zeroes(
                 {
-                    price: short_total * probability
+                    price: self._short_mass_total * probability
                     for price, probability in short_exit_mdf_by_price.items()
                 }
             ),
@@ -1736,30 +1742,8 @@ class Market:
     def _clean_cohorts(self) -> None:
         self._long_cohorts = [cohort for cohort in self._long_cohorts if cohort.mass > 1e-12]
         self._short_cohorts = [cohort for cohort in self._short_cohorts if cohort.mass > 1e-12]
-
-    def _compact_live_state(self, current_price: float) -> None:
-        self._orderbook.compact(
-            current_price,
-            self.gap,
-            retention_ticks=max(2 * self.grid_radius, self.grid_radius + 8),
-        )
-        self._long_cohorts = self._compact_cohorts(self._long_cohorts)
-        self._short_cohorts = self._compact_cohorts(self._short_cohorts)
-
-    @staticmethod
-    def _compact_cohorts(cohorts: list[_PositionCohort]) -> list[_PositionCohort]:
-        compacted: dict[tuple[str, float, int], float] = {}
-        for cohort in cohorts:
-            if cohort.mass <= 1e-12:
-                continue
-            effective_age = min(cohort.age, 30)
-            key = (cohort.side, cohort.entry_price, effective_age)
-            compacted[key] = compacted.get(key, 0.0) + cohort.mass
-        return [
-            _PositionCohort(side=side, entry_price=entry_price, mass=mass, age=age)
-            for (side, entry_price, age), mass in sorted(compacted.items())
-            if mass > 1e-12
-        ]
+        self._long_mass_total = sum(cohort.mass for cohort in self._long_cohorts)
+        self._short_mass_total = sum(cohort.mass for cohort in self._short_cohorts)
 
     def _best_bid(self) -> float | None:
         return self._orderbook.best_bid()

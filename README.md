@@ -109,11 +109,11 @@ For simple export workflows, use `step.to_dict()`, `step.to_json()`, or
 Example output with `seed=42`:
 
 ```text
-10050.0 -> 10050.0
-executed: 0.695
-imbalance: 0.058
-crossed flow: 0.464
-residual flow: 0.15 0.082
+10020.0 -> 10010.0
+executed: 1.586
+imbalance: 0.059
+crossed flow: 1.057
+residual flow: 0.343 0.187
 ```
 
 ## Smoke Matrix
@@ -144,10 +144,10 @@ for name, kwargs, steps_count in cases:
 Recent verification on the current implementation:
 
 ```text
-baseline   range=  9990.0- 10010.0 moves=244 exec_steps=500 final= 10000.0
-busy       range=  9990.0- 10060.0 moves=216 exec_steps=500 final= 10060.0
-thin       range=   495.0-   500.0 moves=237 exec_steps=500 final=   495.0
-low_price  range=     1.0-     3.0 moves=248 exec_steps=500 final=     3.0
+baseline   range= 10000.0- 10010.0 moves=228 exec_steps=500 final= 10000.0
+busy       range=  9940.0- 10010.0 moves=214 exec_steps=500 final=  9940.0
+thin       range=   495.0-   505.0 moves=229 exec_steps=500 final=   505.0
+low_price  range=     1.0-     3.0 moves=223 exec_steps=500 final=     2.0
 inactive   range=   100.0-   100.0 moves=  0 exec_steps=  0 final=   100.0
 ```
 
@@ -158,14 +158,15 @@ steps with executed volume. Dynamic MDF acceptance also runs seeds `10..19` at
 `mdf_temperature=1.0` and checks that every MDF remains finite, non-negative,
 normalized, and broad enough not to collapse to a single price.
 
-Diagnostic note for `0.2.3`: the current MDF update is numerically stable under
+Diagnostic note for `0.2.4`: the current MDF update is numerically stable under
 the smoke metrics above, but it is not behaviorally calibrated. Treat these
 ranges, move counts, and execution counts as regression diagnostics, not claims
 that the generated paths match any real market.
 
-Performance note for `0.2.3`: live order-book lots and position cohorts are
-compacted during long runs, so internal simulator state stays bounded even when
-`keep_history=False` is used for high-volume generation.
+Performance note for `0.2.4`: live order-book and position totals are cached by
+price/side while preserving individual lot and cohort age semantics. Long runs
+avoid repeatedly summing all live lots for best-price lookup, snapshots, and
+near-touch imbalance, regardless of `keep_history`.
 
 ## Visualization
 

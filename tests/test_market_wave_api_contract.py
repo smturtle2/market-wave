@@ -506,33 +506,140 @@ def test_step_can_skip_history_and_stream_steps():
     assert [step.step_index for step in streamed] == [4, 5]
 
 
-def test_live_orderbook_lots_are_compacted_during_long_historyless_runs():
+def test_default_step_preserves_seeded_plot_path_shape():
+    market = Market(initial_price=10_000.0, gap=10.0, popularity=1.0, seed=42)
+
+    steps = market.step(260)
+    prices = [step.price_after for step in steps]
+
+    assert min(prices) == 10_000.0
+    assert max(prices) == 10_010.0
+    assert prices[-1] == 10_000.0
+    assert sum(1 for step in steps if abs(step.price_change) > 1e-12) == 110
+    assert prices[-10:] == [
+        10_000.0,
+        10_000.0,
+        10_000.0,
+        10_000.0,
+        10_000.0,
+        10_000.0,
+        10_000.0,
+        10_010.0,
+        10_010.0,
+        10_000.0,
+    ]
+
+
+def test_default_step_keeps_full_history_and_updates_live_aggregates():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.2, seed=13, grid_radius=16)
+
+    steps = market.step(1000)
+
+    assert len(steps) == 1000
+    assert market.history == steps
+    assert [step.step_index for step in steps[:3]] == [1, 2, 3]
+    assert steps[-1].step_index == 1000
+
+    expected_bid = {
+        price: volume
+        for price, volume in sorted(
+            (price, sum(lot.volume for lot in lots))
+            for price, lots in market._orderbook.bid_lots.items()
+        )
+        if volume > 1e-12
+    }
+    expected_ask = {
+        price: volume
+        for price, volume in sorted(
+            (price, sum(lot.volume for lot in lots))
+            for price, lots in market._orderbook.ask_lots.items()
+        )
+        if volume > 1e-12
+    }
+
+    assert market._orderbook.bid_volume_by_price == pytest.approx(expected_bid)
+    assert market._orderbook.ask_volume_by_price == pytest.approx(expected_ask)
+    assert market._best_bid() == (max(expected_bid) if expected_bid else None)
+    assert market._best_ask() == (min(expected_ask) if expected_ask else None)
+    assert market._long_mass_total == pytest.approx(
+        sum(cohort.mass for cohort in market._long_cohorts)
+    )
+    assert market._short_mass_total == pytest.approx(
+        sum(cohort.mass for cohort in market._short_cohorts)
+    )
+
+
+def test_orderbook_volume_cache_matches_live_lots_after_long_run():
     market = Market(initial_price=100.0, gap=1.0, popularity=1.2, seed=13, grid_radius=16)
 
     market.step(1000, keep_history=False)
 
     assert market.history == []
-    for lots_by_price in (market._orderbook.bid_lots, market._orderbook.ask_lots):
-        for lots in lots_by_price.values():
-            kinds = [lot.kind for lot in lots]
-            assert len(kinds) == len(set(kinds))
+    expected_bid = {
+        price: volume
+        for price, volume in sorted(
+            (price, sum(lot.volume for lot in lots))
+            for price, lots in market._orderbook.bid_lots.items()
+        )
+        if volume > 1e-12
+    }
+    expected_ask = {
+        price: volume
+        for price, volume in sorted(
+            (price, sum(lot.volume for lot in lots))
+            for price, lots in market._orderbook.ask_lots.items()
+        )
+        if volume > 1e-12
+    }
 
-    price_levels = len(market._orderbook.bid_lots) + len(market._orderbook.ask_lots)
-    lot_count = sum(len(lots) for lots in market._orderbook.bid_lots.values()) + sum(
-        len(lots) for lots in market._orderbook.ask_lots.values()
-    )
-    assert lot_count <= 4 * max(1, price_levels)
-    assert lot_count <= 4 * (2 * market.grid_radius + 1)
+    assert market._orderbook.bid_volume_by_price == pytest.approx(expected_bid)
+    assert market._orderbook.ask_volume_by_price == pytest.approx(expected_ask)
+    assert market._orderbook.snapshot().bid_volume_by_price == pytest.approx(expected_bid)
+    assert market._orderbook.snapshot().ask_volume_by_price == pytest.approx(expected_ask)
+    assert market._best_bid() == (max(expected_bid) if expected_bid else None)
+    assert market._best_ask() == (min(expected_ask) if expected_ask else None)
 
 
-def test_position_cohorts_are_compacted_by_effective_age():
+def test_position_mass_cache_matches_live_cohorts_after_long_run():
     market = Market(initial_price=100.0, gap=1.0, popularity=1.3, seed=88, grid_radius=14)
 
     market.step(750, keep_history=False)
 
-    for cohorts in (market._long_cohorts, market._short_cohorts):
-        groups = [(cohort.side, cohort.entry_price, min(cohort.age, 30)) for cohort in cohorts]
-        assert len(groups) == len(set(groups))
+    assert market._long_mass_total == pytest.approx(
+        sum(cohort.mass for cohort in market._long_cohorts)
+    )
+    assert market._short_mass_total == pytest.approx(
+        sum(cohort.mass for cohort in market._short_cohorts)
+    )
+
+
+def test_default_plot_path_renders_panel_with_orderbook_heatmaps():
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    from matplotlib import pyplot as plt
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.1, seed=2026, grid_radius=8)
+    market.step(5)
+
+    fig, ax = market.plot()
+
+    try:
+        assert isinstance(fig, Figure)
+        assert isinstance(ax, Axes)
+        assert ax in fig.axes
+        assert len(fig.axes) >= 5
+        assert fig.axes[1].get_ylabel() == "ask level"
+        assert fig.axes[2].get_ylabel() == "bid level"
+        assert [image.get_array().shape for image in fig.axes[1].images] == [
+            (market.grid_radius, len(market.history))
+        ]
+        assert [image.get_array().shape for image in fig.axes[2].images] == [
+            (market.grid_radius, len(market.history))
+        ]
+    finally:
+        plt.close(fig)
 
 
 def test_stepinfo_exposes_relative_tick_mdfs():

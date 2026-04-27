@@ -107,11 +107,11 @@ for step in market.stream(512, keep_history=False):
 `seed=42` 기준 예시 출력:
 
 ```text
-10050.0 -> 10050.0
-executed: 0.695
-imbalance: 0.058
-crossed flow: 0.464
-residual flow: 0.15 0.082
+10020.0 -> 10010.0
+executed: 1.586
+imbalance: 0.059
+crossed flow: 1.057
+residual flow: 0.343 0.187
 ```
 
 ## 스모크 매트릭스
@@ -142,10 +142,10 @@ for name, kwargs, steps_count in cases:
 현재 구현에서 최근 검증한 결과:
 
 ```text
-baseline   range=  9990.0- 10010.0 moves=244 exec_steps=500 final= 10000.0
-busy       range=  9990.0- 10060.0 moves=216 exec_steps=500 final= 10060.0
-thin       range=   495.0-   500.0 moves=237 exec_steps=500 final=   495.0
-low_price  range=     1.0-     3.0 moves=248 exec_steps=500 final=     3.0
+baseline   range= 10000.0- 10010.0 moves=228 exec_steps=500 final= 10000.0
+busy       range=  9940.0- 10010.0 moves=214 exec_steps=500 final=  9940.0
+thin       range=   495.0-   505.0 moves=229 exec_steps=500 final=   505.0
+low_price  range=     1.0-     3.0 moves=223 exec_steps=500 final=     2.0
 inactive   range=   100.0-   100.0 moves=  0 exec_steps=  0 final=   100.0
 ```
 
@@ -156,14 +156,15 @@ Dynamic MDF acceptance는 `mdf_temperature=1.0`에서 seed `10..19`도 실행해
 모든 MDF가 finite, non-negative, normalized 상태를 유지하고 한 가격으로
 붕괴하지 않는지도 확인합니다.
 
-`0.2.3` 진단 메모: 현재 MDF update는 위 smoke metric 기준으로 수치적으로
+`0.2.4` 진단 메모: 현재 MDF update는 위 smoke metric 기준으로 수치적으로
 안정적이지만, 행동적으로 calibration된 상태는 아닙니다. 위 range, move count,
 execution count는 실제 시장과의 일치 주장이 아니라 regression diagnostic으로
 보아야 합니다.
 
-`0.2.3` 성능 메모: 긴 실행 중 live orderbook lot과 position cohort를 compact하므로,
-대량 생성에서 `keep_history=False`를 쓰는 경우에도 내부 simulator state가 bounded하게
-유지됩니다.
+`0.2.4` 성능 메모: live orderbook과 position total을 price/side별로 cache하면서도
+개별 lot과 cohort의 age 의미는 유지합니다. 긴 실행에서도 best-price lookup, snapshot,
+near-touch imbalance 계산에서 모든 live lot을 반복 합산하지 않으며, 이 개선은
+`keep_history` 값과 무관하게 적용됩니다.
 
 ## 시각화
 
