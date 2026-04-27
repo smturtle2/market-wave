@@ -107,11 +107,11 @@ For simple export workflows, use `step.to_dict()`, `step.to_json()`, or
 Example output with `seed=42`:
 
 ```text
-9880.0 -> 9890.0
-entry: 3.321
-executed: 2.863
-resting bid/ask: 16.4 15.632
-imbalance: -0.151
+10020.0 -> 10010.0
+entry: 2.955
+executed: 0.976
+resting bid/ask: 24.662 25.83
+imbalance: 0.484
 ```
 
 ## Smoke Matrix
@@ -144,12 +144,12 @@ for name, kwargs, steps_count in cases:
 Recent verification on the current implementation:
 
 ```text
-baseline  range=  9850.0- 10050.0 unique= 21 moves=396 exec_steps=500 final=  9890.0
-busy      range=  9940.0- 10260.0 unique= 32 moves=397 exec_steps=500 final= 10260.0
-thin      range=   500.0-   650.0 unique= 31 moves=339 exec_steps=500 final=   630.0
-low_price range=     2.0-    24.0 unique= 23 moves=393 exec_steps=500 final=    21.0
-trend_up  range=  9990.0- 10420.0 unique= 44 moves=402 exec_steps=500 final= 10410.0
-high_vol  range=  9980.0- 10180.0 unique= 21 moves=422 exec_steps=500 final= 10140.0
+baseline  range=  9900.0- 10080.0 unique= 19 moves=369 exec_steps=500 final= 10010.0
+busy      range=  9890.0- 10030.0 unique= 15 moves=388 exec_steps=500 final=  9910.0
+thin      range=   455.0-   535.0 unique= 17 moves=318 exec_steps=500 final=   500.0
+low_price range=     2.0-    24.0 unique= 23 moves=380 exec_steps=500 final=    19.0
+trend_up  range= 10000.0- 10320.0 unique= 33 moves=388 exec_steps=500 final= 10320.0
+high_vol  range=  9960.0- 10040.0 unique=  9 moves=405 exec_steps=500 final=  9970.0
 inactive  range=   100.0-   100.0 unique=  1 moves=  0 exec_steps=  0 final=   100.0
 ```
 
@@ -160,7 +160,7 @@ steps with executed volume. Dynamic MDF acceptance also runs seeds `10..19` at
 `mdf_temperature=1.0` and checks that every MDF remains finite, non-negative,
 normalized, and broad enough not to collapse to a single price.
 
-Diagnostic note for `0.4.0`: the simulator still has no anchor price or stored
+Diagnostic note for `0.4.1`: the simulator still has no anchor price or stored
 target that pulls paths back to the initial price. Seeded `mood`, `trend`,
 `volatility`, microstructure activity, cancellation pressure, and event pressure
 evolve each step and reshape the MDFs and visible book. Prices remain
@@ -175,6 +175,13 @@ existing opposite-side quotes. Executions print at the resting quote price.
 Unfilled volume remains in the book at the sampled MDF price. Exit flow is
 cohort-conditioned, so exit orders carry the originating cohort id and still
 route through visible order-book liquidity.
+
+MDF note for `0.4.1`: the default entry MDF now uses a side-relative
+reservation-price mixture. Buy entry intent is spread across deep value,
+passive bid, arrival, and small chase zones; sell entry intent mirrors that on
+the ask side. This keeps passive limit interest in the MDF itself instead of
+adding synthetic fixed walls, while reducing excessive buy-ask and sell-bid
+tail mass.
 
 Microstructure note for `0.4.0`: order-book replenishment now includes
 regime-specific depth shape, resiliency, wall memory by absolute tick,

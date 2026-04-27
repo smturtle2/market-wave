@@ -945,6 +945,32 @@ def test_stepinfo_exposes_relative_tick_mdfs():
     assert step.price_change == pytest.approx(step.tick_change * market.tick_size)
 
 
+def test_default_entry_mdfs_keep_passive_reservation_price_zones():
+    market = Market(
+        initial_price=100.0,
+        gap=1.0,
+        seed=7,
+        grid_radius=12,
+        regime="normal",
+        augmentation_strength=0.0,
+    )
+
+    step = market.step(1, keep_history=False)[0]
+    buy_passive = sum(volume for tick, volume in step.buy_entry_mdf.items() if tick <= -2)
+    sell_passive = sum(volume for tick, volume in step.sell_entry_mdf.items() if tick >= 2)
+    buy_marketish = sum(volume for tick, volume in step.buy_entry_mdf.items() if tick >= 1)
+    sell_marketish = sum(volume for tick, volume in step.sell_entry_mdf.items() if tick <= -1)
+    buy_arrival = sum(volume for tick, volume in step.buy_entry_mdf.items() if -1 <= tick <= 0)
+    sell_arrival = sum(volume for tick, volume in step.sell_entry_mdf.items() if 0 <= tick <= 1)
+
+    assert buy_passive > 0.55
+    assert sell_passive > 0.55
+    assert buy_marketish < 0.25
+    assert sell_marketish < 0.25
+    assert buy_arrival > 0.10
+    assert sell_arrival > 0.10
+
+
 def test_stepinfo_mdf_price_basis_is_pre_trade_price():
     market = Market(initial_price=100.0, gap=1.0, seed=24, grid_radius=6)
 
@@ -1193,6 +1219,41 @@ def test_orderbook_state_is_nonnegative_and_carries_forward_tolerantly():
     assert carryover_seen or nonempty, (
         "Expected order book depth to persist or remain observable across steps"
     )
+
+
+def test_default_entry_mdfs_build_passive_depth_without_killing_executions():
+    market = Market(
+        initial_price=100.0,
+        gap=1.0,
+        popularity=1.0,
+        seed=31,
+        grid_radius=12,
+        regime="normal",
+        augmentation_strength=0.0,
+    )
+
+    deep_bid_seen = False
+    deep_ask_seen = False
+    total_executed = 0.0
+    for step in market.step(40, keep_history=False):
+        price = step.price_after
+        deep_bid = sum(
+            volume
+            for bid_price, volume in step.orderbook_after.bid_volume_by_price.items()
+            if (price - bid_price) / market.gap >= 3
+        )
+        deep_ask = sum(
+            volume
+            for ask_price, volume in step.orderbook_after.ask_volume_by_price.items()
+            if (ask_price - price) / market.gap >= 3
+        )
+        deep_bid_seen = deep_bid_seen or deep_bid > 0.5
+        deep_ask_seen = deep_ask_seen or deep_ask > 0.5
+        total_executed += step.total_executed_volume
+
+    assert deep_bid_seen
+    assert deep_ask_seen
+    assert total_executed > 0.0
 
 
 def test_stepinfo_exposes_market_realism_diagnostics():

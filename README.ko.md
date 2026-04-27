@@ -105,11 +105,11 @@ for step in market.stream(512, keep_history=False):
 `seed=42` 기준 예시 출력:
 
 ```text
-9880.0 -> 9890.0
-entry: 3.321
-executed: 2.863
-resting bid/ask: 16.4 15.632
-imbalance: -0.151
+10020.0 -> 10010.0
+entry: 2.955
+executed: 0.976
+resting bid/ask: 24.662 25.83
+imbalance: 0.484
 ```
 
 ## 스모크 매트릭스
@@ -142,12 +142,12 @@ for name, kwargs, steps_count in cases:
 현재 구현에서 최근 검증한 결과:
 
 ```text
-baseline  range=  9850.0- 10050.0 unique= 21 moves=396 exec_steps=500 final=  9890.0
-busy      range=  9940.0- 10260.0 unique= 32 moves=397 exec_steps=500 final= 10260.0
-thin      range=   500.0-   650.0 unique= 31 moves=339 exec_steps=500 final=   630.0
-low_price range=     2.0-    24.0 unique= 23 moves=393 exec_steps=500 final=    21.0
-trend_up  range=  9990.0- 10420.0 unique= 44 moves=402 exec_steps=500 final= 10410.0
-high_vol  range=  9980.0- 10180.0 unique= 21 moves=422 exec_steps=500 final= 10140.0
+baseline  range=  9900.0- 10080.0 unique= 19 moves=369 exec_steps=500 final= 10010.0
+busy      range=  9890.0- 10030.0 unique= 15 moves=388 exec_steps=500 final=  9910.0
+thin      range=   455.0-   535.0 unique= 17 moves=318 exec_steps=500 final=   500.0
+low_price range=     2.0-    24.0 unique= 23 moves=380 exec_steps=500 final=    19.0
+trend_up  range= 10000.0- 10320.0 unique= 33 moves=388 exec_steps=500 final= 10320.0
+high_vol  range=  9960.0- 10040.0 unique=  9 moves=405 exec_steps=500 final=  9970.0
 inactive  range=   100.0-   100.0 unique=  1 moves=  0 exec_steps=  0 final=   100.0
 ```
 
@@ -158,7 +158,7 @@ Dynamic MDF acceptance는 `mdf_temperature=1.0`에서 seed `10..19`도 실행해
 모든 MDF가 finite, non-negative, normalized 상태를 유지하고 한 가격으로
 붕괴하지 않는지도 확인합니다.
 
-`0.4.0` 진단 메모: 시뮬레이터는 여전히 가격을 초기값으로 되돌리는 anchor나
+`0.4.1` 진단 메모: 시뮬레이터는 여전히 가격을 초기값으로 되돌리는 anchor나
 저장된 목표 가격을 갖지 않습니다. seed로 정해진 `mood`, `trend`, `volatility`,
 microstructure activity, cancellation pressure, event pressure가 매 step 전이되며
 MDF와 visible book을 바꿉니다. 가격은 체결 기반으로 움직이고, 체결 flow가
@@ -171,6 +171,13 @@ Entry MDF의 가격은 incoming order 가격으로 취급됩니다. 매수 entry
 가격은 resting quote 가격입니다. 체결되지 않은 물량은 sampled MDF 가격에
 그대로 미체결 호가로 남습니다. Exit flow는 cohort 조건부로 생성되며, exit
 주문도 원래 cohort id를 들고 visible order-book liquidity를 통해 처리됩니다.
+
+`0.4.1` MDF 메모: 기본 entry MDF는 이제 side-relative reservation-price
+mixture를 사용합니다. 매수 entry 의도는 deep value, passive bid, arrival,
+작은 chase 구간에 분산되고, 매도 entry 의도는 ask 쪽에서 이를 대칭적으로
+반영합니다. 고정된 synthetic wall을 추가하지 않고 MDF 자체에 passive limit
+interest가 남도록 하며, buy-ask와 sell-bid 방향으로 과하게 새던 tail mass를
+줄입니다.
 
 `0.4.0` microstructure 메모: orderbook 보충은 regime별 depth shape, resiliency,
 absolute tick 기준 wall memory, event-driven volume burst, cancellation pressure
