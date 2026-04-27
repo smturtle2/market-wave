@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from copy import deepcopy
 from dataclasses import dataclass, field
-from math import exp, isfinite, log
+from math import exp, isfinite, log, log1p
 from random import Random
 
 from .distribution import (
@@ -103,6 +103,30 @@ class _ExecutionResult:
     crossed_market_volume: float
     market_buy_volume: float = 0.0
     market_sell_volume: float = 0.0
+
+
+@dataclass
+class _MicrostructureState:
+    activity: float = 0.0
+    cancel_pressure: float = 0.0
+    resiliency: float = 1.0
+    recent_signed_return: float = 0.0
+    recent_flow_imbalance: float = 0.0
+    squeeze_pressure: float = 0.0
+    activity_event: float = 0.0
+    wall_pressure_by_absolute_tick: TickMap = field(default_factory=dict)
+    last_cancelled_volume: float = 0.0
+
+
+@dataclass(frozen=True)
+class _MicrostructureInputs:
+    execution_pressure: float
+    return_shock: float
+    volatility_shock: float
+    imbalance_shock: float
+    signed_return: float
+    flow_imbalance: float
+    squeeze_setup: float
 
 
 @dataclass
@@ -274,6 +298,20 @@ class Market:
                 "cancel": 1.0,
                 "liquidity": 1.0,
                 "spread": 1.0,
+                "activity_gain": 0.20,
+                "activity_decay": 0.76,
+                "cancel_burst": 0.68,
+                "cancel_decay": 0.70,
+                "depth_exponent": 1.35,
+                "near_touch_liquidity": 1.0,
+                "wall_persistence": 0.82,
+                "wall_strength": 0.45,
+                "resiliency": 0.92,
+                "event_gain": 0.36,
+                "book_noise": 0.18,
+                "trend_exhaustion": 0.055,
+                "flow_reversal": 0.045,
+                "squeeze_gain": 0.0,
             },
             "trend_up": {
                 "mood": 0.04,
@@ -285,6 +323,20 @@ class Market:
                 "cancel": 1.02,
                 "liquidity": 1.0,
                 "spread": 1.05,
+                "activity_gain": 0.22,
+                "activity_decay": 0.78,
+                "cancel_burst": 0.72,
+                "cancel_decay": 0.70,
+                "depth_exponent": 1.28,
+                "near_touch_liquidity": 1.04,
+                "wall_persistence": 0.84,
+                "wall_strength": 0.50,
+                "resiliency": 0.98,
+                "event_gain": 0.40,
+                "book_noise": 0.20,
+                "trend_exhaustion": 0.050,
+                "flow_reversal": 0.040,
+                "squeeze_gain": 0.0,
             },
             "trend_down": {
                 "mood": -0.04,
@@ -296,17 +348,45 @@ class Market:
                 "cancel": 1.04,
                 "liquidity": 0.98,
                 "spread": 1.08,
+                "activity_gain": 0.23,
+                "activity_decay": 0.78,
+                "cancel_burst": 0.76,
+                "cancel_decay": 0.70,
+                "depth_exponent": 1.26,
+                "near_touch_liquidity": 0.98,
+                "wall_persistence": 0.82,
+                "wall_strength": 0.46,
+                "resiliency": 0.90,
+                "event_gain": 0.42,
+                "book_noise": 0.20,
+                "trend_exhaustion": 0.055,
+                "flow_reversal": 0.045,
+                "squeeze_gain": 0.0,
             },
             "high_vol": {
                 "mood": 0.0,
                 "trend": 0.0,
                 "volatility": 1.35,
                 "volatility_bias": 0.06,
-                "intensity": 1.35,
-                "taker": 1.24,
+                "intensity": 1.22,
+                "taker": 1.18,
                 "cancel": 1.25,
                 "liquidity": 0.9,
                 "spread": 1.35,
+                "activity_gain": 0.26,
+                "activity_decay": 0.76,
+                "cancel_burst": 0.92,
+                "cancel_decay": 0.70,
+                "depth_exponent": 1.05,
+                "near_touch_liquidity": 0.76,
+                "wall_persistence": 0.66,
+                "wall_strength": 0.30,
+                "resiliency": 0.58,
+                "event_gain": 0.62,
+                "book_noise": 0.28,
+                "trend_exhaustion": 0.060,
+                "flow_reversal": 0.055,
+                "squeeze_gain": 0.0,
             },
             "thin_liquidity": {
                 "mood": 0.0,
@@ -318,17 +398,45 @@ class Market:
                 "cancel": 1.28,
                 "liquidity": 0.42,
                 "spread": 1.22,
+                "activity_gain": 0.19,
+                "activity_decay": 0.74,
+                "cancel_burst": 0.84,
+                "cancel_decay": 0.70,
+                "depth_exponent": 1.55,
+                "near_touch_liquidity": 0.58,
+                "wall_persistence": 0.58,
+                "wall_strength": 0.24,
+                "resiliency": 0.42,
+                "event_gain": 0.58,
+                "book_noise": 0.30,
+                "trend_exhaustion": 0.065,
+                "flow_reversal": 0.060,
+                "squeeze_gain": 0.0,
             },
             "squeeze": {
-                "mood": 0.06,
-                "trend": 0.12,
+                "mood": 0.015,
+                "trend": 0.015,
                 "volatility": 1.45,
-                "volatility_bias": 0.08,
-                "intensity": 1.55,
-                "taker": 1.34,
+                "volatility_bias": 0.035,
+                "intensity": 1.14,
+                "taker": 1.10,
                 "cancel": 1.18,
                 "liquidity": 0.7,
                 "spread": 1.4,
+                "activity_gain": 0.25,
+                "activity_decay": 0.76,
+                "cancel_burst": 0.82,
+                "cancel_decay": 0.70,
+                "depth_exponent": 1.16,
+                "near_touch_liquidity": 0.70,
+                "wall_persistence": 0.74,
+                "wall_strength": 0.40,
+                "resiliency": 0.66,
+                "event_gain": 0.70,
+                "book_noise": 0.28,
+                "trend_exhaustion": 0.070,
+                "flow_reversal": 0.045,
+                "squeeze_gain": 0.34,
             },
         }
         return settings.get(regime, settings["normal"])
@@ -390,6 +498,7 @@ class Market:
         self._last_imbalance = 0.0
         self._last_execution_volume = 0.0
         self._last_executed_by_price: PriceMap = {}
+        self._microstructure = _MicrostructureState()
         self._mdf_model_accepts_signals = self._scores_accepts_signals(self.mdf_model.scores)
         self._mdf_memory: dict[str, dict[int, float]] = {}
 
@@ -907,7 +1016,8 @@ class Market:
 
         self._active_regime = self._next_regime()
         latent = self._next_latent(state.latent)
-        intensity = self._next_intensity(latent)
+        micro = self._next_microstructure_state(state.latent, latent, pre_imbalance)
+        intensity = self._next_intensity(latent, micro)
         mdf = self._next_mdf(
             price_before,
             price_grid,
@@ -916,7 +1026,7 @@ class Market:
             update_memory=True,
         )
 
-        cancelled_volume = self._cancel_orders(price_before, latent)
+        cancelled_volume = self._cancel_orders(price_before, latent, micro)
         long_exit_flow = self._exit_flow(
             "long",
             price_before,
@@ -936,7 +1046,7 @@ class Market:
             short_exit_flow.intent_volume_by_price,
         )
 
-        self._add_liquidity_replenishment(price_before, latent, pre_imbalance)
+        self._add_liquidity_replenishment(price_before, latent, pre_imbalance, micro)
         self._add_exit_orders(short_exit_flow.limit_orders, side="bid", kind="short_exit")
         self._add_exit_orders(long_exit_flow.limit_orders, side="ask", kind="long_exit")
         entry_flow = self._entry_flow(intensity, mdf)
@@ -952,7 +1062,7 @@ class Market:
         self._clean_orderbook()
         self._clean_cohorts()
 
-        price_after = self._next_price_after_trading(price_before, stats)
+        price_after = self._next_price_after_trading(price_before, stats, execution)
         price_after = self._snap_price(price_after)
         self._last_return_ticks = (price_after - price_before) / self.gap
         self._last_abs_return_ticks = abs(self._last_return_ticks)
@@ -960,6 +1070,7 @@ class Market:
         self._last_executed_by_price = self._drop_zeroes(stats.executed_by_price)
         self._trim_orderbook_through_last_price(price_after)
         self._prune_orderbook_window(price_after)
+        self._update_wall_memory_from_book(price_after, micro)
 
         state_grid = self._price_grid(price_after)
         state_mdf = self._reproject_mdf(price_after, mdf)
@@ -1074,20 +1185,39 @@ class Market:
         for cohort in (*self._long_cohorts, *self._short_cohorts):
             cohort.age += 1
 
-    def _next_price_after_trading(self, price_before: float, stats: _TradeStats) -> float:
+    def _next_price_after_trading(
+        self,
+        price_before: float,
+        stats: _TradeStats,
+        execution: _ExecutionResult,
+    ) -> float:
         if stats.total_volume <= 0 or stats.last_price is None:
             return price_before
         vwap = stats.notional / stats.total_volume
         execution_price = 0.68 * stats.last_price + 0.32 * vwap
         execution_move_ticks = (execution_price - price_before) / self.gap
-        if abs(execution_move_ticks) <= 1e-12:
+        flow_total = execution.market_buy_volume + execution.market_sell_volume
+        flow_imbalance = (
+            self._clamp(
+                (execution.market_buy_volume - execution.market_sell_volume) / flow_total,
+                -1.0,
+                1.0,
+            )
+            if flow_total > 1e-12
+            else 0.0
+        )
+        if abs(execution_move_ticks) <= 1e-12 and abs(flow_imbalance) <= 1e-12:
             return price_before
         volume_confidence = self._clamp(
             stats.total_volume / max(0.7, self.popularity),
             0.35,
             1.40,
         )
-        proposed_ticks = execution_move_ticks * (0.85 + 0.25 * volume_confidence)
+        # Last price shows where trades occurred; flow only nudges revealed pressure.
+        price_discovery = self._clamp(abs(execution_move_ticks) / 1.5, 0.25, 1.0)
+        flow_move_ticks = flow_imbalance * (0.18 + 0.12 * volume_confidence) * price_discovery
+        proposed_ticks = execution_move_ticks * (0.72 + 0.18 * volume_confidence)
+        proposed_ticks += flow_move_ticks
         proposed_ticks = self._clamp(proposed_ticks, -3.0, 3.0)
         return max(self._min_price, price_before + proposed_ticks * self.gap)
 
@@ -1119,57 +1249,100 @@ class Market:
 
     def _next_latent(self, latent: LatentState) -> LatentState:
         regime = self._regime_settings(self._active_regime)
-        mood_noise = self._rng.gauss(0.0, 0.15)
-        trend_noise = self._rng.gauss(0.0, 0.10)
+        micro = self._microstructure
+        mood_noise = self._rng.gauss(0.0, 0.11)
+        trend_noise = self._rng.gauss(0.0, 0.08)
         jump_probability = 0.024 * regime["volatility"] * (1.0 + self.augmentation_strength)
         jump = self._rng.gauss(0.0, 0.55) if self._rng.random() < jump_probability else 0.0
         signed_flow = 0.08 * self._last_imbalance - 0.03 * self._last_return_ticks
+        exhaustion = self._trend_exhaustion(micro)
+        squeeze_impulse = self._squeeze_impulse(micro)
+        mood_target = regime["mood"] + 0.06 * latent.trend - 0.025 * exhaustion
 
         mood = self._clamp(
-            0.66 * latent.mood
-            + 0.08 * latent.trend
+            0.74 * latent.mood
+            + 0.26 * mood_target
             + signed_flow
-            + regime["mood"]
             + mood_noise
-            + 0.30 * jump,
+            + 0.22 * jump,
             -1.0,
             1.0,
         )
+        trend_target = regime["trend"] + 0.10 * mood
+        trend_target += 0.05 * squeeze_impulse
+        trend_target -= regime["trend_exhaustion"] * exhaustion
         trend = self._clamp(
-            0.72 * latent.trend
-            + 0.10 * mood
-            - 0.04 * self._last_return_ticks
-            + regime["trend"]
-            + 0.12 * jump
+            0.74 * latent.trend
+            + 0.26 * trend_target
+            - 0.06 * self._last_return_ticks
+            + 0.08 * jump
             + trend_noise,
             -1.0,
             1.0,
         )
-        shock = abs(mood_noise) + abs(jump) * 0.75
-        realized = 0.12 * self._last_abs_return_ticks + 0.025 * self._last_execution_volume
+        noise_shock = max(0.0, abs(mood_noise) - 0.08)
+        shock = 0.32 * noise_shock + abs(jump) * 0.24
+        execution_pressure = min(
+            self._last_execution_volume / max(0.7, self.popularity),
+            4.0,
+        )
+        # Volatility is a regime target plus fresh shocks, not an accumulated level.
+        realized = 0.030 * min(self._last_abs_return_ticks, 3.0) + 0.004 * execution_pressure
+        volatility_target = 0.28 + 0.22 * regime["volatility"] + regime["volatility_bias"]
         volatility = self._clamp(
-            0.78 * latent.volatility
+            0.84 * latent.volatility
+            + 0.16 * volatility_target
             + shock
             + realized
-            + 0.03 * abs(self._last_imbalance)
-            + regime["volatility_bias"],
+            + 0.008 * abs(self._last_imbalance),
             0.04,
-            2.2,
+            1.55,
         )
         return LatentState(mood=mood, trend=trend, volatility=volatility)
 
-    def _next_intensity(self, latent: LatentState) -> IntensityState:
+    def _trend_exhaustion(self, micro: _MicrostructureState) -> float:
+        return self._clamp(
+            0.70 * self._clamp(micro.recent_signed_return / 8.0, -1.0, 1.0)
+            + 0.30 * micro.recent_flow_imbalance,
+            -1.0,
+            1.0,
+        )
+
+    def _squeeze_impulse(self, micro: _MicrostructureState) -> float:
+        if self._active_regime != "squeeze":
+            return 0.0
+        return self._clamp(micro.squeeze_pressure, 0.0, 1.5)
+
+    def _next_intensity(
+        self,
+        latent: LatentState,
+        micro: _MicrostructureState | None = None,
+    ) -> IntensityState:
         regime = self._regime_settings(self._active_regime)
+        micro = micro or self._microstructure
         augmentation = 1.0 + self.augmentation_strength * self._rng.uniform(-0.18, 0.28)
+        flow_reversal = self._flow_reversal_pressure(micro)
+        activity = micro.activity
+        activity_multiplier = 1.0 + 0.38 * self._clamp(activity, 0.0, 2.2)
+        event_multiplier = 1.0 + 0.32 * self._clamp(micro.activity_event, 0.0, 1.8)
+        dry_up = self._clamp(1.0 - 0.10 * micro.cancel_pressure, 0.68, 1.0)
         total = (
-            self.popularity * (1.0 + 2.2 * latent.volatility) * regime["intensity"] * augmentation
+            self.popularity
+            * (1.0 + 2.2 * latent.volatility)
+            * regime["intensity"]
+            * augmentation
+            * activity_multiplier
+            * event_multiplier
+            * dry_up
         )
         buy_ratio = self._clamp(
             0.5
             + 0.24 * latent.mood
             + 0.18 * latent.trend
             + 0.04 * self._last_imbalance
-            - 0.06 * self._last_return_ticks,
+            + 0.025 * self._squeeze_impulse(micro)
+            - 0.06 * self._last_return_ticks
+            - regime["flow_reversal"] * flow_reversal,
             0.08,
             0.92,
         )
@@ -1181,6 +1354,163 @@ class Market:
             buy_ratio=buy_ratio,
             sell_ratio=sell_ratio,
         )
+
+    def _flow_reversal_pressure(self, micro: _MicrostructureState) -> float:
+        return self._clamp(
+            0.65 * micro.recent_flow_imbalance
+            + 0.35 * self._clamp(micro.recent_signed_return / 6.0, -1.0, 1.0),
+            -1.0,
+            1.0,
+        )
+
+    def _next_microstructure_state(
+        self,
+        previous_latent: LatentState,
+        latent: LatentState,
+        imbalance: float,
+    ) -> _MicrostructureState:
+        """Update internal book pressure that links realized flow to future liquidity."""
+        regime = self._regime_settings(self._active_regime)
+        previous = self._microstructure
+        inputs = self._microstructure_inputs(previous_latent, latent, imbalance)
+        realized_activity = (
+            0.46 * inputs.execution_pressure
+            + 0.34 * inputs.return_shock
+            + 0.16 * inputs.volatility_shock
+            + 0.10 * inputs.imbalance_shock
+        )
+        activity = self._clamp(
+            regime["activity_decay"] * previous.activity
+            + regime["activity_gain"] * realized_activity,
+            0.0,
+            2.0,
+        )
+
+        shock = (
+            0.40 * inputs.return_shock
+            + 0.22 * inputs.imbalance_shock
+            + 0.28 * inputs.volatility_shock
+            + 0.04 * max(0.0, activity - previous.activity)
+        )
+        # Cancellation bursts are stateful: shocks raise pressure, then pressure decays.
+        cancel_pressure = self._clamp(
+            regime["cancel_decay"] * previous.cancel_pressure
+            + regime["cancel_burst"] * shock,
+            0.0,
+            2.0,
+        )
+
+        wall_pressure = self._decay_wall_pressure(previous.wall_pressure_by_absolute_tick, regime)
+        recent_signed_return = self._clamp(
+            0.86 * previous.recent_signed_return + 0.14 * inputs.signed_return,
+            -12.0,
+            12.0,
+        )
+        recent_flow_imbalance = self._clamp(
+            0.78 * previous.recent_flow_imbalance + 0.22 * inputs.flow_imbalance,
+            -1.0,
+            1.0,
+        )
+        activity_event = self._next_activity_event(previous, inputs, regime)
+        squeeze_pressure = self._next_squeeze_pressure(previous, inputs, regime)
+        resiliency_target = regime["resiliency"] * self._clamp(
+            1.0 - 0.18 * cancel_pressure + 0.08 * previous.activity - 0.05 * activity_event,
+            0.30,
+            1.30,
+        )
+        resiliency = self._clamp(0.76 * previous.resiliency + 0.24 * resiliency_target, 0.20, 1.40)
+        micro = _MicrostructureState(
+            activity=activity,
+            cancel_pressure=cancel_pressure,
+            resiliency=resiliency,
+            recent_signed_return=recent_signed_return,
+            recent_flow_imbalance=recent_flow_imbalance,
+            squeeze_pressure=squeeze_pressure,
+            activity_event=activity_event,
+            wall_pressure_by_absolute_tick=wall_pressure,
+            last_cancelled_volume=previous.last_cancelled_volume,
+        )
+        self._microstructure = micro
+        return micro
+
+    def _microstructure_inputs(
+        self,
+        previous_latent: LatentState,
+        latent: LatentState,
+        imbalance: float,
+    ) -> _MicrostructureInputs:
+        execution_pressure = min(
+            log1p(self._last_execution_volume / max(0.7, self.popularity)),
+            2.0,
+        )
+        volatility_jump = max(0.0, latent.volatility - previous_latent.volatility)
+        return _MicrostructureInputs(
+            execution_pressure=execution_pressure,
+            return_shock=1.0 - exp(-self._last_abs_return_ticks / 1.4),
+            volatility_shock=1.0 - exp(-volatility_jump / 0.25),
+            imbalance_shock=abs(imbalance - self._last_imbalance),
+            signed_return=self._last_return_ticks,
+            flow_imbalance=self._last_imbalance,
+            squeeze_setup=self._squeeze_setup_pressure(),
+        )
+
+    def _next_activity_event(
+        self,
+        previous: _MicrostructureState,
+        inputs: _MicrostructureInputs,
+        regime: dict[str, float],
+    ) -> float:
+        burst_seed = (
+            max(0.0, inputs.return_shock - 0.42)
+            + 0.36 * inputs.volatility_shock
+            + 0.22 * max(0.0, abs(inputs.flow_imbalance) - 0.35)
+            + 0.18 * max(0.0, inputs.execution_pressure - 0.90)
+        )
+        return self._clamp(
+            0.72 * previous.activity_event + regime["event_gain"] * burst_seed,
+            0.0,
+            1.8,
+        )
+
+    def _next_squeeze_pressure(
+        self,
+        previous: _MicrostructureState,
+        inputs: _MicrostructureInputs,
+        regime: dict[str, float],
+    ) -> float:
+        release = max(0.0, -inputs.signed_return) / 3.0
+        return self._clamp(
+            0.56 * previous.squeeze_pressure
+            + regime["squeeze_gain"] * inputs.squeeze_setup
+            - 0.34 * release,
+            0.0,
+            1.5,
+        )
+
+    def _squeeze_setup_pressure(self) -> float:
+        if self._active_regime != "squeeze" or self._short_mass_total <= 1e-12:
+            return 0.0
+        total_mass = self._long_mass_total + self._short_mass_total
+        short_share = self._short_mass_total / max(total_mass, 1e-12)
+        relative_crowding = self._clamp((short_share - 0.45) * 2.0, 0.0, 1.0)
+        absolute_crowding = self._clamp(
+            self._short_mass_total / max(8.0 * self.popularity, 1.0),
+            0.0,
+            1.0,
+        )
+        short_pressure = max(relative_crowding, 0.45 * absolute_crowding)
+        adverse_move = self._clamp(max(0.0, self._last_return_ticks) / 3.0, 0.0, 1.0)
+        buy_pressure = self._clamp(max(0.0, self._last_imbalance), 0.0, 1.0)
+        trigger = self._clamp(0.65 * adverse_move + 0.35 * buy_pressure - 0.15, 0.0, 1.0)
+        return self._clamp(short_pressure * trigger, 0.0, 1.0)
+
+    def _decay_wall_pressure(self, values: TickMap, regime: dict[str, float]) -> TickMap:
+        persistence = regime["wall_persistence"]
+        return {
+            tick: pressure * persistence
+            for tick, pressure in values.items()
+            if pressure * persistence > 1e-4
+        }
 
     def _next_mdf(
         self,
@@ -1654,8 +1984,12 @@ class Market:
             return [(fallback, volume)]
         return [(price, volume * weight / total_weight) for price, weight in candidates]
 
-    def _cancel_orders(self, current_price: float, latent: LatentState) -> PriceMap:
-        regime = self._regime_settings(self._active_regime)
+    def _cancel_orders(
+        self,
+        current_price: float,
+        latent: LatentState,
+        micro: _MicrostructureState,
+    ) -> PriceMap:
         cancelled: PriceMap = {}
         for side, lots_by_price in (
             ("bid", self._orderbook.bid_lots),
@@ -1663,13 +1997,14 @@ class Market:
         ):
             for price, lots in list(lots_by_price.items()):
                 survivors = []
-                distance = abs(price - current_price) / self.gap
                 for lot in lots:
-                    probability = self._clamp(
-                        (0.025 + 0.018 * lot.age + 0.012 * distance + 0.035 * latent.volatility)
-                        * regime["cancel"],
-                        0.02,
-                        0.70,
+                    probability = self._lot_cancel_probability(
+                        side,
+                        price,
+                        current_price,
+                        lot,
+                        latent,
+                        micro,
                     )
                     cancel_fraction = probability * self._rng.random()
                     removed = lot.volume * cancel_fraction
@@ -1685,20 +2020,80 @@ class Market:
                     lots_by_price[price] = survivors
                 else:
                     del lots_by_price[price]
-        return self._drop_zeroes(cancelled)
+        cancelled = self._drop_zeroes(cancelled)
+        micro.last_cancelled_volume = sum(cancelled.values())
+        return cancelled
+
+    def _lot_cancel_probability(
+        self,
+        side: str,
+        price: float,
+        current_price: float,
+        lot: _OrderLot,
+        latent: LatentState,
+        micro: _MicrostructureState,
+    ) -> float:
+        regime = self._regime_settings(self._active_regime)
+        distance = abs(price - current_price) / self.gap
+        adverse_side = (side == "bid" and latent.trend < 0) or (side == "ask" and latent.trend > 0)
+        adverse = abs(latent.trend) if adverse_side else 0.0
+        age_term = 0.075 * (1.0 - exp(-lot.age / 9.0))
+        distance_term = 0.045 * (1.0 - exp(-distance / 5.0))
+        volatility_term = 0.026 * latent.volatility / (1.0 + latent.volatility)
+        probability = (
+            0.016
+            + age_term
+            + distance_term
+            + volatility_term
+            + self._cancel_burst_multiplier(micro, distance, adverse)
+        ) * regime["cancel"]
+        return self._clamp(probability, 0.01, 0.55)
+
+    def _cancel_burst_multiplier(
+        self,
+        micro: _MicrostructureState,
+        distance: float,
+        adverse: float,
+    ) -> float:
+        vulnerability = 0.65 + 0.10 * min(distance, 6.0) + 0.45 * adverse
+        pressure = 1.0 - exp(-micro.cancel_pressure)
+        return 0.050 * pressure * vulnerability
 
     def _add_liquidity_replenishment(
         self,
         current_price: float,
         latent: LatentState,
         imbalance: float,
+        micro: _MicrostructureState,
     ) -> None:
         regime = self._regime_settings(self._active_regime)
-        base = self.popularity * (0.18 + 0.20 / (1.0 + latent.volatility)) * regime["liquidity"]
-        for level in range(1, min(7, self.grid_radius + 1)):
-            shape = base / (level**1.35)
-            bid_volume = shape * self._clamp(1.0 + 0.20 * imbalance, 0.55, 1.55)
-            ask_volume = shape * self._clamp(1.0 - 0.20 * imbalance, 0.55, 1.55)
+        base = (
+            self.popularity
+            * (0.18 + 0.20 / (1.0 + latent.volatility))
+            * regime["liquidity"]
+            * micro.resiliency
+        )
+        depth = min(13, self.grid_radius + 1)
+        current_tick = self.price_to_tick(current_price)
+        for level in range(1, depth):
+            bid_volume = self._replenishment_volume_for_level(
+                level,
+                "bid",
+                current_tick,
+                base,
+                imbalance,
+                latent,
+                micro,
+            )
+            ask_volume = self._replenishment_volume_for_level(
+                level,
+                "ask",
+                current_tick,
+                base,
+                imbalance,
+                latent,
+                micro,
+            )
             self._add_lots(
                 {self._snap_price(current_price - level * self.gap): bid_volume}, "bid", "buy_entry"
             )
@@ -1707,6 +2102,91 @@ class Market:
                 "ask",
                 "sell_entry",
             )
+
+    def _replenishment_volume_for_level(
+        self,
+        level: int,
+        side: str,
+        current_tick: int,
+        base: float,
+        imbalance: float,
+        latent: LatentState,
+        micro: _MicrostructureState,
+    ) -> float:
+        regime = self._regime_settings(self._active_regime)
+        near_touch = regime["near_touch_liquidity"] if level <= 2 else 1.0
+        shape = base * near_touch / (level ** regime["depth_exponent"])
+        side_tilt = imbalance if side == "bid" else -imbalance
+        trend_tilt = latent.trend if side == "bid" else -latent.trend
+        tick = -level if side == "bid" else level
+        wall = 1.0 + regime["wall_strength"] * self._wall_pressure_at_relative_tick(
+            micro,
+            current_tick,
+            tick,
+        )
+        pressure_drag = self._clamp(1.0 - 0.16 * micro.cancel_pressure, 0.35, 1.0)
+        level_noise = self._book_level_noise(regime["book_noise"])
+        return shape * wall * pressure_drag * self._clamp(
+            1.0 + 0.20 * side_tilt + 0.10 * trend_tilt,
+            0.45,
+            1.65,
+        ) * level_noise
+
+    def _book_level_noise(self, sigma: float) -> float:
+        if sigma <= 0:
+            return 1.0
+        return self._clamp(
+            self._rng.lognormvariate(-0.5 * sigma * sigma, sigma),
+            0.45,
+            2.10,
+        )
+
+    def _update_wall_memory_from_book(
+        self,
+        current_price: float,
+        micro: _MicrostructureState,
+    ) -> None:
+        orderbook = self._snapshot_orderbook()
+        current_tick = self.price_to_tick(current_price)
+        relative = self._price_map_to_relative_ticks(
+            current_price,
+            self._merge_maps(
+                orderbook.bid_volume_by_price,
+                orderbook.ask_volume_by_price,
+            ),
+        )
+        positive = [volume for volume in relative.values() if volume > 1e-12]
+        if not positive:
+            micro.wall_pressure_by_absolute_tick = self._decay_wall_pressure(
+                micro.wall_pressure_by_absolute_tick,
+                self._regime_settings(self._active_regime),
+            )
+            return
+        baseline = sorted(positive)[len(positive) // 2]
+        updated = dict(micro.wall_pressure_by_absolute_tick)
+        # Wall pressure is anchored by absolute tick so walls can be consumed or left behind.
+        for relative_tick, volume in relative.items():
+            if relative_tick == 0 or abs(relative_tick) > self.grid_radius:
+                continue
+            prominence = self._clamp(volume / max(baseline, 1e-12) - 1.0, 0.0, 4.0)
+            absolute_tick = current_tick + relative_tick
+            if absolute_tick < 1:
+                continue
+            old = updated.get(absolute_tick, 0.0)
+            updated[absolute_tick] = self._clamp(0.86 * old + 0.14 * prominence, 0.0, 3.0)
+        micro.wall_pressure_by_absolute_tick = {
+            tick: pressure
+            for tick, pressure in updated.items()
+            if pressure > 1e-4 and abs(tick - current_tick) <= 2 * self.grid_radius
+        }
+
+    def _wall_pressure_at_relative_tick(
+        self,
+        micro: _MicrostructureState,
+        current_tick: int,
+        relative_tick: int,
+    ) -> float:
+        return micro.wall_pressure_by_absolute_tick.get(current_tick + relative_tick, 0.0)
 
     def _add_lots(self, volume_by_price: PriceMap, side: str, kind: str) -> None:
         self._orderbook.add_lots(volume_by_price, side, kind)

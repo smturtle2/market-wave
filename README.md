@@ -107,11 +107,11 @@ For simple export workflows, use `step.to_dict()`, `step.to_json()`, or
 Example output with `seed=42`:
 
 ```text
-10140.0 -> 10170.0
-entry: 4.458
-executed: 4.042
-resting bid/ask: 12.12 10.571
-imbalance: -0.587
+9880.0 -> 9890.0
+entry: 3.321
+executed: 2.863
+resting bid/ask: 16.4 15.632
+imbalance: -0.151
 ```
 
 ## Smoke Matrix
@@ -144,12 +144,12 @@ for name, kwargs, steps_count in cases:
 Recent verification on the current implementation:
 
 ```text
-baseline  range=  9900.0- 10220.0 unique= 33 moves=455 exec_steps=500 final= 10170.0
-busy      range=  9940.0- 10470.0 unique= 52 moves=451 exec_steps=500 final= 10240.0
-thin      range=   330.0-   525.0 unique= 36 moves=451 exec_steps=500 final=   355.0
-low_price range=     4.0-    75.0 unique= 68 moves=447 exec_steps=500 final=    73.0
-trend_up  range= 10010.0- 15650.0 unique=447 moves=490 exec_steps=500 final= 15650.0
-high_vol  range=  9970.0- 10700.0 unique= 72 moves=452 exec_steps=500 final= 10580.0
+baseline  range=  9850.0- 10050.0 unique= 21 moves=396 exec_steps=500 final=  9890.0
+busy      range=  9940.0- 10260.0 unique= 32 moves=397 exec_steps=500 final= 10260.0
+thin      range=   500.0-   650.0 unique= 31 moves=339 exec_steps=500 final=   630.0
+low_price range=     2.0-    24.0 unique= 23 moves=393 exec_steps=500 final=    21.0
+trend_up  range=  9990.0- 10420.0 unique= 44 moves=402 exec_steps=500 final= 10410.0
+high_vol  range=  9980.0- 10180.0 unique= 21 moves=422 exec_steps=500 final= 10140.0
 inactive  range=   100.0-   100.0 unique=  1 moves=  0 exec_steps=  0 final=   100.0
 ```
 
@@ -160,12 +160,14 @@ steps with executed volume. Dynamic MDF acceptance also runs seeds `10..19` at
 `mdf_temperature=1.0` and checks that every MDF remains finite, non-negative,
 normalized, and broad enough not to collapse to a single price.
 
-Diagnostic note for `0.3.1`: the simulator does not keep a stored target price
-or any value that pulls prices back to the initial price. Seeded `mood`, `trend`,
-and `volatility` evolve each step and reshape the MDFs; prices still move only
-from executed prints. Treat these ranges, move counts, and execution counts as
-regression diagnostics, not claims that the generated paths match any real
-market.
+Diagnostic note for `0.4.0`: the simulator still has no anchor price or stored
+target that pulls paths back to the initial price. Seeded `mood`, `trend`,
+`volatility`, microstructure activity, cancellation pressure, and event pressure
+evolve each step and reshape the MDFs and visible book. Prices remain
+execution-driven, with a small flow-implied price-discovery component when
+executed flow reveals one-sided pressure. Treat these ranges, move counts, and
+execution counts as regression diagnostics, not claims that generated paths
+match any specific real market.
 
 Entry MDF prices are treated as incoming order prices. Buy entry orders arrive as
 bids, sell entry orders arrive as asks, and they execute only when they overlap
@@ -174,12 +176,13 @@ Unfilled volume remains in the book at the sampled MDF price. Exit flow is
 cohort-conditioned, so exit orders carry the originating cohort id and still
 route through visible order-book liquidity.
 
-Performance note for `0.3.1`: live order-book and position totals are cached by
-price/side, order-book lots are coalesced by price/kind, and position inventory
-is kept in bounded entry-price cohort buckets. The live book is also pruned to
-the active price window after each step. Long runs avoid repeatedly summing all
-live lots for best-price lookup, snapshots, and near-touch imbalance, regardless
-of `keep_history`.
+Microstructure note for `0.4.0`: order-book replenishment now includes
+regime-specific depth shape, resiliency, wall memory by absolute tick,
+event-driven volume bursts, dry-up after cancellation pressure, trend
+exhaustion, and squeeze pressure derived from short crowding plus recent
+one-sided flow. Live order-book and position totals remain cached by price/side,
+lots are coalesced by price/kind, and position inventory is kept in bounded
+entry-price cohort buckets.
 
 ## Visualization
 

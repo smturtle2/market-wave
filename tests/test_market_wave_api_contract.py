@@ -9,7 +9,7 @@ import pytest
 
 import market_wave as mw
 from market_wave import Market, MarketState, StepInfo
-from market_wave.market import _PositionCohort, _TradeStats
+from market_wave.market import _ExecutionResult, _PositionCohort, _TradeStats
 
 PUBLIC_TYPE_EXPORTS = (
     "Market",
@@ -295,6 +295,12 @@ def _total_orderbook_depth(orderbook):
     return sum(_total_price_map(value) for _, value in _public_items(orderbook))
 
 
+def _near_touch_depth(orderbook, levels=2):
+    bid = sorted(orderbook.bid_volume_by_price.items(), reverse=True)[:levels]
+    ask = sorted(orderbook.ask_volume_by_price.items())[:levels]
+    return sum(volume for _, volume in (*bid, *ask))
+
+
 def _required_realism_step(step):
     missing = [name for name in REALISM_STEPINFO_FIELDS if not hasattr(step, name)]
     if missing:
@@ -460,6 +466,32 @@ def test_seeded_markets_are_deterministic():
     assert _freeze(_state_from_market(left)) == _freeze(_state_from_market(right))
 
 
+def test_seeded_regime_microstructure_is_deterministic():
+    for regime in ("normal", "high_vol", "thin_liquidity", "squeeze"):
+        left = Market(
+            initial_price=100.0,
+            gap=1.0,
+            popularity=1.2,
+            seed=314,
+            grid_radius=10,
+            regime=regime,
+        )
+        right = Market(
+            initial_price=100.0,
+            gap=1.0,
+            popularity=1.2,
+            seed=314,
+            grid_radius=10,
+            regime=regime,
+        )
+
+        left_steps = left.step(80)
+        right_steps = right.step(80)
+
+        assert _freeze(left_steps) == _freeze(right_steps)
+        assert _freeze(_state_from_market(left)) == _freeze(_state_from_market(right))
+
+
 def test_stepinfo_json_and_history_records_are_exportable():
     market = Market(initial_price=100.0, gap=1.0, seed=101, grid_radius=8)
     step = market.step(1)[0]
@@ -534,8 +566,15 @@ def test_price_update_stays_flat_when_executions_print_at_previous_price():
     market = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=44)
     stats = _TradeStats(executed_by_price={})
     stats.record(100.0, 1.0)
+    execution = _ExecutionResult(
+        residual_market_buy=0.0,
+        residual_short_exit=0.0,
+        residual_market_sell=0.0,
+        residual_long_exit=0.0,
+        crossed_market_volume=0.0,
+    )
 
-    assert market._next_price_after_trading(100.0, stats) == 100.0
+    assert market._next_price_after_trading(100.0, stats, execution) == 100.0
 
 
 def test_latent_mdf_context_is_seeded_and_evolves_over_steps():
@@ -799,6 +838,25 @@ def test_entry_mdf_order_rests_when_it_does_not_overlap_opposite_quotes():
     assert execution.market_buy_volume == 0.0
     assert market._orderbook.bid_volume_by_price == pytest.approx({100.0: 4.0})
     assert market._orderbook.ask_volume_by_price == pytest.approx({101.0: 3.0})
+
+
+def test_wall_memory_strengthens_observed_liquidity_wall():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=98, grid_radius=10)
+    market._add_lots({105.0: 20.0, 101.0: 1.0}, "ask", "sell_entry")
+    market._add_lots({99.0: 1.0}, "bid", "buy_entry")
+    micro = market._next_microstructure_state(
+        market.state.latent,
+        market.state.latent,
+        market._near_touch_imbalance(100.0),
+    )
+
+    market._update_wall_memory_from_book(100.0, micro)
+
+    assert micro.wall_pressure_by_absolute_tick[105] > micro.wall_pressure_by_absolute_tick.get(
+        101,
+        0.0,
+    )
+    assert micro.wall_pressure_by_absolute_tick[105] > 0.0
 
 
 def test_same_price_entry_orders_match_after_first_order_rests():
@@ -1193,6 +1251,12 @@ def test_stepinfo_exposes_market_realism_diagnostics():
         total = _total_price_map(getattr(step, name))
         assert total >= -1e-12, f"{name} should not contain net negative volume"
 
+    cancelled_total = _total_price_map(step.cancelled_volume_by_price)
+    for price in step.cancelled_volume_by_price:
+        assert price == market._snap_price(price)
+    if _total_orderbook_depth(step.orderbook_before) <= 1e-12:
+        assert cancelled_total == 0.0
+
     if step.trade_count > 0:
         assert step.vwap_price is not None, "vwap_price should be present when trades execute"
         assert (
@@ -1320,6 +1384,132 @@ def test_realism_volatility_clustering_diagnostic_is_positiveish():
 
     assert sum(correlations) / len(correlations) > -0.02
     assert sum(follower_ratios) / len(follower_ratios) >= 0.9
+
+
+@pytest.mark.slow
+def test_microstructure_activity_clusters_intensity():
+    correlations = []
+    follower_ratios = []
+    for seed in (42, 77, 123, 404):
+        market = Market(initial_price=100.0, gap=1.0, popularity=1.2, seed=seed, grid_radius=16)
+        steps = _realism_steps_or_skip(market, 900)
+        intensities = [step.intensity.total for step in steps]
+        threshold = sorted(intensities)[int(0.75 * (len(intensities) - 1))]
+        high_followers = [
+            intensities[index + 1]
+            for index, value in enumerate(intensities[:-1])
+            if value >= threshold
+        ]
+        correlations.append(_lag1_correlation(intensities))
+        follower_ratios.append(
+            (sum(high_followers) / len(high_followers))
+            / (sum(intensities) / len(intensities))
+        )
+
+    assert sum(correlations) / len(correlations) > 0.25
+    assert sum(follower_ratios) / len(follower_ratios) > 1.05
+
+
+@pytest.mark.slow
+def test_microstructure_cancellation_is_bursty_but_nonnegative():
+    burst_ratios = []
+    for seed in (42, 77, 123, 404):
+        market = Market(initial_price=100.0, gap=1.0, popularity=1.2, seed=seed, grid_radius=16)
+        steps = _realism_steps_or_skip(market, 900)
+        cancelled = [sum(step.cancelled_volume_by_price.values()) for step in steps]
+        nonzero = [value for value in cancelled if value > 1e-12]
+
+        assert len(nonzero) >= 100
+        assert all(value >= -1e-12 for value in cancelled)
+        top_decile = sorted(nonzero)[int(0.90 * (len(nonzero) - 1)) :]
+        burst_ratios.append((sum(top_decile) / len(top_decile)) / (sum(nonzero) / len(nonzero)))
+
+    assert sum(burst_ratios) / len(burst_ratios) > 1.20
+
+
+@pytest.mark.slow
+def test_microstructure_regimes_change_activity_and_depth_shape():
+    def summarize(regime):
+        intensity = []
+        volatility = []
+        cancel = []
+        depth = []
+        spread = []
+        near_share = []
+        for seed in (11, 42, 77):
+            market = Market(
+                initial_price=100.0,
+                gap=1.0,
+                popularity=1.2,
+                seed=seed,
+                grid_radius=16,
+                regime=regime,
+            )
+            steps = _realism_steps_or_skip(market, 700)
+            intensity.extend(step.intensity.total for step in steps)
+            volatility.extend(step.volatility for step in steps)
+            cancel.extend(sum(step.cancelled_volume_by_price.values()) for step in steps)
+            for step in steps:
+                total_depth = _total_orderbook_depth(step.orderbook_after)
+                depth.append(total_depth)
+                if total_depth > 1e-12:
+                    near_share.append(_near_touch_depth(step.orderbook_after) / total_depth)
+                if step.spread_after is not None:
+                    spread.append(step.spread_after)
+        return {
+            "intensity": sum(intensity) / len(intensity),
+            "volatility": sum(volatility) / len(volatility),
+            "cancel": sum(cancel) / len(cancel),
+            "depth": sum(depth) / len(depth),
+            "spread": sum(spread) / len(spread),
+            "near_share": sum(near_share) / len(near_share),
+        }
+
+    normal = summarize("normal")
+    high_vol = summarize("high_vol")
+    thin = summarize("thin_liquidity")
+
+    assert high_vol["intensity"] > normal["intensity"]
+    assert high_vol["volatility"] > normal["volatility"]
+    assert high_vol["cancel"] > normal["cancel"]
+    assert thin["depth"] < normal["depth"]
+    assert thin["spread"] >= normal["spread"]
+    assert thin["near_share"] < normal["near_share"]
+
+
+@pytest.mark.slow
+def test_microstructure_events_do_not_lock_private_state_at_caps():
+    for regime in ("high_vol", "squeeze"):
+        sample_count = 0
+        activity_cap_hits = 0
+        cancel_cap_hits = 0
+        activity_events = []
+        squeeze_pressure = []
+        for seed in (42, 77, 123):
+            market = Market(
+                initial_price=100.0,
+                gap=1.0,
+                popularity=1.2,
+                seed=seed,
+                grid_radius=16,
+                regime=regime,
+            )
+
+            for _ in range(700):
+                market.step(1, keep_history=False)
+                micro = market._microstructure
+                sample_count += 1
+                activity_cap_hits += micro.activity > 1.95
+                cancel_cap_hits += micro.cancel_pressure > 1.95
+                activity_events.append(micro.activity_event)
+                squeeze_pressure.append(micro.squeeze_pressure)
+
+        assert max(activity_events) > 0.6
+        assert activity_cap_hits / sample_count < 0.01
+        assert cancel_cap_hits / sample_count < 0.01
+        if regime == "squeeze":
+            assert max(squeeze_pressure) > 0.02
+            assert sum(value > 0.01 for value in squeeze_pressure) >= 5
 
 
 @pytest.mark.slow
