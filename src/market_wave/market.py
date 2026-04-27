@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from copy import deepcopy
 from dataclasses import dataclass, field
-from math import ceil, exp, isfinite, log
+from math import exp, isfinite, log
 from random import Random
 
 from .distribution import (
@@ -30,6 +30,7 @@ class _OrderLot:
     volume: float
     kind: str
     age: int = 0
+    cohort_id: int | None = None
 
 
 @dataclass
@@ -38,6 +39,41 @@ class _PositionCohort:
     entry_price: float
     mass: float
     age: int = 0
+    id: int = 0
+
+
+@dataclass
+class _ExitOrder:
+    price: float
+    volume: float
+    cohort_id: int
+
+
+@dataclass
+class _IncomingOrder:
+    side: str
+    kind: str
+    price: float
+    volume: float
+    cohort_id: int | None = None
+
+
+@dataclass
+class _EntryFlow:
+    orders: list[_IncomingOrder]
+    buy_intent_by_price: PriceMap
+    sell_intent_by_price: PriceMap
+
+
+@dataclass
+class _ExitFlow:
+    market_orders: list[_IncomingOrder]
+    limit_orders: list[_ExitOrder]
+    intent_volume_by_price: PriceMap
+
+    @property
+    def market_volume(self) -> float:
+        return sum(order.volume for order in self.market_orders)
 
 
 @dataclass
@@ -65,6 +101,8 @@ class _ExecutionResult:
     residual_market_sell: float
     residual_long_exit: float
     crossed_market_volume: float
+    market_buy_volume: float = 0.0
+    market_sell_volume: float = 0.0
 
 
 @dataclass
@@ -80,14 +118,33 @@ class _OrderBook:
                 for lot in lots:
                     lot.age += 1
 
-    def add_lots(self, volume_by_price: PriceMap, side: str, kind: str) -> None:
+    def add_lot(
+        self,
+        price: float,
+        volume: float,
+        side: str,
+        kind: str,
+        cohort_id: int | None = None,
+    ) -> None:
+        if volume <= 0:
+            return
         lots_by_price = self.lots_for_side(side)
         volume_totals = self.volumes_for_side(side)
+        lots = lots_by_price.setdefault(price, [])
+        for lot in reversed(lots):
+            if lot.kind == kind and lot.cohort_id == cohort_id:
+                total = lot.volume + volume
+                if total > 1e-12:
+                    lot.age = int(round((lot.age * lot.volume) / total))
+                    lot.volume = total
+                break
+        else:
+            lots.append(_OrderLot(volume=volume, kind=kind, cohort_id=cohort_id))
+        volume_totals[price] = volume_totals.get(price, 0.0) + volume
+
+    def add_lots(self, volume_by_price: PriceMap, side: str, kind: str) -> None:
         for price, volume in volume_by_price.items():
-            if volume <= 0:
-                continue
-            lots_by_price.setdefault(price, []).append(_OrderLot(volume=volume, kind=kind))
-            volume_totals[price] = volume_totals.get(price, 0.0) + volume
+            self.add_lot(price, volume, side, kind)
 
     def lots_for_side(self, side: str) -> dict[float, list[_OrderLot]]:
         return self.bid_lots if side == "bid" else self.ask_lots
@@ -322,6 +379,10 @@ class Market:
         self._orderbook = _OrderBook(bid_lots={}, ask_lots={})
         self._long_cohorts: list[_PositionCohort] = []
         self._short_cohorts: list[_PositionCohort] = []
+        self._long_cohorts_by_bucket: dict[int, _PositionCohort] = {}
+        self._short_cohorts_by_bucket: dict[int, _PositionCohort] = {}
+        self._cohorts_by_id: dict[int, _PositionCohort] = {}
+        self._next_cohort_id = 1
         self._long_mass_total = 0.0
         self._short_mass_total = 0.0
         self._last_return_ticks = 0.0
@@ -832,6 +893,9 @@ class Market:
         step_index = state.step_index + 1
         price_before = state.price
         self._age_state()
+        self._clear_stale_exit_lots()
+        self._clean_orderbook()
+        self._clean_cohorts()
 
         price_grid = self._price_grid(price_before)
         orderbook_before = self._snapshot_orderbook()
@@ -853,47 +917,35 @@ class Market:
         )
 
         cancelled_volume = self._cancel_orders(price_before, latent)
-        entry_limit_buy, entry_limit_sell = self._entry_limit_volumes(
-            intensity,
-            mdf,
-            latent,
-            price_before,
-        )
-        initial_market_buy, initial_market_sell = self._market_entry_volumes(
-            intensity,
-            latent,
-            pre_imbalance,
-        )
-        market_buy = initial_market_buy
-        market_sell = initial_market_sell
-        long_exit_market, long_exit_limit = self._exit_flow(
+        long_exit_flow = self._exit_flow(
             "long",
             price_before,
             latent,
             mdf.long_exit_mdf_by_price,
         )
-        short_exit_market, short_exit_limit = self._exit_flow(
+        short_exit_flow = self._exit_flow(
             "short",
             price_before,
             latent,
             mdf.short_exit_mdf_by_price,
         )
+        mdf = self._with_cohort_exit_mdfs(
+            price_before,
+            mdf,
+            long_exit_flow.intent_volume_by_price,
+            short_exit_flow.intent_volume_by_price,
+        )
 
         self._add_liquidity_replenishment(price_before, latent, pre_imbalance)
-        self._add_lots(entry_limit_buy, side="bid", kind="buy_entry")
-        self._add_lots(entry_limit_sell, side="ask", kind="sell_entry")
-        self._add_lots(short_exit_limit, side="bid", kind="short_exit")
-        self._add_lots(long_exit_limit, side="ask", kind="long_exit")
+        self._add_exit_orders(short_exit_flow.limit_orders, side="bid", kind="short_exit")
+        self._add_exit_orders(long_exit_flow.limit_orders, side="ask", kind="long_exit")
+        entry_flow = self._entry_flow(intensity, mdf)
 
-        initial_short_exit_market = short_exit_market
-        initial_long_exit_market = long_exit_market
         stats = _TradeStats(executed_by_price={})
         execution = self._execute_market_flows(
-            price_before=price_before,
-            market_buy=market_buy,
-            short_exit_market=short_exit_market,
-            market_sell=market_sell,
-            long_exit_market=long_exit_market,
+            entry_orders=entry_flow.orders,
+            short_exit_market_orders=short_exit_flow.market_orders,
+            long_exit_market_orders=long_exit_flow.market_orders,
             mdf=mdf,
             stats=stats,
         )
@@ -906,6 +958,8 @@ class Market:
         self._last_abs_return_ticks = abs(self._last_return_ticks)
         self._last_execution_volume = stats.total_volume
         self._last_executed_by_price = self._drop_zeroes(stats.executed_by_price)
+        self._trim_orderbook_through_last_price(price_after)
+        self._prune_orderbook_window(price_after)
 
         state_grid = self._price_grid(price_after)
         state_mdf = self._reproject_mdf(price_after, mdf)
@@ -917,10 +971,12 @@ class Market:
         best_bid_after = self._best_bid()
         best_ask_after = self._best_ask()
         spread_after = self._spread(best_bid_after, best_ask_after)
-        total_market_buy = initial_market_buy + initial_short_exit_market
-        total_market_sell = initial_market_sell + initial_long_exit_market
-        residual_market_buy = execution.residual_market_buy + execution.residual_short_exit
-        residual_market_sell = execution.residual_market_sell + execution.residual_long_exit
+        total_market_buy = execution.market_buy_volume
+        total_market_sell = execution.market_sell_volume
+        # Incoming order leftovers now rest in the book at their sampled price.
+        # These compatibility fields remain zero in the order-book-first engine.
+        residual_market_buy = 0.0
+        residual_market_sell = 0.0
         market_flow_delta = total_market_buy - total_market_sell
         market_flow_total = total_market_buy + total_market_sell
         order_flow_imbalance = (
@@ -930,19 +986,21 @@ class Market:
         )
         self._last_imbalance = order_flow_imbalance
 
-        entry_volume = self._merge_maps(entry_limit_buy, entry_limit_sell)
-        exit_volume = self._merge_maps(long_exit_limit, short_exit_limit)
+        entry_volume = self._merge_maps(
+            entry_flow.buy_intent_by_price,
+            entry_flow.sell_intent_by_price,
+        )
+        exit_volume = self._merge_maps(
+            long_exit_flow.intent_volume_by_price,
+            short_exit_flow.intent_volume_by_price,
+        )
         buy_volume = self._merge_maps(
-            entry_limit_buy,
-            short_exit_limit,
-            self._single_price_volume(price_before, execution.crossed_market_volume),
-            self._single_price_volume(best_ask_before or price_before, residual_market_buy),
+            entry_flow.buy_intent_by_price,
+            short_exit_flow.intent_volume_by_price,
         )
         sell_volume = self._merge_maps(
-            entry_limit_sell,
-            long_exit_limit,
-            self._single_price_volume(price_before, execution.crossed_market_volume),
-            self._single_price_volume(best_bid_before or price_before, residual_market_sell),
+            entry_flow.sell_intent_by_price,
+            long_exit_flow.intent_volume_by_price,
         )
         vwap = stats.notional / stats.total_volume if stats.total_volume > 0 else None
         step_info = StepInfo(
@@ -1049,9 +1107,6 @@ class Market:
     def relative_tick_grid(self) -> list[int]:
         return list(range(-self.grid_radius, self.grid_radius + 1))
 
-    def _price_from_relative_tick(self, current_tick: int, relative_tick: int) -> float:
-        return self.tick_to_price(current_tick + relative_tick)
-
     def _snap_price(self, price: float) -> float:
         snapped = max(self._min_price, round(price / self.gap) * self.gap)
         return self._clean_number(snapped)
@@ -1068,11 +1123,11 @@ class Market:
         trend_noise = self._rng.gauss(0.0, 0.10)
         jump_probability = 0.024 * regime["volatility"] * (1.0 + self.augmentation_strength)
         jump = self._rng.gauss(0.0, 0.55) if self._rng.random() < jump_probability else 0.0
-        signed_flow = 0.12 * self._last_imbalance + 0.04 * self._last_return_ticks
+        signed_flow = 0.08 * self._last_imbalance - 0.03 * self._last_return_ticks
 
         mood = self._clamp(
             0.66 * latent.mood
-            + 0.12 * latent.trend
+            + 0.08 * latent.trend
             + signed_flow
             + regime["mood"]
             + mood_noise
@@ -1081,9 +1136,9 @@ class Market:
             1.0,
         )
         trend = self._clamp(
-            0.74 * latent.trend
-            + 0.13 * mood
-            + 0.10 * self._last_return_ticks
+            0.72 * latent.trend
+            + 0.10 * mood
+            - 0.04 * self._last_return_ticks
             + regime["trend"]
             + 0.12 * jump
             + trend_noise,
@@ -1112,8 +1167,9 @@ class Market:
         buy_ratio = self._clamp(
             0.5
             + 0.24 * latent.mood
-            + 0.20 * latent.trend
-            + 0.08 * self._last_imbalance,
+            + 0.18 * latent.trend
+            + 0.04 * self._last_imbalance
+            - 0.06 * self._last_return_ticks,
             0.08,
             0.92,
         )
@@ -1209,27 +1265,50 @@ class Market:
             short_exit_mdf=dict(mdf.short_exit_mdf),
         )
 
-    def _entry_limit_volumes(
+    def _entry_flow(
         self,
         intensity: IntensityState,
         mdf: MDFState,
-        latent: LatentState,
-        price: float,
-    ) -> tuple[PriceMap, PriceMap]:
-        passive_share = 1.0 - self._taker_share(latent, self._last_imbalance)
-        bid_ceiling = price - self.gap
-        ask_floor = price + self.gap
-        buy = {
-            price: intensity.buy * passive_share * probability
-            for price, probability in mdf.buy_entry_mdf_by_price.items()
-            if price <= bid_ceiling
-        }
-        sell = {
-            price: intensity.sell * passive_share * probability
-            for price, probability in mdf.sell_entry_mdf_by_price.items()
-            if price >= ask_floor
-        }
-        return self._drop_zeroes(buy), self._drop_zeroes(sell)
+    ) -> _EntryFlow:
+        orders: list[_IncomingOrder] = []
+        buy_intent: PriceMap = {}
+        sell_intent: PriceMap = {}
+
+        for price, probability in mdf.buy_entry_mdf_by_price.items():
+            volume = intensity.buy * probability
+            if volume <= 1e-12:
+                continue
+            price = self._snap_price(price)
+            buy_intent[price] = buy_intent.get(price, 0.0) + volume
+            orders.append(
+                _IncomingOrder(
+                    side="buy",
+                    kind="buy_entry",
+                    price=price,
+                    volume=volume,
+                )
+            )
+
+        for price, probability in mdf.sell_entry_mdf_by_price.items():
+            volume = intensity.sell * probability
+            if volume <= 1e-12:
+                continue
+            price = self._snap_price(price)
+            sell_intent[price] = sell_intent.get(price, 0.0) + volume
+            orders.append(
+                _IncomingOrder(
+                    side="sell",
+                    kind="sell_entry",
+                    price=price,
+                    volume=volume,
+                )
+            )
+
+        return _EntryFlow(
+            orders=orders,
+            buy_intent_by_price=self._drop_zeroes(buy_intent),
+            sell_intent_by_price=self._drop_zeroes(sell_intent),
+        )
 
     def _model_scores(
         self,
@@ -1335,12 +1414,84 @@ class Market:
     def _project_tick_mdf(self, current_tick: int, mdf_by_tick: dict[int, float]) -> PriceMap:
         projected: PriceMap = {}
         for relative_tick, probability in mdf_by_tick.items():
-            price = self._price_from_relative_tick(current_tick, relative_tick)
+            absolute_tick = current_tick + relative_tick
+            if absolute_tick < 1:
+                continue
+            price = self.tick_to_price(absolute_tick)
             projected[price] = projected.get(price, 0.0) + probability
         total = sum(projected.values())
         if total <= 0:
             return {}
         return {price: probability / total for price, probability in sorted(projected.items())}
+
+    def _with_cohort_exit_mdfs(
+        self,
+        basis_price: float,
+        mdf: MDFState,
+        long_exit_intent: PriceMap,
+        short_exit_intent: PriceMap,
+    ) -> MDFState:
+        long_by_price = (
+            self._cohort_intent_price_mdf(basis_price, long_exit_intent)
+            or mdf.long_exit_mdf_by_price
+        )
+        short_by_price = (
+            self._cohort_intent_price_mdf(basis_price, short_exit_intent)
+            or mdf.short_exit_mdf_by_price
+        )
+        return MDFState(
+            buy_entry_mdf_by_price=mdf.buy_entry_mdf_by_price,
+            sell_entry_mdf_by_price=mdf.sell_entry_mdf_by_price,
+            long_exit_mdf_by_price=long_by_price,
+            short_exit_mdf_by_price=short_by_price,
+            relative_ticks=list(mdf.relative_ticks),
+            buy_entry_mdf=dict(mdf.buy_entry_mdf),
+            sell_entry_mdf=dict(mdf.sell_entry_mdf),
+            long_exit_mdf=self._price_map_to_normalized_relative_mdf(
+                basis_price, long_by_price
+            )
+            or dict(mdf.long_exit_mdf),
+            short_exit_mdf=self._price_map_to_normalized_relative_mdf(
+                basis_price, short_by_price
+            )
+            or dict(mdf.short_exit_mdf),
+        )
+
+    def _cohort_intent_price_mdf(self, basis_price: float, values: PriceMap) -> PriceMap:
+        grid = self._price_grid(basis_price)
+        grid_set = set(grid)
+        cleaned = {
+            price: max(0.0, value)
+            for price, value in values.items()
+            if price in grid_set and value > 1e-12
+        }
+        total = sum(cleaned.values())
+        if total <= 1e-12:
+            return {}
+        uniform = 1.0 / len(grid)
+        floor_mix = min(0.44, max(self._mdf_floor_mix, 0.42))
+        return self._normalize_price_map(
+            {
+                price: (1.0 - floor_mix) * cleaned.get(price, 0.0) / total
+                + floor_mix * uniform
+                for price in grid
+            }
+        )
+
+    def _price_map_to_normalized_relative_mdf(
+        self, basis_price: float, values: PriceMap
+    ) -> TickMap:
+        raw_by_tick = self._price_map_to_relative_ticks(basis_price, values)
+        return self._normalize_tick_map(
+            {tick: raw_by_tick.get(tick, 0.0) for tick in self.relative_tick_grid()}
+        )
+
+    def _normalize_price_map(self, values: PriceMap) -> PriceMap:
+        total = sum(max(0.0, value) for value in values.values())
+        if total <= 0:
+            uniform = 1.0 / len(values)
+            return {price: uniform for price in values}
+        return {price: max(0.0, value) / total for price, value in sorted(values.items())}
 
     def _normalize_tick_map(self, values: dict[int, float]) -> dict[int, float]:
         total = sum(max(0.0, value) for value in values.values())
@@ -1348,35 +1499,6 @@ class Market:
             uniform = 1.0 / len(values)
             return {tick: uniform for tick in values}
         return {tick: max(0.0, value) / total for tick, value in values.items()}
-
-    def _market_entry_volumes(
-        self,
-        intensity: IntensityState,
-        latent: LatentState,
-        imbalance: float,
-    ) -> tuple[float, float]:
-        taker_share = self._taker_share(latent, imbalance)
-        burst = 1.0 + (self._rng.random() < 0.06) * self._rng.uniform(0.2, 0.9)
-        buy_noise = self._clamp(self._rng.lognormvariate(0.0, 0.16), 0.65, 1.45)
-        sell_noise = self._clamp(self._rng.lognormvariate(0.0, 0.16), 0.65, 1.45)
-        buy_bias = self._clamp(
-            1.0
-            + 0.30 * max(latent.trend, 0.0)
-            + 0.14 * max(imbalance, 0.0),
-            0.58,
-            1.65,
-        )
-        sell_bias = self._clamp(
-            1.0
-            + 0.30 * max(-latent.trend, 0.0)
-            + 0.14 * max(-imbalance, 0.0),
-            0.58,
-            1.65,
-        )
-        return (
-            intensity.buy * taker_share * burst * buy_bias * buy_noise,
-            intensity.sell * taker_share * burst * sell_bias * sell_noise,
-        )
 
     def _taker_share(self, latent: LatentState, imbalance: float) -> float:
         regime = self._regime_settings(self._active_regime)
@@ -1393,44 +1515,144 @@ class Market:
         current_price: float,
         latent: LatentState,
         exit_mdf: PriceMap,
-    ) -> tuple[float, PriceMap]:
+    ) -> _ExitFlow:
+        del exit_mdf
         cohorts = self._long_cohorts if side == "long" else self._short_cohorts
-        market_volume = 0.0
-        passive_volume = 0.0
+        market_orders: list[_IncomingOrder] = []
+        limit_orders: list[_ExitOrder] = []
+        intent_volume_by_price: PriceMap = {}
         for cohort in cohorts:
             if cohort.mass <= 0:
                 continue
-            age_pressure = min(0.12, cohort.age * 0.004)
-            if side == "long":
-                pnl_ticks = (current_price - cohort.entry_price) / self.gap
-                stop_pressure = max(0.0, -pnl_ticks - 2.0) * 0.08
-                take_profit = max(0.0, pnl_ticks - 3.0) * 0.04
-                trend_pressure = max(0.0, -latent.trend) * 0.05
-            else:
-                pnl_ticks = (cohort.entry_price - current_price) / self.gap
-                stop_pressure = max(0.0, -pnl_ticks - 2.0) * 0.08
-                take_profit = max(0.0, pnl_ticks - 3.0) * 0.04
-                trend_pressure = max(0.0, latent.trend) * 0.05
-            fraction = self._clamp(
-                0.015 + age_pressure + stop_pressure + take_profit + trend_pressure, 0.0, 0.35
+            pnl_ticks = self._cohort_pnl_ticks(side, cohort, current_price)
+            adverse_trend = max(0.0, -latent.trend) if side == "long" else max(0.0, latent.trend)
+            stop_ticks = 2.0 + 1.4 * latent.volatility
+            target_ticks = 3.0 + 1.8 * latent.volatility
+            stop_pressure = self._threshold_pressure(-pnl_ticks - stop_ticks, 2.0)
+            take_profit_pressure = self._threshold_pressure(pnl_ticks - target_ticks, 3.0)
+            age_pressure = min(0.10, cohort.age * 0.002)
+            volatility_pressure = 0.025 * latent.volatility / (1.0 + latent.volatility)
+            urgency = self._clamp(
+                0.006
+                + age_pressure
+                + 0.18 * stop_pressure
+                + 0.10 * take_profit_pressure
+                + 0.06 * adverse_trend
+                + volatility_pressure,
+                0.0,
+                0.42,
             )
-            desired = cohort.mass * fraction
-            market_volume += desired * (0.55 + 0.20 * latent.volatility / (1.0 + latent.volatility))
-            passive_volume += desired * 0.35
+            desired = min(cohort.mass, cohort.mass * urgency)
+            if desired <= 1e-12:
+                continue
 
+            market_share = self._clamp(
+                0.14
+                + 0.48 * stop_pressure
+                + 0.15 * adverse_trend
+                + 0.20 * latent.volatility / (1.0 + latent.volatility),
+                0.12,
+                0.88,
+            )
+            market_volume = desired * market_share
+            passive_volume = desired - market_volume
+
+            if market_volume > 1e-12:
+                stop_price = self._exit_stop_price(side, current_price)
+                market_orders.append(
+                    _IncomingOrder(
+                        side="sell" if side == "long" else "buy",
+                        kind="long_exit" if side == "long" else "short_exit",
+                        price=stop_price,
+                        volume=market_volume,
+                        cohort_id=cohort.id,
+                    )
+                )
+                intent_volume_by_price[stop_price] = (
+                    intent_volume_by_price.get(stop_price, 0.0) + market_volume
+                )
+
+            if passive_volume <= 1e-12:
+                continue
+            for price, volume in self._passive_exit_kernel(
+                side,
+                cohort,
+                current_price,
+                latent,
+                pnl_ticks,
+                target_ticks,
+                passive_volume,
+            ):
+                limit_orders.append(_ExitOrder(price=price, volume=volume, cohort_id=cohort.id))
+                intent_volume_by_price[price] = intent_volume_by_price.get(price, 0.0) + volume
+
+        return _ExitFlow(
+            market_orders=market_orders,
+            limit_orders=limit_orders,
+            intent_volume_by_price=self._drop_zeroes(intent_volume_by_price),
+        )
+
+    def _cohort_pnl_ticks(
+        self, side: str, cohort: _PositionCohort, current_price: float
+    ) -> float:
         if side == "long":
-            limit_map = {
-                price: passive_volume * probability
-                for price, probability in exit_mdf.items()
-                if passive_volume > 0 and price >= current_price + self.gap
-            }
+            return (current_price - cohort.entry_price) / self.gap
+        return (cohort.entry_price - current_price) / self.gap
+
+    def _threshold_pressure(self, value: float, scale: float) -> float:
+        if value <= 0:
+            return 0.0
+        scaled = self._clamp(value / max(scale, 1e-12), -50.0, 50.0)
+        return 2.0 * (1.0 / (1.0 + exp(-scaled)) - 0.5)
+
+    def _exit_stop_price(self, side: str, current_price: float) -> float:
+        if side == "long":
+            return max(self._min_price, self._snap_price(current_price - self.gap))
+        return self._snap_price(current_price + self.gap)
+
+    def _passive_exit_kernel(
+        self,
+        side: str,
+        cohort: _PositionCohort,
+        current_price: float,
+        latent: LatentState,
+        pnl_ticks: float,
+        target_ticks: float,
+        volume: float,
+    ) -> list[tuple[float, float]]:
+        if volume <= 1e-12:
+            return []
+        if side == "long":
+            raw_target = cohort.entry_price + target_ticks * self.gap
+            target = max(current_price + self.gap, raw_target)
+            side_floor = current_price + self.gap
         else:
-            limit_map = {
-                price: passive_volume * probability
-                for price, probability in exit_mdf.items()
-                if passive_volume > 0 and price <= current_price - self.gap
-            }
-        return market_volume, self._drop_zeroes(limit_map)
+            raw_target = cohort.entry_price - target_ticks * self.gap
+            target = min(current_price - self.gap, raw_target)
+            side_floor = max(self._min_price, current_price - self.gap)
+
+        target = self._snap_price(target)
+        min_price = self._snap_price(current_price - self.grid_radius * self.gap)
+        max_price = self._snap_price(current_price + self.grid_radius * self.gap)
+        target = self._clamp(target, max(self._min_price, min_price), max_price)
+        spread_ticks = max(1.1, 1.4 + 1.4 * latent.volatility + 0.08 * abs(pnl_ticks))
+        center_tick = self.price_to_tick(target)
+        candidates: list[tuple[float, float]] = []
+        for offset in range(-2, 3):
+            price = self.tick_to_price(center_tick + offset)
+            if side == "long" and price < side_floor:
+                continue
+            if side == "short" and price > side_floor:
+                continue
+            if price < self._min_price or price < min_price or price > max_price:
+                continue
+            weight = exp(-abs(offset) / spread_ticks)
+            candidates.append((price, weight))
+        total_weight = sum(weight for _, weight in candidates)
+        if total_weight <= 1e-12:
+            fallback = self._snap_price(side_floor)
+            return [(fallback, volume)]
+        return [(price, volume * weight / total_weight) for price, weight in candidates]
 
     def _cancel_orders(self, current_price: float, latent: LatentState) -> PriceMap:
         regime = self._regime_settings(self._active_regime)
@@ -1489,205 +1711,120 @@ class Market:
     def _add_lots(self, volume_by_price: PriceMap, side: str, kind: str) -> None:
         self._orderbook.add_lots(volume_by_price, side, kind)
 
+    def _add_exit_orders(self, orders: list[_ExitOrder], side: str, kind: str) -> None:
+        for order in orders:
+            self._orderbook.add_lot(
+                order.price,
+                order.volume,
+                side,
+                kind,
+                cohort_id=order.cohort_id,
+            )
+
     def _execute_market_flows(
         self,
         *,
-        price_before: float,
-        market_buy: float,
-        short_exit_market: float,
-        market_sell: float,
-        long_exit_market: float,
+        entry_orders: list[_IncomingOrder],
+        short_exit_market_orders: list[_IncomingOrder],
+        long_exit_market_orders: list[_IncomingOrder],
         mdf: MDFState,
         stats: _TradeStats,
     ) -> _ExecutionResult:
-        market_buy, short_exit_market, market_sell, long_exit_market, crossed_market_volume = (
-            self._cross_taker_flow(
-                price_before,
-                market_buy,
-                short_exit_market,
-                market_sell,
-                long_exit_market,
-                mdf,
-                stats,
-            )
-        )
-        taker_calls = [
-            ("buy", market_buy, "buy_entry"),
-            ("sell", market_sell, "sell_entry"),
-            ("buy", short_exit_market, "short_exit"),
-            ("sell", long_exit_market, "long_exit"),
+        orders = [
+            *entry_orders,
+            *short_exit_market_orders,
+            *long_exit_market_orders,
         ]
-        self._rng.shuffle(taker_calls)
-        for side, volume, kind in taker_calls:
-            self._consume_taker(
-                side=side,
-                volume=volume,
-                kind=kind,
-                fallback_price=price_before,
+        self._rng.shuffle(orders)
+        market_buy_volume = 0.0
+        market_sell_volume = 0.0
+        for order in orders:
+            executed = self._process_incoming_order(
+                order,
                 mdf=mdf,
                 stats=stats,
             )
-        self._match_crossed_book(mdf, stats)
+            if order.side == "buy":
+                market_buy_volume += executed
+            else:
+                market_sell_volume += executed
         return _ExecutionResult(
-            residual_market_buy=market_buy,
-            residual_short_exit=short_exit_market,
-            residual_market_sell=market_sell,
-            residual_long_exit=long_exit_market,
-            crossed_market_volume=crossed_market_volume,
+            residual_market_buy=0.0,
+            residual_short_exit=0.0,
+            residual_market_sell=0.0,
+            residual_long_exit=0.0,
+            crossed_market_volume=0.0,
+            market_buy_volume=market_buy_volume,
+            market_sell_volume=market_sell_volume,
         )
 
-    def _consume_taker(
+    def _process_incoming_order(
         self,
-        side: str,
-        volume: float,
-        kind: str,
-        fallback_price: float,
+        order: _IncomingOrder,
         mdf: MDFState,
         stats: _TradeStats,
-    ) -> None:
-        if volume <= 0:
-            return
-        remaining = volume
-        max_impact_ticks = max(2, min(6, self.grid_radius // 3))
+    ) -> float:
+        if order.volume <= 0:
+            return 0.0
+        remaining = order.volume
+        executed = 0.0
+        price_limit = self._snap_price(order.price)
         while remaining > 1e-12:
-            price = self._best_ask() if side == "buy" else self._best_bid()
-            if price is not None and abs(price - fallback_price) / self.gap > max_impact_ticks:
-                price = None
+            price = self._best_ask() if order.side == "buy" else self._best_bid()
             if price is None:
-                impact_ticks = min(
-                    max_impact_ticks,
-                    max(1, ceil(remaining / max(self.popularity * 3.0, 0.3))),
-                )
-                if side == "buy":
-                    price = fallback_price + impact_ticks * self.gap
-                else:
-                    price = max(self._min_price, fallback_price - impact_ticks * self.gap)
-                price = self._snap_price(price)
-                fill_volume = remaining
-                remaining = 0.0
-                actual = self._apply_fill(kind, fill_volume, price, mdf)
-                if kind == "buy_entry":
-                    self._apply_fill("sell_entry", actual, price, mdf)
-                elif kind == "sell_entry":
-                    self._apply_fill("buy_entry", actual, price, mdf)
-                stats.record(price, actual)
+                break
+            if order.side == "buy" and price > price_limit + 1e-12:
+                break
+            if order.side == "sell" and price < price_limit - 1e-12:
                 break
 
-            lots_by_price = self._orderbook.lots_for_taker_side(side)
+            lots_by_price = self._orderbook.lots_for_taker_side(order.side)
             resting_lot = lots_by_price[price][0]
             fill_volume = min(remaining, resting_lot.volume)
-            taker_actual = self._available_fill_volume(kind, fill_volume)
-            resting_actual = self._available_fill_volume(resting_lot.kind, fill_volume)
+            taker_actual = self._available_fill_volume(
+                order.kind,
+                fill_volume,
+                order.cohort_id,
+            )
+            resting_actual = self._available_fill_volume(
+                resting_lot.kind, fill_volume, resting_lot.cohort_id
+            )
             actual = min(taker_actual, resting_actual)
             if actual <= 1e-12:
                 if self._is_exit_kind(resting_lot.kind) and resting_actual <= 1e-12:
-                    resting_side = "ask" if side == "buy" else "bid"
+                    resting_side = "ask" if order.side == "buy" else "bid"
                     self._orderbook.adjust_volume(resting_side, price, -resting_lot.volume)
                     resting_lot.volume = 0.0
                     self._discard_empty_head(price, resting_side)
                     continue
                 break
             resting_lot.volume -= actual
-            resting_side = "ask" if side == "buy" else "bid"
+            resting_side = "ask" if order.side == "buy" else "bid"
             self._orderbook.adjust_volume(resting_side, price, -actual)
             remaining -= actual
-            self._apply_fill(kind, actual, price, mdf)
-            self._apply_fill(resting_lot.kind, actual, price, mdf)
+            executed += actual
+            self._apply_fill(order.kind, actual, price, mdf, cohort_id=order.cohort_id)
+            self._apply_fill(
+                resting_lot.kind,
+                actual,
+                price,
+                mdf,
+                cohort_id=resting_lot.cohort_id,
+            )
             stats.record(price, actual)
-            self._discard_empty_head(price, "ask" if side == "buy" else "bid")
+            self._discard_empty_head(price, "ask" if order.side == "buy" else "bid")
 
-    def _cross_taker_flow(
-        self,
-        price: float,
-        buy_entry: float,
-        short_exit: float,
-        sell_entry: float,
-        long_exit: float,
-        mdf: MDFState,
-        stats: _TradeStats,
-    ) -> tuple[float, float, float, float, float]:
-        buy_total = buy_entry + short_exit
-        sell_total = sell_entry + long_exit
-        total = buy_total + sell_total
-        side_imbalance = abs(buy_total - sell_total) / total if total > 1e-12 else 0.0
-        cross_share = self._clamp(0.74 - 0.48 * side_imbalance, 0.24, 0.82)
-        cross_volume = min(buy_total, sell_total) * cross_share
-        if cross_volume <= 1e-12:
-            return buy_entry, short_exit, sell_entry, long_exit, 0.0
-
-        buy_entry_fill = cross_volume * buy_entry / buy_total if buy_total > 0 else 0.0
-        short_exit_fill = cross_volume * short_exit / buy_total if buy_total > 0 else 0.0
-        sell_entry_fill = cross_volume * sell_entry / sell_total if sell_total > 0 else 0.0
-        long_exit_fill = cross_volume * long_exit / sell_total if sell_total > 0 else 0.0
-
-        actual_buy_entry = self._available_fill_volume("buy_entry", buy_entry_fill)
-        actual_short_exit = self._available_fill_volume("short_exit", short_exit_fill)
-        actual_sell_entry = self._available_fill_volume("sell_entry", sell_entry_fill)
-        actual_long_exit = self._available_fill_volume("long_exit", long_exit_fill)
-        actual_buy_side = actual_buy_entry + actual_short_exit
-        actual_sell_side = actual_sell_entry + actual_long_exit
-        actual_cross = min(actual_buy_side, actual_sell_side)
-        if actual_cross <= 1e-12:
-            return buy_entry, short_exit, sell_entry, long_exit, 0.0
-
-        buy_scale = actual_cross / actual_buy_side if actual_buy_side > 0 else 0.0
-        sell_scale = actual_cross / actual_sell_side if actual_sell_side > 0 else 0.0
-        buy_entry_actual = actual_buy_entry * buy_scale
-        short_exit_actual = actual_short_exit * buy_scale
-        sell_entry_actual = actual_sell_entry * sell_scale
-        long_exit_actual = actual_long_exit * sell_scale
-
-        self._apply_fill("buy_entry", buy_entry_actual, price, mdf)
-        self._apply_fill("short_exit", short_exit_actual, price, mdf)
-        self._apply_fill("sell_entry", sell_entry_actual, price, mdf)
-        self._apply_fill("long_exit", long_exit_actual, price, mdf)
-        stats.record(price, actual_cross)
-
-        return (
-            max(0.0, buy_entry - buy_entry_actual),
-            max(0.0, short_exit - short_exit_actual),
-            max(0.0, sell_entry - sell_entry_actual),
-            max(0.0, long_exit - long_exit_actual),
-            actual_cross,
-        )
-
-    def _match_crossed_book(self, mdf: MDFState, stats: _TradeStats) -> None:
-        while self._best_bid() is not None and self._best_ask() is not None:
-            bid_price = self._best_bid()
-            ask_price = self._best_ask()
-            if bid_price is None or ask_price is None or bid_price < ask_price:
-                break
-
-            bid_lot = self._orderbook.bid_lots[bid_price][0]
-            ask_lot = self._orderbook.ask_lots[ask_price][0]
-            volume = min(bid_lot.volume, ask_lot.volume)
-            if volume <= 1e-12:
-                self._discard_empty_head(bid_price, "bid")
-                self._discard_empty_head(ask_price, "ask")
-                continue
-            execution_price = ask_price
-            bid_actual = self._available_fill_volume(bid_lot.kind, volume)
-            ask_actual = self._available_fill_volume(ask_lot.kind, volume)
-            actual = min(bid_actual, ask_actual)
-            if actual <= 1e-12:
-                if self._is_exit_kind(bid_lot.kind) and bid_actual <= 1e-12:
-                    self._orderbook.adjust_volume("bid", bid_price, -bid_lot.volume)
-                    bid_lot.volume = 0.0
-                if self._is_exit_kind(ask_lot.kind) and ask_actual <= 1e-12:
-                    self._orderbook.adjust_volume("ask", ask_price, -ask_lot.volume)
-                    ask_lot.volume = 0.0
-                self._discard_empty_head(bid_price, "bid")
-                self._discard_empty_head(ask_price, "ask")
-                continue
-            bid_lot.volume -= actual
-            ask_lot.volume -= actual
-            self._orderbook.adjust_volume("bid", bid_price, -actual)
-            self._orderbook.adjust_volume("ask", ask_price, -actual)
-            self._apply_fill(bid_lot.kind, actual, execution_price, mdf)
-            self._apply_fill(ask_lot.kind, actual, execution_price, mdf)
-            stats.record(execution_price, actual)
-            self._discard_empty_head(bid_price, "bid")
-            self._discard_empty_head(ask_price, "ask")
+        restable = self._available_fill_volume(order.kind, remaining, order.cohort_id)
+        if restable > 1e-12:
+            passive_side = "bid" if order.side == "buy" else "ask"
+            self._orderbook.add_lot(
+                price_limit,
+                restable,
+                passive_side,
+                order.kind,
+                cohort_id=order.cohort_id,
+            )
+        return executed
 
     def _apply_fill(
         self,
@@ -1695,38 +1832,86 @@ class Market:
         volume: float,
         execution_price: float,
         mdf: MDFState,
+        cohort_id: int | None = None,
     ) -> float:
+        del mdf
         if volume <= 0:
             return 0.0
         if kind == "buy_entry":
-            self._long_cohorts.append(_PositionCohort("long", execution_price, volume))
+            self._add_position_cohort("long", execution_price, volume)
             self._long_mass_total += volume
             return volume
         elif kind == "sell_entry":
-            self._short_cohorts.append(_PositionCohort("short", execution_price, volume))
+            self._add_position_cohort("short", execution_price, volume)
             self._short_mass_total += volume
             return volume
         elif kind == "long_exit":
-            removed = self._remove_cohort_mass(self._long_cohorts, execution_price, volume)
+            removed = self._remove_cohort_mass(
+                self._long_cohorts,
+                execution_price,
+                volume,
+                cohort_id=cohort_id,
+            )
             self._long_mass_total = max(0.0, self._long_mass_total - removed)
             return removed
         elif kind == "short_exit":
-            removed = self._remove_cohort_mass(self._short_cohorts, execution_price, volume)
+            removed = self._remove_cohort_mass(
+                self._short_cohorts,
+                execution_price,
+                volume,
+                cohort_id=cohort_id,
+            )
             self._short_mass_total = max(0.0, self._short_mass_total - removed)
             return removed
         return 0.0
+
+    def _add_position_cohort(self, side: str, execution_price: float, volume: float) -> None:
+        bucket = self._cohort_bucket_tick(execution_price)
+        cohorts_by_bucket = (
+            self._long_cohorts_by_bucket if side == "long" else self._short_cohorts_by_bucket
+        )
+        cohort = cohorts_by_bucket.get(bucket)
+        if cohort is not None:
+            total = cohort.mass + volume
+            if total > 1e-12:
+                cohort.age = int(round((cohort.age * cohort.mass) / total))
+                cohort.mass = total
+            return
+        cohort = _PositionCohort(
+            side=side,
+            entry_price=self.tick_to_price(bucket),
+            mass=volume,
+            id=self._next_cohort_id,
+        )
+        self._next_cohort_id += 1
+        cohorts_by_bucket[bucket] = cohort
+        self._cohorts_by_id[cohort.id] = cohort
+        if side == "long":
+            self._long_cohorts.append(cohort)
+        else:
+            self._short_cohorts.append(cohort)
 
     def _remove_cohort_mass(
         self,
         cohorts: list[_PositionCohort],
         execution_price: float,
         volume: float,
+        cohort_id: int | None = None,
     ) -> float:
         remaining = volume
         removed_total = 0.0
+        if cohort_id is not None:
+            cohort = self._cohorts_by_id.get(cohort_id)
+            if cohort is not None and cohort.mass > 0:
+                removed = min(cohort.mass, remaining)
+                cohort.mass -= removed
+                return removed
         ordered = sorted(
             cohorts,
-            key=lambda cohort: (abs(cohort.entry_price - execution_price), -cohort.age),
+            key=lambda cohort: (
+                -abs(cohort.entry_price - execution_price) / self.gap,
+                -cohort.age,
+            ),
         )
         for cohort in ordered:
             if remaining <= 1e-12:
@@ -1737,9 +1922,14 @@ class Market:
             removed_total += removed
         return removed_total
 
-    def _available_fill_volume(self, kind: str, requested: float) -> float:
+    def _available_fill_volume(
+        self, kind: str, requested: float, cohort_id: int | None = None
+    ) -> float:
         if requested <= 0:
             return 0.0
+        if cohort_id is not None and kind in {"long_exit", "short_exit"}:
+            cohort = self._cohorts_by_id.get(cohort_id)
+            return min(requested, cohort.mass) if cohort is not None else 0.0
         if kind == "long_exit":
             return min(requested, self._long_mass_total)
         if kind == "short_exit":
@@ -1767,11 +1957,61 @@ class Market:
             ),
         )
 
+    def _clear_stale_exit_lots(self) -> None:
+        for lots_by_price in (self._orderbook.bid_lots, self._orderbook.ask_lots):
+            for price in list(lots_by_price):
+                lots_by_price[price] = [
+                    lot for lot in lots_by_price[price] if not self._is_exit_kind(lot.kind)
+                ]
+                if not lots_by_price[price]:
+                    del lots_by_price[price]
+        self._orderbook.rebuild_totals()
+
+    def _trim_orderbook_through_last_price(self, last_price: float) -> None:
+        for price in list(self._orderbook.bid_lots):
+            if price >= last_price:
+                del self._orderbook.bid_lots[price]
+        for price in list(self._orderbook.ask_lots):
+            if price <= last_price:
+                del self._orderbook.ask_lots[price]
+        self._orderbook.rebuild_totals()
+
+    def _prune_orderbook_window(self, current_price: float) -> None:
+        min_price = max(
+            self._min_price,
+            self._snap_price(current_price - self.grid_radius * self.gap),
+        )
+        max_price = self._snap_price(current_price + self.grid_radius * self.gap)
+        for lots_by_price in (self._orderbook.bid_lots, self._orderbook.ask_lots):
+            for price in list(lots_by_price):
+                if price < min_price or price > max_price:
+                    del lots_by_price[price]
+        self._orderbook.rebuild_totals()
+
     def _clean_cohorts(self) -> None:
-        self._long_cohorts = [cohort for cohort in self._long_cohorts if cohort.mass > 1e-12]
-        self._short_cohorts = [cohort for cohort in self._short_cohorts if cohort.mass > 1e-12]
+        self._prune_cohort_buckets(self._long_cohorts_by_bucket)
+        self._prune_cohort_buckets(self._short_cohorts_by_bucket)
+        self._long_cohorts = sorted(
+            self._long_cohorts_by_bucket.values(), key=lambda cohort: cohort.entry_price
+        )
+        self._short_cohorts = sorted(
+            self._short_cohorts_by_bucket.values(), key=lambda cohort: cohort.entry_price
+        )
+        self._cohorts_by_id = {
+            cohort.id: cohort for cohort in (*self._long_cohorts, *self._short_cohorts)
+        }
         self._long_mass_total = sum(cohort.mass for cohort in self._long_cohorts)
         self._short_mass_total = sum(cohort.mass for cohort in self._short_cohorts)
+
+    def _prune_cohort_buckets(self, cohorts_by_bucket: dict[int, _PositionCohort]) -> None:
+        for bucket, cohort in list(cohorts_by_bucket.items()):
+            if cohort.mass <= 1e-8:
+                del cohorts_by_bucket[bucket]
+
+    def _cohort_bucket_tick(self, entry_price: float) -> int:
+        tick = self.price_to_tick(entry_price)
+        bucket_width = max(1, self.grid_radius // 4)
+        return int(round(tick / bucket_width)) * bucket_width
 
     def _best_bid(self) -> float | None:
         return self._orderbook.best_bid()

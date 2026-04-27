@@ -9,7 +9,7 @@ import pytest
 
 import market_wave as mw
 from market_wave import Market, MarketState, StepInfo
-from market_wave.market import _TradeStats
+from market_wave.market import _PositionCohort, _TradeStats
 
 PUBLIC_TYPE_EXPORTS = (
     "Market",
@@ -645,6 +645,204 @@ def test_position_mass_cache_matches_live_cohorts_after_long_run():
     )
 
 
+def test_entry_fills_are_bucketed_into_bounded_cohorts():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.2, seed=13, grid_radius=16)
+
+    market.step(5000, keep_history=False)
+
+    assert len(market._long_cohorts) <= 2 * market.grid_radius + 8
+    assert len(market._short_cohorts) <= 2 * market.grid_radius + 8
+    assert market._long_mass_total == pytest.approx(
+        sum(cohort.mass for cohort in market._long_cohorts)
+    )
+    assert market._short_mass_total == pytest.approx(
+        sum(cohort.mass for cohort in market._short_cohorts)
+    )
+
+
+def test_cohort_conditioned_exit_flow_uses_entry_price_and_book_side():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=91, grid_radius=16)
+    low_entry = _PositionCohort("long", entry_price=90.0, mass=5.0, age=5, id=1)
+    high_entry = _PositionCohort("long", entry_price=110.0, mass=5.0, age=5, id=2)
+    market._long_cohorts_by_bucket = {
+        market._cohort_bucket_tick(low_entry.entry_price): low_entry,
+        market._cohort_bucket_tick(high_entry.entry_price): high_entry,
+    }
+    market._long_cohorts = sorted(
+        market._long_cohorts_by_bucket.values(), key=lambda cohort: cohort.entry_price
+    )
+    market._cohorts_by_id = {cohort.id: cohort for cohort in market._long_cohorts}
+    market._long_mass_total = sum(cohort.mass for cohort in market._long_cohorts)
+
+    flow = market._exit_flow(
+        "long",
+        current_price=100.0,
+        latent=mw.LatentState(mood=0.0, trend=0.0, volatility=0.2),
+        exit_mdf={},
+    )
+
+    assert flow.intent_volume_by_price
+    assert all(order.price >= 101.0 for order in flow.limit_orders)
+    assert all(order.cohort_id in {1, 2} for order in flow.limit_orders)
+    low_weighted_price = sum(
+        order.price * order.volume for order in flow.limit_orders if order.cohort_id == 1
+    ) / sum(order.volume for order in flow.limit_orders if order.cohort_id == 1)
+    high_weighted_price = sum(
+        order.price * order.volume for order in flow.limit_orders if order.cohort_id == 2
+    ) / sum(order.volume for order in flow.limit_orders if order.cohort_id == 2)
+    assert low_weighted_price < high_weighted_price
+
+
+def test_passive_exit_fill_removes_linked_cohort_mass():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=92, grid_radius=12)
+    linked = _PositionCohort("long", entry_price=90.0, mass=4.0, age=10, id=1)
+    unrelated = _PositionCohort("long", entry_price=100.0, mass=4.0, age=10, id=2)
+    market._long_cohorts_by_bucket = {
+        market._cohort_bucket_tick(linked.entry_price): linked,
+        market._cohort_bucket_tick(unrelated.entry_price): unrelated,
+    }
+    market._long_cohorts = sorted(
+        market._long_cohorts_by_bucket.values(), key=lambda cohort: cohort.entry_price
+    )
+    market._cohorts_by_id = {cohort.id: cohort for cohort in market._long_cohorts}
+    market._long_mass_total = 8.0
+
+    removed = market._apply_fill(
+        "long_exit",
+        1.5,
+        101.0,
+        market.state.mdf,
+        cohort_id=linked.id,
+    )
+
+    assert removed == pytest.approx(1.5)
+    assert linked.mass == pytest.approx(2.5)
+    assert unrelated.mass == pytest.approx(4.0)
+    assert market._long_mass_total == pytest.approx(6.5)
+
+
+def test_buy_entry_mdf_order_matches_resting_asks_and_rests_leftover_volume():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=93, grid_radius=8)
+    market._add_lots({101.0: 1.0, 102.0: 2.0, 103.0: 4.0}, "ask", "sell_entry")
+    mdf = mw.MDFState(buy_entry_mdf_by_price={102.0: 1.0})
+    intensity = mw.IntensityState(total=5.0, buy=5.0, sell=0.0, buy_ratio=1.0, sell_ratio=0.0)
+
+    flow = market._entry_flow(intensity, mdf)
+    stats = _TradeStats(executed_by_price={})
+    execution = market._execute_market_flows(
+        entry_orders=flow.orders,
+        short_exit_market_orders=[],
+        long_exit_market_orders=[],
+        mdf=market.state.mdf,
+        stats=stats,
+    )
+
+    assert [(order.side, order.price, order.volume) for order in flow.orders] == [
+        ("buy", 102.0, 5.0)
+    ]
+    assert stats.executed_by_price == pytest.approx({101.0: 1.0, 102.0: 2.0})
+    assert execution.residual_market_buy == 0.0
+    assert execution.market_buy_volume == pytest.approx(3.0)
+    assert market._orderbook.ask_volume_by_price == pytest.approx({103.0: 4.0})
+    assert market._orderbook.bid_volume_by_price == pytest.approx({102.0: 2.0})
+    assert market._long_mass_total == pytest.approx(3.0)
+
+
+def test_sell_entry_mdf_order_matches_resting_bids_and_rests_leftover_volume():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=94, grid_radius=8)
+    market._add_lots({99.0: 1.0, 98.0: 2.0, 97.0: 4.0}, "bid", "buy_entry")
+    mdf = mw.MDFState(sell_entry_mdf_by_price={98.0: 1.0})
+    intensity = mw.IntensityState(total=5.0, buy=0.0, sell=5.0, buy_ratio=0.0, sell_ratio=1.0)
+
+    flow = market._entry_flow(intensity, mdf)
+    stats = _TradeStats(executed_by_price={})
+    execution = market._execute_market_flows(
+        entry_orders=flow.orders,
+        short_exit_market_orders=[],
+        long_exit_market_orders=[],
+        mdf=market.state.mdf,
+        stats=stats,
+    )
+
+    assert [(order.side, order.price, order.volume) for order in flow.orders] == [
+        ("sell", 98.0, 5.0)
+    ]
+    assert stats.executed_by_price == pytest.approx({99.0: 1.0, 98.0: 2.0})
+    assert execution.residual_market_sell == 0.0
+    assert execution.market_sell_volume == pytest.approx(3.0)
+    assert market._orderbook.bid_volume_by_price == pytest.approx({97.0: 4.0})
+    assert market._orderbook.ask_volume_by_price == pytest.approx({98.0: 2.0})
+    assert market._short_mass_total == pytest.approx(3.0)
+
+
+def test_entry_mdf_order_rests_when_it_does_not_overlap_opposite_quotes():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=95, grid_radius=8)
+    market._add_lots({101.0: 3.0}, "ask", "sell_entry")
+    mdf = mw.MDFState(buy_entry_mdf_by_price={100.0: 1.0})
+    intensity = mw.IntensityState(total=4.0, buy=4.0, sell=0.0, buy_ratio=1.0, sell_ratio=0.0)
+
+    flow = market._entry_flow(intensity, mdf)
+    stats = _TradeStats(executed_by_price={})
+    execution = market._execute_market_flows(
+        entry_orders=flow.orders,
+        short_exit_market_orders=[],
+        long_exit_market_orders=[],
+        mdf=market.state.mdf,
+        stats=stats,
+    )
+
+    assert [(order.side, order.price, order.volume) for order in flow.orders] == [
+        ("buy", 100.0, 4.0)
+    ]
+    assert stats.total_volume == 0.0
+    assert execution.residual_market_buy == 0.0
+    assert execution.market_buy_volume == 0.0
+    assert market._orderbook.bid_volume_by_price == pytest.approx({100.0: 4.0})
+    assert market._orderbook.ask_volume_by_price == pytest.approx({101.0: 3.0})
+
+
+def test_same_price_entry_orders_match_after_first_order_rests():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.0, seed=96, grid_radius=8)
+    orders = [
+        market._entry_flow(
+            mw.IntensityState(total=4.0, buy=4.0, sell=0.0, buy_ratio=1.0, sell_ratio=0.0),
+            mw.MDFState(buy_entry_mdf_by_price={100.0: 1.0}),
+        ).orders[0],
+        market._entry_flow(
+            mw.IntensityState(total=6.0, buy=0.0, sell=6.0, buy_ratio=0.0, sell_ratio=1.0),
+            mw.MDFState(sell_entry_mdf_by_price={100.0: 1.0}),
+        ).orders[0],
+    ]
+    stats = _TradeStats(executed_by_price={})
+
+    buy_executed = market._process_incoming_order(
+        orders[0],
+        mdf=market.state.mdf,
+        stats=stats,
+    )
+    sell_executed = market._process_incoming_order(
+        orders[1],
+        mdf=market.state.mdf,
+        stats=stats,
+    )
+
+    assert stats.executed_by_price == pytest.approx({100.0: 4.0})
+    assert buy_executed == 0.0
+    assert sell_executed == pytest.approx(4.0)
+    assert market._orderbook.bid_volume_by_price == {}
+    assert market._orderbook.ask_volume_by_price == pytest.approx({100.0: 2.0})
+
+
+def test_orderbook_does_not_stay_crossed_after_steps():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.3, seed=97, grid_radius=12)
+    steps = market.step(250)
+
+    for step in steps:
+        best_bid = step.best_bid_after
+        best_ask = step.best_ask_after
+        assert best_bid is None or best_ask is None or best_bid < best_ask
+
+
 def test_default_plot_path_renders_panel_with_orderbook_heatmaps():
     matplotlib = pytest.importorskip("matplotlib")
     matplotlib.use("Agg", force=True)
@@ -950,6 +1148,10 @@ def test_stepinfo_exposes_market_realism_diagnostics():
 
     for name in REALISM_STEPINFO_FIELDS:
         assert hasattr(step, name), f"StepInfo should expose {name}"
+
+    assert step.residual_market_buy_volume == 0.0
+    assert step.residual_market_sell_volume == 0.0
+    assert step.crossed_market_volume == 0.0
 
     numeric_fields = (
         "market_buy_volume",

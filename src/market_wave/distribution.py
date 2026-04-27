@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from math import exp, isfinite, log1p
+from math import exp, isfinite, log
 from random import Random
 from typing import Protocol
 
@@ -150,7 +150,7 @@ def _component_score(tick: int, components: Sequence[RelativeMDFComponent]) -> f
             continue
         spread = max(component.spread_ticks, 1e-12)
         mass += component.weight * exp(-abs(tick - component.center_tick) / spread)
-    return log1p(max(0.0, mass))
+    return log(max(mass, 1e-12))
 
 
 def _scale_map(values: Mapping[int, float]) -> TickMap:

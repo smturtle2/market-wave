@@ -1,7 +1,7 @@
 # market-wave
 
 <p align="center">
-  <img src="docs/assets/market-wave-hero.png" alt="market-wave abstract market intent simulation hero" />
+  <img src="https://raw.githubusercontent.com/smturtle2/market-wave/main/docs/assets/market-wave-hero.png" alt="market-wave abstract market intent simulation hero" />
 </p>
 
 <p align="center">
@@ -83,10 +83,10 @@ steps = market.step(500)
 
 last = steps[-1]
 print(last.price_before, "->", last.price_after)
+print("entry:", round(sum(last.entry_volume_by_price.values()), 3))
 print("executed:", round(last.total_executed_volume, 3))
+print("resting bid/ask:", round(sum(last.orderbook_after.bid_volume_by_price.values()), 3), round(sum(last.orderbook_after.ask_volume_by_price.values()), 3))
 print("imbalance:", round(last.order_flow_imbalance, 3))
-print("crossed flow:", round(last.crossed_market_volume, 3))
-print("residual flow:", round(last.residual_market_buy_volume, 3), round(last.residual_market_sell_volume, 3))
 ```
 
 `Market.step(n)` always returns `list[StepInfo]` and appends the same objects to
@@ -107,11 +107,11 @@ For simple export workflows, use `step.to_dict()`, `step.to_json()`, or
 Example output with `seed=42`:
 
 ```text
-9920.0 -> 9950.0
-executed: 3.043
-imbalance: 0.024
-crossed flow: 1.68
-residual flow: 0.738 0.626
+10140.0 -> 10170.0
+entry: 4.458
+executed: 4.042
+resting bid/ask: 12.12 10.571
+imbalance: -0.587
 ```
 
 ## Smoke Matrix
@@ -144,12 +144,12 @@ for name, kwargs, steps_count in cases:
 Recent verification on the current implementation:
 
 ```text
-baseline  range=  9880.0- 10320.0 unique= 44 moves=482 exec_steps=500 final=  9950.0
-busy      range=  9920.0- 10290.0 unique= 38 moves=486 exec_steps=500 final=  9990.0
-thin      range=   470.0-   665.0 unique= 40 moves=407 exec_steps=500 final=   575.0
-low_price range=     1.0-    63.0 unique= 63 moves=494 exec_steps=500 final=    55.0
-trend_up  range=  9820.0- 10270.0 unique= 46 moves=485 exec_steps=500 final=  9860.0
-high_vol  range=  9660.0- 10390.0 unique= 73 moves=484 exec_steps=500 final= 10290.0
+baseline  range=  9900.0- 10220.0 unique= 33 moves=455 exec_steps=500 final= 10170.0
+busy      range=  9940.0- 10470.0 unique= 52 moves=451 exec_steps=500 final= 10240.0
+thin      range=   330.0-   525.0 unique= 36 moves=451 exec_steps=500 final=   355.0
+low_price range=     4.0-    75.0 unique= 68 moves=447 exec_steps=500 final=    73.0
+trend_up  range= 10010.0- 15650.0 unique=447 moves=490 exec_steps=500 final= 15650.0
+high_vol  range=  9970.0- 10700.0 unique= 72 moves=452 exec_steps=500 final= 10580.0
 inactive  range=   100.0-   100.0 unique=  1 moves=  0 exec_steps=  0 final=   100.0
 ```
 
@@ -160,17 +160,26 @@ steps with executed volume. Dynamic MDF acceptance also runs seeds `10..19` at
 `mdf_temperature=1.0` and checks that every MDF remains finite, non-negative,
 normalized, and broad enough not to collapse to a single price.
 
-Diagnostic note for `0.3.0`: the simulator does not keep a stored target price
+Diagnostic note for `0.3.1`: the simulator does not keep a stored target price
 or any value that pulls prices back to the initial price. Seeded `mood`, `trend`,
 and `volatility` evolve each step and reshape the MDFs; prices still move only
 from executed prints. Treat these ranges, move counts, and execution counts as
 regression diagnostics, not claims that the generated paths match any real
 market.
 
-Performance note for `0.3.0`: live order-book and position totals are cached by
-price/side while preserving individual lot and cohort age semantics. Long runs
-avoid repeatedly summing all live lots for best-price lookup, snapshots, and
-near-touch imbalance, regardless of `keep_history`.
+Entry MDF prices are treated as incoming order prices. Buy entry orders arrive as
+bids, sell entry orders arrive as asks, and they execute only when they overlap
+existing opposite-side quotes. Executions print at the resting quote price.
+Unfilled volume remains in the book at the sampled MDF price. Exit flow is
+cohort-conditioned, so exit orders carry the originating cohort id and still
+route through visible order-book liquidity.
+
+Performance note for `0.3.1`: live order-book and position totals are cached by
+price/side, order-book lots are coalesced by price/kind, and position inventory
+is kept in bounded entry-price cohort buckets. The live book is also pruned to
+the active price window after each step. Long runs avoid repeatedly summing all
+live lots for best-price lookup, snapshots, and near-touch imbalance, regardless
+of `keep_history`.
 
 ## Visualization
 
@@ -189,7 +198,7 @@ fig, ax = market.plot(last=220, orderbook_depth=12)
 ```
 
 <p align="center">
-  <img src="docs/assets/market-wave-plot.png" alt="market-wave light pyplot chart showing price, orderbook depth heatmaps, volume, and imbalance" />
+  <img src="https://raw.githubusercontent.com/smturtle2/market-wave/main/docs/assets/market-wave-plot.png" alt="market-wave light pyplot chart showing price, orderbook depth heatmaps, volume, and imbalance" />
 </p>
 
 The default `market_wave` style uses a light multi-panel chart: price/VWAP,
@@ -339,13 +348,20 @@ Useful `StepInfo` fields include:
 - `mdf_price_basis`, `price_grid`
 - `buy_entry_mdf`, `sell_entry_mdf`, `long_exit_mdf`, `short_exit_mdf`
 - `buy_entry_mdf_by_price`, `sell_entry_mdf_by_price`
+- `entry_volume_by_price`, `exit_volume_by_price`
 - `buy_volume_by_price`, `sell_volume_by_price`
 - `executed_volume_by_price`, `total_executed_volume`, `trade_count`
-- `market_buy_volume`, `market_sell_volume`, `crossed_market_volume`
-- `residual_market_buy_volume`, `residual_market_sell_volume`
+- `market_buy_volume`, `market_sell_volume`
 - `vwap_price`, `best_bid_before`, `best_ask_before`, `spread_after`
 - `orderbook_before`, `orderbook_after`
 - `position_mass_before`, `position_mass_after`
+
+`buy_volume_by_price` and `sell_volume_by_price` are submitted side-intent maps
+keyed by sampled order price, not executed or resting liquidity. `market_*`
+volume fields report the executed incoming buy/sell volume. Unfilled incoming
+volume rests in `orderbook_after`; legacy `residual_market_*` and
+`crossed_market_volume` fields remain compatibility zeroes in the current
+order-book-first engine.
 
 The `*_mdf_by_price` fields are pre-trade MDF projections keyed by
 `mdf_price_basis`; current `Market.state.mdf.*_by_price` is reprojected to the

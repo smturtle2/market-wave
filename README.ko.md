@@ -1,7 +1,7 @@
 # market-wave
 
 <p align="center">
-  <img src="docs/assets/market-wave-hero.png" alt="market-wave 시장 의도 시뮬레이션 히어로 이미지" />
+  <img src="https://raw.githubusercontent.com/smturtle2/market-wave/main/docs/assets/market-wave-hero.png" alt="market-wave 시장 의도 시뮬레이션 히어로 이미지" />
 </p>
 
 <p align="center">
@@ -81,10 +81,10 @@ steps = market.step(500)
 
 last = steps[-1]
 print(last.price_before, "->", last.price_after)
+print("entry:", round(sum(last.entry_volume_by_price.values()), 3))
 print("executed:", round(last.total_executed_volume, 3))
+print("resting bid/ask:", round(sum(last.orderbook_after.bid_volume_by_price.values()), 3), round(sum(last.orderbook_after.ask_volume_by_price.values()), 3))
 print("imbalance:", round(last.order_flow_imbalance, 3))
-print("crossed flow:", round(last.crossed_market_volume, 3))
-print("residual flow:", round(last.residual_market_buy_volume, 3), round(last.residual_market_sell_volume, 3))
 ```
 
 `Market.step(n)`은 항상 `list[StepInfo]`를 반환하고, 같은 객체들을
@@ -105,11 +105,11 @@ for step in market.stream(512, keep_history=False):
 `seed=42` 기준 예시 출력:
 
 ```text
-9920.0 -> 9950.0
-executed: 3.043
-imbalance: 0.024
-crossed flow: 1.68
-residual flow: 0.738 0.626
+10140.0 -> 10170.0
+entry: 4.458
+executed: 4.042
+resting bid/ask: 12.12 10.571
+imbalance: -0.587
 ```
 
 ## 스모크 매트릭스
@@ -142,12 +142,12 @@ for name, kwargs, steps_count in cases:
 현재 구현에서 최근 검증한 결과:
 
 ```text
-baseline  range=  9880.0- 10320.0 unique= 44 moves=482 exec_steps=500 final=  9950.0
-busy      range=  9920.0- 10290.0 unique= 38 moves=486 exec_steps=500 final=  9990.0
-thin      range=   470.0-   665.0 unique= 40 moves=407 exec_steps=500 final=   575.0
-low_price range=     1.0-    63.0 unique= 63 moves=494 exec_steps=500 final=    55.0
-trend_up  range=  9820.0- 10270.0 unique= 46 moves=485 exec_steps=500 final=  9860.0
-high_vol  range=  9660.0- 10390.0 unique= 73 moves=484 exec_steps=500 final= 10290.0
+baseline  range=  9900.0- 10220.0 unique= 33 moves=455 exec_steps=500 final= 10170.0
+busy      range=  9940.0- 10470.0 unique= 52 moves=451 exec_steps=500 final= 10240.0
+thin      range=   330.0-   525.0 unique= 36 moves=451 exec_steps=500 final=   355.0
+low_price range=     4.0-    75.0 unique= 68 moves=447 exec_steps=500 final=    73.0
+trend_up  range= 10010.0- 15650.0 unique=447 moves=490 exec_steps=500 final= 15650.0
+high_vol  range=  9970.0- 10700.0 unique= 72 moves=452 exec_steps=500 final= 10580.0
 inactive  range=   100.0-   100.0 unique=  1 moves=  0 exec_steps=  0 final=   100.0
 ```
 
@@ -158,16 +158,24 @@ Dynamic MDF acceptance는 `mdf_temperature=1.0`에서 seed `10..19`도 실행해
 모든 MDF가 finite, non-negative, normalized 상태를 유지하고 한 가격으로
 붕괴하지 않는지도 확인합니다.
 
-`0.3.0` 진단 메모: 시뮬레이터는 저장된 목표 가격이나 가격을 초기값으로
+`0.3.1` 진단 메모: 시뮬레이터는 저장된 목표 가격이나 가격을 초기값으로
 되돌리는 값을 갖지 않습니다. seed로 정해진 `mood`, `trend`, `volatility`는
 매 step 전이되며 MDF 형태를 바꿉니다. 가격은 여전히 체결 print에서만
 움직입니다. 위 range, move count, execution count는 실제 시장과의 일치 주장이
 아니라 regression diagnostic으로 보아야 합니다.
 
-`0.3.0` 성능 메모: live orderbook과 position total을 price/side별로 cache하면서도
-개별 lot과 cohort의 age 의미는 유지합니다. 긴 실행에서도 best-price lookup, snapshot,
-near-touch imbalance 계산에서 모든 live lot을 반복 합산하지 않으며, 이 개선은
-`keep_history` 값과 무관하게 적용됩니다.
+Entry MDF의 가격은 incoming order 가격으로 취급됩니다. 매수 entry는 bid로,
+매도 entry는 ask로 들어오며, 기존 반대편 호가와 겹칠 때만 체결됩니다. 체결
+가격은 resting quote 가격입니다. 체결되지 않은 물량은 sampled MDF 가격에
+그대로 미체결 호가로 남습니다. Exit flow는 cohort 조건부로 생성되며, exit
+주문도 원래 cohort id를 들고 visible order-book liquidity를 통해 처리됩니다.
+
+`0.3.1` 성능 메모: live orderbook과 position total을 price/side별로 cache하고,
+orderbook lot은 price/kind별로 합치며, position inventory는 제한된 entry-price
+cohort bucket으로 유지합니다. 또한 매 step 후 live book을 active price window로
+잘라냅니다. 긴 실행에서도 best-price lookup, snapshot, near-touch imbalance
+계산에서 모든 live lot을 반복 합산하지 않으며, 이 개선은 `keep_history` 값과
+무관하게 적용됩니다.
 
 ## 시각화
 
@@ -186,7 +194,7 @@ fig, ax = market.plot(last=220, orderbook_depth=12)
 ```
 
 <p align="center">
-  <img src="docs/assets/market-wave-plot.png" alt="가격, orderbook depth heatmap, 거래량, imbalance를 보여주는 market-wave light pyplot 차트" />
+  <img src="https://raw.githubusercontent.com/smturtle2/market-wave/main/docs/assets/market-wave-plot.png" alt="가격, orderbook depth heatmap, 거래량, imbalance를 보여주는 market-wave light pyplot 차트" />
 </p>
 
 기본 `market_wave` 스타일은 가격/VWAP, 단순 level 기준 bid/ask orderbook depth
@@ -335,13 +343,20 @@ from market_wave import (
 - `mdf_price_basis`, `price_grid`
 - `buy_entry_mdf`, `sell_entry_mdf`, `long_exit_mdf`, `short_exit_mdf`
 - `buy_entry_mdf_by_price`, `sell_entry_mdf_by_price`
+- `entry_volume_by_price`, `exit_volume_by_price`
 - `buy_volume_by_price`, `sell_volume_by_price`
 - `executed_volume_by_price`, `total_executed_volume`, `trade_count`
-- `market_buy_volume`, `market_sell_volume`, `crossed_market_volume`
-- `residual_market_buy_volume`, `residual_market_sell_volume`
+- `market_buy_volume`, `market_sell_volume`
 - `vwap_price`, `best_bid_before`, `best_ask_before`, `spread_after`
 - `orderbook_before`, `orderbook_after`
 - `position_mass_before`, `position_mass_after`
+
+`buy_volume_by_price`와 `sell_volume_by_price`는 sampled order price별 제출
+의도 물량이며, 체결량이나 남은 호가 물량이 아닙니다. `market_*` volume field는
+실제로 체결된 incoming buy/sell 물량을 뜻합니다. 체결되지 않은 incoming 물량은
+`orderbook_after`에 남습니다. legacy `residual_market_*`와
+`crossed_market_volume` field는 현재 order-book-first engine에서 호환성을 위한
+0 값으로 유지됩니다.
 
 `*_mdf_by_price` 필드는 `mdf_price_basis`를 기준으로 한 pre-trade MDF projection입니다.
 현재 `Market.state.mdf.*_by_price`는 post-trade state 가격에 맞춰 다시 투영됩니다.
