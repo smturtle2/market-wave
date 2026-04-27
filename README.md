@@ -158,12 +158,12 @@ steps with executed volume. Dynamic MDF acceptance also runs seeds `10..19` at
 `mdf_temperature=1.0` and checks that every MDF remains finite, non-negative,
 normalized, and broad enough not to collapse to a single price.
 
-Diagnostic note for `0.2.4`: the current MDF update is numerically stable under
+Diagnostic note for `0.2.5`: the current MDF update is numerically stable under
 the smoke metrics above, but it is not behaviorally calibrated. Treat these
 ranges, move counts, and execution counts as regression diagnostics, not claims
 that the generated paths match any real market.
 
-Performance note for `0.2.4`: live order-book and position totals are cached by
+Performance note for `0.2.5`: live order-book and position totals are cached by
 price/side while preserving individual lot and cohort age semantics. Long runs
 avoid repeatedly summing all live lots for best-price lookup, snapshots, and
 near-touch imbalance, regardless of `keep_history`.
@@ -173,10 +173,18 @@ near-touch imbalance, regardless of `keep_history`.
 ```python
 from market_wave import Market
 
-market = Market(initial_price=10_000, gap=10, popularity=1.0, seed=42)
-market.step(260)
+market = Market(
+    initial_price=10_000,
+    gap=5,
+    popularity=1.4,
+    seed=42,
+    regime="auto",
+    augmentation_strength=0.25,
+    grid_radius=20,
+)
+market.step(320)
 
-fig, ax = market.plot(last=180)
+fig, ax = market.plot(last=220, orderbook_depth=12)
 ```
 
 <p align="center">
