@@ -506,6 +506,35 @@ def test_step_can_skip_history_and_stream_steps():
     assert [step.step_index for step in streamed] == [4, 5]
 
 
+def test_live_orderbook_lots_are_compacted_during_long_historyless_runs():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.2, seed=13, grid_radius=16)
+
+    market.step(1000, keep_history=False)
+
+    assert market.history == []
+    for lots_by_price in (market._orderbook.bid_lots, market._orderbook.ask_lots):
+        for lots in lots_by_price.values():
+            kinds = [lot.kind for lot in lots]
+            assert len(kinds) == len(set(kinds))
+
+    price_levels = len(market._orderbook.bid_lots) + len(market._orderbook.ask_lots)
+    lot_count = sum(len(lots) for lots in market._orderbook.bid_lots.values()) + sum(
+        len(lots) for lots in market._orderbook.ask_lots.values()
+    )
+    assert lot_count <= 4 * max(1, price_levels)
+    assert lot_count <= 4 * (2 * market.grid_radius + 1)
+
+
+def test_position_cohorts_are_compacted_by_effective_age():
+    market = Market(initial_price=100.0, gap=1.0, popularity=1.3, seed=88, grid_radius=14)
+
+    market.step(750, keep_history=False)
+
+    for cohorts in (market._long_cohorts, market._short_cohorts):
+        groups = [(cohort.side, cohort.entry_price, min(cohort.age, 30)) for cohort in cohorts]
+        assert len(groups) == len(set(groups))
+
+
 def test_stepinfo_exposes_relative_tick_mdfs():
     market = Market(initial_price=100.0, gap=1.0, seed=23, grid_radius=4)
 

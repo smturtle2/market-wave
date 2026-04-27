@@ -122,6 +122,20 @@ class _OrderBook:
                 if not lots_by_price[price]:
                     del lots_by_price[price]
 
+    def compact(self, current_price: float, gap: float, retention_ticks: int) -> None:
+        lower_bound = current_price - retention_ticks * gap
+        upper_bound = current_price + retention_ticks * gap
+        for lots_by_price in (self.bid_lots, self.ask_lots):
+            for price in list(lots_by_price):
+                if price < lower_bound or price > upper_bound:
+                    del lots_by_price[price]
+                    continue
+                compacted = self._compact_lots(lots_by_price[price])
+                if compacted:
+                    lots_by_price[price] = compacted
+                else:
+                    del lots_by_price[price]
+
     def snapshot(self) -> OrderBookState:
         return OrderBookState(
             bid_volume_by_price=self._aggregate_lots(self.bid_lots),
@@ -153,6 +167,27 @@ class _OrderBook:
             )
             if volume > 1e-12
         }
+
+    @staticmethod
+    def _compact_lots(lots: list[_OrderLot]) -> list[_OrderLot]:
+        by_kind: dict[str, tuple[float, float]] = {}
+        for lot in lots:
+            if lot.volume <= 1e-12:
+                continue
+            total_volume, weighted_age = by_kind.get(lot.kind, (0.0, 0.0))
+            by_kind[lot.kind] = (
+                total_volume + lot.volume,
+                weighted_age + lot.volume * lot.age,
+            )
+        return [
+            _OrderLot(
+                volume=volume,
+                kind=kind,
+                age=max(0, int(round(weighted_age / volume))),
+            )
+            for kind, (volume, weighted_age) in sorted(by_kind.items())
+            if volume > 1e-12
+        ]
 
 
 class Market:
@@ -855,6 +890,7 @@ class Market:
         )
         self._clean_orderbook()
         self._clean_cohorts()
+        self._compact_live_state(price_before)
 
         price_after = self._next_price_after_trading(price_before, stats)
         price_after = self._snap_price(price_after)
@@ -1700,6 +1736,30 @@ class Market:
     def _clean_cohorts(self) -> None:
         self._long_cohorts = [cohort for cohort in self._long_cohorts if cohort.mass > 1e-12]
         self._short_cohorts = [cohort for cohort in self._short_cohorts if cohort.mass > 1e-12]
+
+    def _compact_live_state(self, current_price: float) -> None:
+        self._orderbook.compact(
+            current_price,
+            self.gap,
+            retention_ticks=max(2 * self.grid_radius, self.grid_radius + 8),
+        )
+        self._long_cohorts = self._compact_cohorts(self._long_cohorts)
+        self._short_cohorts = self._compact_cohorts(self._short_cohorts)
+
+    @staticmethod
+    def _compact_cohorts(cohorts: list[_PositionCohort]) -> list[_PositionCohort]:
+        compacted: dict[tuple[str, float, int], float] = {}
+        for cohort in cohorts:
+            if cohort.mass <= 1e-12:
+                continue
+            effective_age = min(cohort.age, 30)
+            key = (cohort.side, cohort.entry_price, effective_age)
+            compacted[key] = compacted.get(key, 0.0) + cohort.mass
+        return [
+            _PositionCohort(side=side, entry_price=entry_price, mass=mass, age=age)
+            for (side, entry_price, age), mass in sorted(compacted.items())
+            if mass > 1e-12
+        ]
 
     def _best_bid(self) -> float | None:
         return self._orderbook.best_bid()
