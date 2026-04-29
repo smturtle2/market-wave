@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import inspect
 from copy import deepcopy
 from dataclasses import dataclass, field
-from math import exp, isfinite, log, log1p
+from math import exp, isfinite, log1p, sin
 from random import Random
 
 from .distribution import (
-    DynamicMDFModel,
     MDFContext,
-    MDFModel,
     MDFSignals,
 )
 from .state import (
@@ -18,35 +15,10 @@ from .state import (
     MarketState,
     MDFState,
     OrderBookState,
-    PositionMassState,
     PriceMap,
     StepInfo,
     TickMap,
 )
-
-
-@dataclass
-class _OrderLot:
-    volume: float
-    kind: str
-    age: int = 0
-    cohort_id: int | None = None
-
-
-@dataclass
-class _PositionCohort:
-    side: str
-    entry_price: float
-    mass: float
-    age: int = 0
-    id: int = 0
-
-
-@dataclass
-class _ExitOrder:
-    price: float
-    volume: float
-    cohort_id: int
 
 
 @dataclass
@@ -55,7 +27,6 @@ class _IncomingOrder:
     kind: str
     price: float
     volume: float
-    cohort_id: int | None = None
 
 
 @dataclass
@@ -63,17 +34,6 @@ class _EntryFlow:
     orders: list[_IncomingOrder]
     buy_intent_by_price: PriceMap
     sell_intent_by_price: PriceMap
-
-
-@dataclass
-class _ExitFlow:
-    market_orders: list[_IncomingOrder]
-    limit_orders: list[_ExitOrder]
-    intent_volume_by_price: PriceMap
-
-    @property
-    def market_volume(self) -> float:
-        return sum(order.volume for order in self.market_orders)
 
 
 @dataclass
@@ -97,12 +57,16 @@ class _TradeStats:
 @dataclass
 class _ExecutionResult:
     residual_market_buy: float
-    residual_short_exit: float
     residual_market_sell: float
-    residual_long_exit: float
     crossed_market_volume: float
     market_buy_volume: float = 0.0
     market_sell_volume: float = 0.0
+
+
+@dataclass(frozen=True)
+class _ProcessedOrder:
+    executed: float
+    rested: float
 
 
 @dataclass
@@ -114,7 +78,9 @@ class _MicrostructureState:
     recent_flow_imbalance: float = 0.0
     squeeze_pressure: float = 0.0
     activity_event: float = 0.0
-    wall_pressure_by_absolute_tick: TickMap = field(default_factory=dict)
+    liquidity_stress: float = 0.0
+    stress_side: float = 0.0
+    spread_pressure: float = 0.0
     last_cancelled_volume: float = 0.0
 
 
@@ -129,18 +95,74 @@ class _MicrostructureInputs:
     squeeze_setup: float
 
 
+@dataclass(frozen=True)
+class _MarketConditionInputs:
+    execution_pressure: float
+    return_shock: float
+    volatility_shock: float
+    imbalance_shock: float
+    signed_return: float
+    flow_imbalance: float
+    spread_gap: float
+    depth_shortage: float
+    cancel_pressure: float
+    squeeze_setup: float
+
+
+@dataclass(frozen=True)
+class _MarketConditionState:
+    trend_bias: float = 0.0
+    volatility_pressure: float = 0.0
+    liquidity_tightness: float = 0.0
+    stress_pressure: float = 0.0
+    participation_bias: float = 0.0
+    squeeze_pressure: float = 0.0
+
+
+@dataclass(frozen=True)
+class _MDFSideJudgment:
+    fair_value_shift: float
+    urgency: float
+    patience: float
+    opportunity: float
+    liquidation: float
+    liquidity_aversion: float
+    pocket_bias: float
+    uncertainty: float
+
+
+@dataclass(frozen=True)
+class _MDFJudgmentSample:
+    buy: _MDFSideJudgment
+    sell: _MDFSideJudgment
+
+
+@dataclass
+class _StepComputationCache:
+    basis_price: float
+    mdf: MDFState | None = None
+    micro: _MicrostructureState | None = None
+    signals: MDFSignals | None = None
+    spread_ticks: float | None = None
+    entry_probabilities_by_side: dict[str, PriceMap] = field(default_factory=dict)
+    expected_depth_by_side: dict[str, float] = field(default_factory=dict)
+    expected_volume_by_side_price: dict[tuple[str, float], float] = field(default_factory=dict)
+
+
 @dataclass
 class _OrderBook:
-    bid_lots: dict[float, list[_OrderLot]]
-    ask_lots: dict[float, list[_OrderLot]]
     bid_volume_by_price: PriceMap = field(default_factory=dict)
     ask_volume_by_price: PriceMap = field(default_factory=dict)
+    _best_bid_cache: float | None = field(default=None, init=False, repr=False)
+    _best_ask_cache: float | None = field(default=None, init=False, repr=False)
+    _bid_best_dirty: bool = field(default=True, init=False, repr=False)
+    _ask_best_dirty: bool = field(default=True, init=False, repr=False)
 
-    def age(self) -> None:
-        for lots_by_price in (self.bid_lots, self.ask_lots):
-            for lots in lots_by_price.values():
-                for lot in lots:
-                    lot.age += 1
+    def invalidate(self, side: str | None = None) -> None:
+        if side in (None, "bid"):
+            self._bid_best_dirty = True
+        if side in (None, "ask"):
+            self._ask_best_dirty = True
 
     def add_lot(
         self,
@@ -148,36 +170,23 @@ class _OrderBook:
         volume: float,
         side: str,
         kind: str,
-        cohort_id: int | None = None,
     ) -> None:
+        del kind
         if volume <= 0:
             return
-        lots_by_price = self.lots_for_side(side)
         volume_totals = self.volumes_for_side(side)
-        lots = lots_by_price.setdefault(price, [])
-        for lot in reversed(lots):
-            if lot.kind == kind and lot.cohort_id == cohort_id:
-                total = lot.volume + volume
-                if total > 1e-12:
-                    lot.age = int(round((lot.age * lot.volume) / total))
-                    lot.volume = total
-                break
-        else:
-            lots.append(_OrderLot(volume=volume, kind=kind, cohort_id=cohort_id))
         volume_totals[price] = volume_totals.get(price, 0.0) + volume
+        self.invalidate(side)
 
     def add_lots(self, volume_by_price: PriceMap, side: str, kind: str) -> None:
         for price, volume in volume_by_price.items():
             self.add_lot(price, volume, side, kind)
 
-    def lots_for_side(self, side: str) -> dict[float, list[_OrderLot]]:
-        return self.bid_lots if side == "bid" else self.ask_lots
-
-    def lots_for_taker_side(self, side: str) -> dict[float, list[_OrderLot]]:
-        return self.ask_lots if side == "buy" else self.bid_lots
-
     def volumes_for_side(self, side: str) -> PriceMap:
         return self.bid_volume_by_price if side == "bid" else self.ask_volume_by_price
+
+    def volumes_for_taker_side(self, side: str) -> PriceMap:
+        return self.ask_volume_by_price if side == "buy" else self.bid_volume_by_price
 
     def adjust_volume(self, side: str, price: float, delta: float) -> None:
         if abs(delta) <= 1e-12:
@@ -188,38 +197,41 @@ class _OrderBook:
             volume_totals[price] = next_volume
         else:
             volume_totals.pop(price, None)
-
-    def rebuild_totals(self) -> None:
-        self.bid_volume_by_price = self._aggregate_lots(self.bid_lots)
-        self.ask_volume_by_price = self._aggregate_lots(self.ask_lots)
+        self.invalidate(side)
 
     def best_bid(self) -> float | None:
-        prices = [price for price, volume in self.bid_volume_by_price.items() if volume > 1e-12]
-        return max(prices) if prices else None
+        if self._bid_best_dirty:
+            self._best_bid_cache = max(
+                (price for price, volume in self.bid_volume_by_price.items() if volume > 1e-12),
+                default=None,
+            )
+            self._bid_best_dirty = False
+        return self._best_bid_cache
 
     def best_ask(self) -> float | None:
-        prices = [price for price, volume in self.ask_volume_by_price.items() if volume > 1e-12]
-        return min(prices) if prices else None
+        if self._ask_best_dirty:
+            self._best_ask_cache = min(
+                (price for price, volume in self.ask_volume_by_price.items() if volume > 1e-12),
+                default=None,
+            )
+            self._ask_best_dirty = False
+        return self._best_ask_cache
 
     def discard_empty_head(self, price: float, side: str) -> None:
-        lots_by_price = self.lots_for_side(side)
         volume_totals = self.volumes_for_side(side)
-        lots = lots_by_price.get(price, [])
-        while lots and lots[0].volume <= 1e-12:
-            lots.pop(0)
-        if not lots and price in lots_by_price:
-            del lots_by_price[price]
+        if volume_totals.get(price, 0.0) <= 1e-12:
             volume_totals.pop(price, None)
-        elif not lots:
-            volume_totals.pop(price, None)
+            self.invalidate(side)
 
     def clean(self) -> None:
-        for lots_by_price in (self.bid_lots, self.ask_lots):
-            for price in list(lots_by_price):
-                lots_by_price[price] = [lot for lot in lots_by_price[price] if lot.volume > 1e-12]
-                if not lots_by_price[price]:
-                    del lots_by_price[price]
-        self.rebuild_totals()
+        for side, volume_by_price in (
+            ("bid", self.bid_volume_by_price),
+            ("ask", self.ask_volume_by_price),
+        ):
+            for price in list(volume_by_price):
+                if volume_by_price[price] <= 1e-12:
+                    del volume_by_price[price]
+                    self.invalidate(side)
 
     def snapshot(self) -> OrderBookState:
         return OrderBookState(
@@ -244,16 +256,6 @@ class _OrderBook:
         return max(-1.0, min(1.0, (bid_depth - ask_depth) / total))
 
     @staticmethod
-    def _aggregate_lots(lots_by_price: dict[float, list[_OrderLot]]) -> PriceMap:
-        return {
-            price: volume
-            for price, volume in sorted(
-                (price, sum(lot.volume for lot in lots)) for price, lots in lots_by_price.items()
-            )
-            if volume > 1e-12
-        }
-
-    @staticmethod
     def _drop_zeroes(values: PriceMap) -> PriceMap:
         return {price: value for price, value in sorted(values.items()) if value > 1e-12}
 
@@ -263,183 +265,327 @@ class Market:
     def _regime_names() -> set[str]:
         return {"normal", "trend_up", "trend_down", "high_vol", "thin_liquidity", "squeeze"}
 
-    def _next_regime(self) -> str:
-        if self.regime != "auto":
-            return self.regime
-        switch_probability = self._clamp(0.015 + 0.08 * self.augmentation_strength, 0.0, 0.18)
-        if self._rng.random() >= switch_probability:
-            return self._active_regime
-        regimes = sorted(self._regime_names())
-        weights = {
-            "normal": 0.42,
-            "trend_up": 0.14,
-            "trend_down": 0.14,
-            "high_vol": 0.12,
-            "thin_liquidity": 0.10,
-            "squeeze": 0.08,
+    def _condition_preset(self, regime: str) -> _MarketConditionState:
+        presets = {
+            "normal": _MarketConditionState(),
+            "trend_up": _MarketConditionState(
+                trend_bias=0.36,
+                volatility_pressure=0.06,
+                participation_bias=0.12,
+            ),
+            "trend_down": _MarketConditionState(
+                trend_bias=-0.36,
+                volatility_pressure=0.10,
+                liquidity_tightness=0.05,
+                stress_pressure=0.08,
+                participation_bias=0.14,
+            ),
+            "high_vol": _MarketConditionState(
+                volatility_pressure=0.78,
+                liquidity_tightness=0.24,
+                stress_pressure=0.68,
+                participation_bias=0.36,
+            ),
+            "thin_liquidity": _MarketConditionState(
+                volatility_pressure=0.30,
+                liquidity_tightness=1.08,
+                stress_pressure=0.58,
+                participation_bias=-0.30,
+            ),
+            "squeeze": _MarketConditionState(
+                trend_bias=0.10,
+                volatility_pressure=0.62,
+                liquidity_tightness=0.56,
+                stress_pressure=0.72,
+                participation_bias=0.22,
+                squeeze_pressure=0.78,
+            ),
         }
-        draw = self._rng.random() * sum(weights.values())
-        cumulative = 0.0
-        for regime in regimes:
-            cumulative += weights[regime]
-            if draw <= cumulative:
-                return regime
+        return presets.get("normal" if regime == "auto" else regime, presets["normal"])
+
+    def _condition_settings(self, condition: _MarketConditionState) -> dict[str, float]:
+        trend = self._clamp(condition.trend_bias, -1.0, 1.0)
+        volatility = self._clamp(condition.volatility_pressure, 0.0, 1.8)
+        tightness = self._clamp(condition.liquidity_tightness, 0.0, 1.8)
+        stress = self._clamp(condition.stress_pressure, 0.0, 1.8)
+        participation = self._clamp(condition.participation_bias, -0.8, 1.2)
+        squeeze = self._clamp(condition.squeeze_pressure, 0.0, 1.5)
+        trend_abs = abs(trend)
+
+        return {
+            "mood": 0.12 * trend + 0.015 * squeeze,
+            "trend": 0.22 * trend + 0.050 * squeeze,
+            "volatility": self._clamp(
+                1.0 + 0.36 * volatility + 0.08 * tightness + 0.04 * trend_abs,
+                0.78,
+                1.75,
+            ),
+            "volatility_bias": self._clamp(
+                0.065 * volatility + 0.018 * stress + 0.010 * tightness,
+                0.0,
+                0.12,
+            ),
+            "intensity": self._clamp(
+                1.0
+                + 0.28 * participation
+                + 0.14 * volatility
+                - 0.22 * tightness
+                + 0.08 * trend_abs
+                + 0.10 * squeeze,
+                0.52,
+                1.52,
+            ),
+            "taker": self._clamp(
+                1.0 + 0.16 * volatility + 0.10 * tightness + 0.06 * squeeze,
+                0.88,
+                1.42,
+            ),
+            "cancel": self._clamp(
+                1.0 + 0.20 * volatility + 0.26 * tightness + 0.20 * stress,
+                0.86,
+                1.62,
+            ),
+            "liquidity": self._clamp(
+                1.0 - 0.48 * tightness - 0.12 * stress + 0.05 * participation,
+                0.32,
+                1.12,
+            ),
+            "spread": self._clamp(
+                1.0 + 0.22 * volatility + 0.17 * tightness + 0.08 * stress,
+                0.92,
+                1.58,
+            ),
+            "activity_gain": self._clamp(
+                0.20 + 0.045 * volatility + 0.025 * max(participation, 0.0),
+                0.15,
+                0.32,
+            ),
+            "activity_decay": self._clamp(
+                0.76 + 0.020 * trend_abs - 0.018 * volatility,
+                0.70,
+                0.82,
+            ),
+            "cancel_burst": self._clamp(
+                0.68 + 0.16 * volatility + 0.14 * tightness + 0.10 * stress,
+                0.55,
+                1.08,
+            ),
+            "cancel_decay": self._clamp(0.70 + 0.018 * tightness - 0.012 * volatility, 0.64, 0.76),
+            "depth_exponent": self._clamp(
+                1.35 + 0.20 * tightness - 0.18 * volatility - 0.04 * participation,
+                1.02,
+                1.62,
+            ),
+            "near_touch_liquidity": self._clamp(
+                1.0 - 0.33 * tightness - 0.13 * volatility + 0.06 * participation,
+                0.52,
+                1.10,
+            ),
+            "resiliency": self._clamp(
+                0.92 - 0.26 * volatility - 0.36 * tightness - 0.18 * stress
+                + 0.08 * participation,
+                0.39,
+                1.08,
+            ),
+            "stress": self._clamp(
+                0.78 + 0.32 * volatility + 0.28 * tightness + 0.30 * stress,
+                0.62,
+                1.58,
+            ),
+            "event_gain": self._clamp(
+                0.36 + 0.20 * volatility + 0.18 * stress + 0.12 * squeeze,
+                0.28,
+                0.86,
+            ),
+            "book_noise": self._clamp(
+                0.18 + 0.08 * volatility + 0.08 * tightness + 0.04 * stress,
+                0.12,
+                0.38,
+            ),
+            "trend_exhaustion": self._clamp(
+                0.055 + 0.012 * trend_abs + 0.008 * volatility,
+                0.04,
+                0.09,
+            ),
+            "flow_reversal": self._clamp(
+                0.045 + 0.015 * tightness + 0.010 * volatility,
+                0.025,
+                0.075,
+            ),
+            "squeeze_gain": self._clamp(0.34 * squeeze, 0.0, 0.44),
+        }
+
+    def _condition_label(self, condition: _MarketConditionState) -> str:
+        if condition.squeeze_pressure >= 0.42:
+            return "squeeze"
+        if condition.liquidity_tightness >= 0.62:
+            return "thin_liquidity"
+        if condition.volatility_pressure >= 0.58 or condition.stress_pressure >= 0.72:
+            return "high_vol"
+        if condition.trend_bias >= 0.22:
+            return "trend_up"
+        if condition.trend_bias <= -0.22:
+            return "trend_down"
         return "normal"
 
-    def _regime_settings(self, regime: str) -> dict[str, float]:
-        settings = {
-            "normal": {
-                "mood": 0.0,
-                "trend": 0.0,
-                "volatility": 1.0,
-                "volatility_bias": 0.0,
-                "intensity": 1.0,
-                "taker": 1.0,
-                "cancel": 1.0,
-                "liquidity": 1.0,
-                "spread": 1.0,
-                "activity_gain": 0.20,
-                "activity_decay": 0.76,
-                "cancel_burst": 0.68,
-                "cancel_decay": 0.70,
-                "depth_exponent": 1.35,
-                "near_touch_liquidity": 1.0,
-                "wall_persistence": 0.82,
-                "wall_strength": 0.45,
-                "resiliency": 0.92,
-                "event_gain": 0.36,
-                "book_noise": 0.18,
-                "trend_exhaustion": 0.055,
-                "flow_reversal": 0.045,
-                "squeeze_gain": 0.0,
-            },
-            "trend_up": {
-                "mood": 0.04,
-                "trend": 0.08,
-                "volatility": 1.05,
-                "volatility_bias": 0.01,
-                "intensity": 1.12,
-                "taker": 1.08,
-                "cancel": 1.02,
-                "liquidity": 1.0,
-                "spread": 1.05,
-                "activity_gain": 0.22,
-                "activity_decay": 0.78,
-                "cancel_burst": 0.72,
-                "cancel_decay": 0.70,
-                "depth_exponent": 1.28,
-                "near_touch_liquidity": 1.04,
-                "wall_persistence": 0.84,
-                "wall_strength": 0.50,
-                "resiliency": 0.98,
-                "event_gain": 0.40,
-                "book_noise": 0.20,
-                "trend_exhaustion": 0.050,
-                "flow_reversal": 0.040,
-                "squeeze_gain": 0.0,
-            },
-            "trend_down": {
-                "mood": -0.04,
-                "trend": -0.08,
-                "volatility": 1.08,
-                "volatility_bias": 0.015,
-                "intensity": 1.14,
-                "taker": 1.10,
-                "cancel": 1.04,
-                "liquidity": 0.98,
-                "spread": 1.08,
-                "activity_gain": 0.23,
-                "activity_decay": 0.78,
-                "cancel_burst": 0.76,
-                "cancel_decay": 0.70,
-                "depth_exponent": 1.26,
-                "near_touch_liquidity": 0.98,
-                "wall_persistence": 0.82,
-                "wall_strength": 0.46,
-                "resiliency": 0.90,
-                "event_gain": 0.42,
-                "book_noise": 0.20,
-                "trend_exhaustion": 0.055,
-                "flow_reversal": 0.045,
-                "squeeze_gain": 0.0,
-            },
-            "high_vol": {
-                "mood": 0.0,
-                "trend": 0.0,
-                "volatility": 1.35,
-                "volatility_bias": 0.06,
-                "intensity": 1.22,
-                "taker": 1.18,
-                "cancel": 1.25,
-                "liquidity": 0.9,
-                "spread": 1.35,
-                "activity_gain": 0.26,
-                "activity_decay": 0.76,
-                "cancel_burst": 0.92,
-                "cancel_decay": 0.70,
-                "depth_exponent": 1.05,
-                "near_touch_liquidity": 0.76,
-                "wall_persistence": 0.66,
-                "wall_strength": 0.30,
-                "resiliency": 0.58,
-                "event_gain": 0.62,
-                "book_noise": 0.28,
-                "trend_exhaustion": 0.060,
-                "flow_reversal": 0.055,
-                "squeeze_gain": 0.0,
-            },
-            "thin_liquidity": {
-                "mood": 0.0,
-                "trend": 0.0,
-                "volatility": 1.18,
-                "volatility_bias": 0.025,
-                "intensity": 0.74,
-                "taker": 1.16,
-                "cancel": 1.28,
-                "liquidity": 0.42,
-                "spread": 1.22,
-                "activity_gain": 0.19,
-                "activity_decay": 0.74,
-                "cancel_burst": 0.84,
-                "cancel_decay": 0.70,
-                "depth_exponent": 1.55,
-                "near_touch_liquidity": 0.58,
-                "wall_persistence": 0.58,
-                "wall_strength": 0.24,
-                "resiliency": 0.42,
-                "event_gain": 0.58,
-                "book_noise": 0.30,
-                "trend_exhaustion": 0.065,
-                "flow_reversal": 0.060,
-                "squeeze_gain": 0.0,
-            },
-            "squeeze": {
-                "mood": 0.015,
-                "trend": 0.015,
-                "volatility": 1.45,
-                "volatility_bias": 0.035,
-                "intensity": 1.14,
-                "taker": 1.10,
-                "cancel": 1.18,
-                "liquidity": 0.7,
-                "spread": 1.4,
-                "activity_gain": 0.25,
-                "activity_decay": 0.76,
-                "cancel_burst": 0.82,
-                "cancel_decay": 0.70,
-                "depth_exponent": 1.16,
-                "near_touch_liquidity": 0.70,
-                "wall_persistence": 0.74,
-                "wall_strength": 0.40,
-                "resiliency": 0.66,
-                "event_gain": 0.70,
-                "book_noise": 0.28,
-                "trend_exhaustion": 0.070,
-                "flow_reversal": 0.045,
-                "squeeze_gain": 0.34,
-            },
-        }
-        return settings.get(regime, settings["normal"])
+    def _market_condition_inputs(
+        self,
+        latent: LatentState,
+        imbalance: float,
+    ) -> _MarketConditionInputs:
+        execution_pressure = min(
+            log1p(self._last_execution_volume / max(0.7, self.popularity)),
+            2.0,
+        )
+        spread_gap = self._clamp((self._current_spread_ticks() - 2.0) / 5.0, 0.0, 1.0)
+        bid_depth = self._nearby_book_depth("bid", self.state.price)
+        ask_depth = self._nearby_book_depth("ask", self.state.price)
+        expected_depth = max(0.8, self.popularity * (3.6 + 0.30 * self.grid_radius))
+        depth_shortage = self._clamp(
+            1.0 - (bid_depth + ask_depth) / max(expected_depth, 1e-12),
+            0.0,
+            1.0,
+        )
+        volatility_jump = max(0.0, latent.volatility - self.state.latent.volatility)
+        return _MarketConditionInputs(
+            execution_pressure=execution_pressure,
+            return_shock=1.0 - exp(-self._last_abs_return_ticks / 1.4),
+            volatility_shock=1.0 - exp(-volatility_jump / 0.25),
+            imbalance_shock=abs(imbalance - self._last_imbalance),
+            signed_return=self._last_return_ticks,
+            flow_imbalance=self._last_imbalance,
+            spread_gap=spread_gap,
+            depth_shortage=depth_shortage,
+            cancel_pressure=self._microstructure.cancel_pressure,
+            squeeze_setup=self._squeeze_setup_pressure(),
+        )
+
+    def _next_market_condition(
+        self,
+        previous: _MarketConditionState,
+        inputs: _MarketConditionInputs,
+    ) -> _MarketConditionState:
+        preset = self._condition_preset(self.regime)
+        preset_weight = 0.22 if self.regime == "auto" else 0.62
+        adaptive_weight = 1.0 - preset_weight
+        noise_scale = 0.010 + 0.018 * self.augmentation_strength
+
+        def signed_next(
+            previous_value: float,
+            preset_value: float,
+            evidence: float,
+            *,
+            memory: float,
+            low: float,
+            high: float,
+        ) -> float:
+            target = preset_weight * preset_value + adaptive_weight * evidence
+            noise = self._rng.gauss(0.0, noise_scale)
+            return self._clamp(memory * previous_value + (1.0 - memory) * target + noise, low, high)
+
+        def pressure_next(
+            previous_value: float,
+            preset_value: float,
+            evidence: float,
+            *,
+            memory: float,
+            high: float,
+        ) -> float:
+            mixed = preset_weight * preset_value + adaptive_weight * evidence
+            target = max(0.72 * preset_value, mixed)
+            noise = self._rng.gauss(0.0, noise_scale)
+            return self._clamp(memory * previous_value + (1.0 - memory) * target + noise, 0.0, high)
+
+        signed_return = self._clamp(inputs.signed_return / 5.0, -1.0, 1.0)
+        trend_evidence = self._clamp(
+            0.58 * inputs.flow_imbalance + 0.42 * signed_return,
+            -1.0,
+            1.0,
+        )
+        volatility_evidence = self._clamp(
+            0.62 * inputs.return_shock
+            + 0.24 * inputs.execution_pressure
+            + 0.24 * inputs.volatility_shock
+            + 0.12 * abs(inputs.flow_imbalance),
+            0.0,
+            1.8,
+        )
+        liquidity_evidence = self._clamp(
+            0.48 * inputs.depth_shortage
+            + 0.34 * inputs.spread_gap
+            + 0.18 * self._clamp(inputs.cancel_pressure, 0.0, 2.0) / 2.0,
+            0.0,
+            1.8,
+        )
+        stress_evidence = self._clamp(
+            0.34 * inputs.return_shock
+            + 0.24 * inputs.execution_pressure
+            + 0.24 * inputs.imbalance_shock
+            + 0.18 * self._clamp(inputs.cancel_pressure, 0.0, 2.0) / 2.0,
+            0.0,
+            1.8,
+        )
+        participation_evidence = self._clamp(
+            0.44 * inputs.execution_pressure
+            + 0.26 * inputs.return_shock
+            + 0.20 * abs(inputs.flow_imbalance)
+            - 0.18 * inputs.depth_shortage,
+            -0.8,
+            1.2,
+        )
+        squeeze_evidence = self._clamp(
+            0.82 * inputs.squeeze_setup
+            + 0.18 * max(0.0, signed_return),
+            0.0,
+            1.5,
+        )
+
+        return _MarketConditionState(
+            trend_bias=signed_next(
+                previous.trend_bias,
+                preset.trend_bias,
+                trend_evidence,
+                memory=0.86,
+                low=-1.0,
+                high=1.0,
+            ),
+            volatility_pressure=pressure_next(
+                previous.volatility_pressure,
+                preset.volatility_pressure,
+                volatility_evidence,
+                memory=0.82,
+                high=1.8,
+            ),
+            liquidity_tightness=pressure_next(
+                previous.liquidity_tightness,
+                preset.liquidity_tightness,
+                liquidity_evidence,
+                memory=0.84,
+                high=1.8,
+            ),
+            stress_pressure=pressure_next(
+                previous.stress_pressure,
+                preset.stress_pressure,
+                stress_evidence,
+                memory=0.80,
+                high=1.8,
+            ),
+            participation_bias=signed_next(
+                previous.participation_bias,
+                preset.participation_bias,
+                participation_evidence,
+                memory=0.82,
+                low=-0.8,
+                high=1.2,
+            ),
+            squeeze_pressure=pressure_next(
+                previous.squeeze_pressure,
+                preset.squeeze_pressure,
+                squeeze_evidence,
+                memory=0.78,
+                high=1.5,
+            ),
+        )
 
     def __init__(
         self,
@@ -448,9 +594,7 @@ class Market:
         popularity: float = 1.0,
         seed: int | None = None,
         grid_radius: int = 20,
-        mdf_model: MDFModel | None = None,
         augmentation_strength: float = 0.0,
-        mdf_temperature: float = 1.0,
         regime: str = "normal",
     ) -> None:
         if not isfinite(initial_price) or initial_price <= 0:
@@ -463,44 +607,36 @@ class Market:
             raise ValueError("popularity must be a non-negative finite number")
         if not isfinite(augmentation_strength) or augmentation_strength < 0:
             raise ValueError("augmentation_strength must be a non-negative finite number")
-        if not isfinite(mdf_temperature) or mdf_temperature <= 0:
-            raise ValueError("mdf_temperature must be a positive finite number")
         if regime not in self._regime_names() | {"auto"}:
             raise ValueError("regime must be one of the supported regimes or 'auto'")
 
         self.gap = float(gap)
+        self._gap_is_integer = self.gap.is_integer()
         self.popularity = float(popularity)
         self._min_price = self.gap
         self.grid_radius = int(grid_radius)
-        self.mdf_model = mdf_model or DynamicMDFModel()
         self.augmentation_strength = float(augmentation_strength)
-        self.mdf_temperature = float(mdf_temperature)
-        self._mdf_persistence = 0.88
-        self._mdf_diffusion = 0.04
-        self._mdf_floor_mix = 0.04
-        self._mdf_eps = 1e-12
+        self._entry_mdf_memory = 0.18
+        self._mdf_floor_mix = 0.012
+        self._entry_noise_mix = 0.023
+        self._entry_noise_sigma_ticks = self._clamp(0.14 * self.grid_radius, 1.25, 2.50)
         self.regime = regime
-        self._active_regime = "normal" if regime == "auto" else regime
+        self._market_condition = self._condition_preset(regime)
+        self._active_regime = self._condition_label(self._market_condition)
+        self._active_settings = self._condition_settings(self._market_condition)
         self._rng = Random(seed)
         self._seed = seed
         self.history: list[StepInfo] = []
-        self._orderbook = _OrderBook(bid_lots={}, ask_lots={})
-        self._long_cohorts: list[_PositionCohort] = []
-        self._short_cohorts: list[_PositionCohort] = []
-        self._long_cohorts_by_bucket: dict[int, _PositionCohort] = {}
-        self._short_cohorts_by_bucket: dict[int, _PositionCohort] = {}
-        self._cohorts_by_id: dict[int, _PositionCohort] = {}
-        self._next_cohort_id = 1
-        self._long_mass_total = 0.0
-        self._short_mass_total = 0.0
+        self._orderbook = _OrderBook()
         self._last_return_ticks = 0.0
         self._last_abs_return_ticks = 0.0
         self._last_imbalance = 0.0
         self._last_execution_volume = 0.0
         self._last_executed_by_price: PriceMap = {}
+        self._price_residual_ticks = 0.0
         self._microstructure = _MicrostructureState()
-        self._mdf_model_accepts_signals = self._scores_accepts_signals(self.mdf_model.scores)
         self._mdf_memory: dict[str, dict[int, float]] = {}
+        self._mdf_judgment_memory: dict[str, _MDFSideJudgment] = {}
 
         price = self._snap_price(float(initial_price))
         grid = self._price_grid(price)
@@ -511,17 +647,12 @@ class Market:
         uniform = 1.0 / len(grid)
         initial_mdf_by_price = {price_level: uniform for price_level in grid}
         initial_mdf = {tick: 1.0 / len(tick_grid) for tick in tick_grid}
-        zero_mass = {price_level: 0.0 for price_level in grid}
         mdf = MDFState(
             relative_ticks=tick_grid,
             buy_entry_mdf=initial_mdf,
             sell_entry_mdf=initial_mdf.copy(),
-            long_exit_mdf=initial_mdf.copy(),
-            short_exit_mdf=initial_mdf.copy(),
             buy_entry_mdf_by_price=initial_mdf_by_price,
             sell_entry_mdf_by_price=initial_mdf_by_price.copy(),
-            long_exit_mdf_by_price=initial_mdf_by_price.copy(),
-            short_exit_mdf_by_price=initial_mdf_by_price.copy(),
         )
         self.state = MarketState(
             price=price,
@@ -533,21 +664,17 @@ class Market:
             price_grid=grid,
             mdf=mdf,
             orderbook=OrderBookState(),
-            position_mass=PositionMassState(
-                long_exit_mass_by_price=zero_mass,
-                short_exit_mass_by_price=zero_mass.copy(),
-            ),
         )
 
     def _initial_latent(self) -> LatentState:
-        regime = self._regime_settings(self._active_regime)
+        settings = self._active_settings
         mood = self._clamp(
-            self._rng.gauss(regime["mood"], 0.18),
+            self._rng.gauss(settings["mood"], 0.18),
             -0.7,
             0.7,
         )
         trend = self._clamp(
-            self._rng.gauss(regime["trend"] + 0.20 * mood, 0.14),
+            self._rng.gauss(settings["trend"] + 0.20 * mood, 0.14),
             -0.7,
             0.7,
         )
@@ -555,7 +682,7 @@ class Market:
             0.12
             + 0.18 * self._rng.random()
             + abs(self._rng.gauss(0.0, 0.11))
-            + regime["volatility_bias"],
+            + settings["volatility_bias"],
             0.05,
             0.75,
         )
@@ -909,12 +1036,15 @@ class Market:
         ask_matrix = [[0.0 for _ in steps] for _ in levels]
         for column, step in enumerate(steps):
             orderbook = step.orderbook_after if snapshot == "after" else step.orderbook_before
-            bid_levels = sorted(orderbook.bid_volume_by_price.items(), reverse=True)[:depth]
-            ask_levels = sorted(orderbook.ask_volume_by_price.items())[:depth]
-            for row, (_, volume) in enumerate(bid_levels):
-                bid_matrix[row][column] = volume
-            for row, (_, volume) in enumerate(ask_levels):
-                ask_matrix[row][column] = volume
+            basis_tick = step.tick_after if snapshot == "after" else step.tick_before
+            for price, volume in orderbook.bid_volume_by_price.items():
+                level = basis_tick - self.price_to_tick(price)
+                if 1 <= level <= depth:
+                    bid_matrix[level - 1][column] += volume
+            for price, volume in orderbook.ask_volume_by_price.items():
+                level = self.price_to_tick(price) - basis_tick
+                if 1 <= level <= depth:
+                    ask_matrix[level - 1][column] += volume
         return x_values, levels, bid_matrix, ask_matrix
 
     def _heatmap_extent(self, x_values: list[int], levels: list[int]) -> list[float]:
@@ -1001,118 +1131,100 @@ class Market:
         state = self.state
         step_index = state.step_index + 1
         price_before = state.price
-        self._age_state()
-        self._clear_stale_exit_lots()
         self._clean_orderbook()
-        self._clean_cohorts()
 
         price_grid = self._price_grid(price_before)
         orderbook_before = self._snapshot_orderbook()
-        position_before = self._snapshot_position_mass()
         best_bid_before = self._best_bid()
         best_ask_before = self._best_ask()
         spread_before = self._spread(best_bid_before, best_ask_before)
         pre_imbalance = self._near_touch_imbalance(price_before)
 
-        self._active_regime = self._next_regime()
+        condition_inputs = self._market_condition_inputs(state.latent, pre_imbalance)
+        self._market_condition = self._next_market_condition(
+            self._market_condition,
+            condition_inputs,
+        )
+        self._active_settings = self._condition_settings(self._market_condition)
+        self._active_regime = self._condition_label(self._market_condition)
         latent = self._next_latent(state.latent)
         micro = self._next_microstructure_state(state.latent, latent, pre_imbalance)
         intensity = self._next_intensity(latent, micro)
+        pre_trade_cache = _StepComputationCache(price_before, micro=micro)
         mdf = self._next_mdf(
             price_before,
             price_grid,
             latent,
             step_index=step_index,
             update_memory=True,
+            cache=pre_trade_cache,
         )
+        pre_trade_cache.mdf = mdf
 
-        cancelled_volume = self._cancel_orders(price_before, latent, micro)
-        long_exit_flow = self._exit_flow(
-            "long",
-            price_before,
-            latent,
-            mdf.long_exit_mdf_by_price,
-        )
-        short_exit_flow = self._exit_flow(
-            "short",
-            price_before,
-            latent,
-            mdf.short_exit_mdf_by_price,
-        )
-        mdf = self._with_cohort_exit_mdfs(
-            price_before,
-            mdf,
-            long_exit_flow.intent_volume_by_price,
-            short_exit_flow.intent_volume_by_price,
-        )
-
-        self._add_liquidity_replenishment(price_before, latent, pre_imbalance, micro)
-        self._add_exit_orders(short_exit_flow.limit_orders, side="bid", kind="short_exit")
-        self._add_exit_orders(long_exit_flow.limit_orders, side="ask", kind="long_exit")
+        cancelled_volume = self._cancel_orders(price_before, latent, micro, mdf, pre_trade_cache)
         entry_flow = self._entry_flow(intensity, mdf)
 
         stats = _TradeStats(executed_by_price={})
         execution = self._execute_market_flows(
             entry_orders=entry_flow.orders,
-            short_exit_market_orders=short_exit_flow.market_orders,
-            long_exit_market_orders=long_exit_flow.market_orders,
-            mdf=mdf,
             stats=stats,
         )
         self._clean_orderbook()
-        self._clean_cohorts()
 
-        price_after = self._next_price_after_trading(price_before, stats, execution)
+        price_after = self._next_price_after_trading(price_before, stats, execution, latent)
         price_after = self._snap_price(price_after)
         self._last_return_ticks = (price_after - price_before) / self.gap
         self._last_abs_return_ticks = abs(self._last_return_ticks)
         self._last_execution_volume = stats.total_volume
         self._last_executed_by_price = self._drop_zeroes(stats.executed_by_price)
+        total_market_buy = execution.market_buy_volume
+        total_market_sell = execution.market_sell_volume
+        residual_market_buy = execution.residual_market_buy
+        residual_market_sell = execution.residual_market_sell
+        order_flow_imbalance = self._step_order_flow_imbalance(
+            price_after,
+            execution,
+            cancelled_volume,
+        )
+        self._last_imbalance = order_flow_imbalance
         self._trim_orderbook_through_last_price(price_after)
         self._prune_orderbook_window(price_after)
-        self._update_wall_memory_from_book(price_after, micro)
+        post_trade_mdf = self._reproject_mdf(price_after, mdf)
+        post_trade_cache = _StepComputationCache(price_after, mdf=post_trade_mdf, micro=micro)
+        self._add_post_event_quote_arrivals(
+            price_after,
+            latent,
+            micro,
+            stats,
+            order_flow_imbalance,
+            post_trade_mdf,
+            post_trade_cache,
+        )
+        self._refresh_post_event_deep_quotes(
+            cancelled_volume,
+            price_after,
+            micro,
+            post_trade_mdf,
+            post_trade_cache,
+        )
+        cancelled_volume = self._drop_zeroes(cancelled_volume)
+        micro.last_cancelled_volume = sum(cancelled_volume.values())
+        self._trim_orderbook_through_last_price(price_after)
+        self._clean_orderbook()
 
         state_grid = self._price_grid(price_after)
-        state_mdf = self._reproject_mdf(price_after, mdf)
-        position_after = self._position_mass_from_cohorts(
-            state_mdf.long_exit_mdf_by_price,
-            state_mdf.short_exit_mdf_by_price,
-        )
+        state_mdf = post_trade_mdf
         orderbook_after = self._snapshot_orderbook()
         best_bid_after = self._best_bid()
         best_ask_after = self._best_ask()
         spread_after = self._spread(best_bid_after, best_ask_after)
-        total_market_buy = execution.market_buy_volume
-        total_market_sell = execution.market_sell_volume
-        # Incoming order leftovers now rest in the book at their sampled price.
-        # These compatibility fields remain zero in the order-book-first engine.
-        residual_market_buy = 0.0
-        residual_market_sell = 0.0
-        market_flow_delta = total_market_buy - total_market_sell
-        market_flow_total = total_market_buy + total_market_sell
-        order_flow_imbalance = (
-            self._clamp(market_flow_delta / market_flow_total, -1.0, 1.0)
-            if market_flow_total > 1e-12
-            else self._near_touch_imbalance(price_after)
-        )
-        self._last_imbalance = order_flow_imbalance
 
         entry_volume = self._merge_maps(
             entry_flow.buy_intent_by_price,
             entry_flow.sell_intent_by_price,
         )
-        exit_volume = self._merge_maps(
-            long_exit_flow.intent_volume_by_price,
-            short_exit_flow.intent_volume_by_price,
-        )
-        buy_volume = self._merge_maps(
-            entry_flow.buy_intent_by_price,
-            short_exit_flow.intent_volume_by_price,
-        )
-        sell_volume = self._merge_maps(
-            entry_flow.sell_intent_by_price,
-            long_exit_flow.intent_volume_by_price,
-        )
+        buy_volume = entry_flow.buy_intent_by_price
+        sell_volume = entry_flow.sell_intent_by_price
         vwap = stats.notional / stats.total_volume if stats.total_volume > 0 else None
         step_info = StepInfo(
             step_index=step_index,
@@ -1133,16 +1245,11 @@ class Market:
             relative_ticks=mdf.relative_ticks,
             buy_entry_mdf=mdf.buy_entry_mdf,
             sell_entry_mdf=mdf.sell_entry_mdf,
-            long_exit_mdf=mdf.long_exit_mdf,
-            short_exit_mdf=mdf.short_exit_mdf,
             buy_entry_mdf_by_price=mdf.buy_entry_mdf_by_price,
             sell_entry_mdf_by_price=mdf.sell_entry_mdf_by_price,
-            long_exit_mdf_by_price=mdf.long_exit_mdf_by_price,
-            short_exit_mdf_by_price=mdf.short_exit_mdf_by_price,
             buy_volume_by_price=buy_volume,
             sell_volume_by_price=sell_volume,
             entry_volume_by_price=entry_volume,
-            exit_volume_by_price=exit_volume,
             cancelled_volume_by_price=cancelled_volume,
             executed_volume_by_price=self._drop_zeroes(stats.executed_by_price),
             total_executed_volume=stats.total_volume,
@@ -1162,8 +1269,6 @@ class Market:
             order_flow_imbalance=order_flow_imbalance,
             orderbook_before=orderbook_before,
             orderbook_after=orderbook_after,
-            position_mass_before=position_before,
-            position_mass_after=position_after,
         )
 
         self.state = MarketState(
@@ -1176,23 +1281,88 @@ class Market:
             price_grid=state_grid,
             mdf=state_mdf,
             orderbook=orderbook_after,
-            position_mass=position_after,
         )
         return step_info
 
     def _age_state(self) -> None:
-        self._orderbook.age()
-        for cohort in (*self._long_cohorts, *self._short_cohorts):
-            cohort.age += 1
+        return None
+
+    def _step_order_flow_imbalance(
+        self,
+        current_price: float,
+        execution: _ExecutionResult,
+        cancelled_volume: PriceMap,
+    ) -> float:
+        trade_delta = execution.market_buy_volume - execution.market_sell_volume
+        trade_total = execution.market_buy_volume + execution.market_sell_volume
+        residual_delta = execution.residual_market_buy - execution.residual_market_sell
+        residual_total = execution.residual_market_buy + execution.residual_market_sell
+        cancel_delta = 0.0
+        cancel_total = 0.0
+        for price, volume in cancelled_volume.items():
+            if volume <= 1e-12:
+                continue
+            cancel_total += volume
+            if price < current_price:
+                cancel_delta -= volume
+            elif price > current_price:
+                cancel_delta += volume
+        near_depth = self._nearby_book_depth("bid", current_price) + self._nearby_book_depth(
+            "ask",
+            current_price,
+        )
+        near_imbalance = self._near_touch_imbalance(current_price)
+        context_numerator = (
+            0.24 * residual_delta
+            + 0.12 * cancel_delta
+            + 0.10 * near_imbalance * near_depth
+        )
+        context_denominator = (
+            0.50 * residual_total
+            + 0.45 * cancel_total
+            + 0.32 * near_depth
+            + 2.0 * self._mean_child_order_size()
+        )
+        if context_denominator <= 1e-12 and trade_total <= 1e-12:
+            return 0.0
+        context_imbalance = (
+            context_numerator / context_denominator
+            if context_denominator > 1e-12
+            else 0.0
+        )
+        if trade_total <= 1e-12:
+            return self._clamp(context_imbalance, -1.0, 1.0)
+        trade_imbalance = self._clamp(trade_delta / trade_total, -1.0, 1.0)
+        trade_confidence = self._clamp(
+            trade_total
+            / (
+                trade_total
+                + 0.50 * residual_total
+                + 0.35 * cancel_total
+                + 0.22 * near_depth
+                + self._mean_child_order_size()
+            ),
+            0.62,
+            0.92,
+        )
+        return self._clamp(
+            trade_confidence * trade_imbalance
+            + (1.0 - trade_confidence) * context_imbalance,
+            -1.0,
+            1.0,
+        )
 
     def _next_price_after_trading(
         self,
         price_before: float,
         stats: _TradeStats,
         execution: _ExecutionResult,
+        latent: LatentState | None = None,
     ) -> float:
         if stats.total_volume <= 0 or stats.last_price is None:
             return price_before
+        latent = latent or self.state.latent
+        regime = self._active_settings
         vwap = stats.notional / stats.total_volume
         execution_price = 0.68 * stats.last_price + 0.32 * vwap
         execution_move_ticks = (execution_price - price_before) / self.gap
@@ -1211,15 +1381,37 @@ class Market:
         volume_confidence = self._clamp(
             stats.total_volume / max(0.7, self.popularity),
             0.35,
-            1.40,
+            1.65,
+        )
+        volatility_response = self._clamp(
+            0.86 + 0.18 * regime["volatility"] + 0.14 * latent.volatility,
+            0.90,
+            1.50,
         )
         # Last price shows where trades occurred; flow only nudges revealed pressure.
-        price_discovery = self._clamp(abs(execution_move_ticks) / 1.5, 0.25, 1.0)
-        flow_move_ticks = flow_imbalance * (0.18 + 0.12 * volume_confidence) * price_discovery
-        proposed_ticks = execution_move_ticks * (0.72 + 0.18 * volume_confidence)
+        price_discovery = self._clamp(abs(execution_move_ticks) / 1.35, 0.25, 1.0)
+        flow_move_ticks = (
+            flow_imbalance
+            * (0.06 + 0.045 * volume_confidence)
+            * price_discovery
+            * volatility_response
+        )
+        proposed_ticks = (
+            execution_move_ticks * (0.52 + 0.12 * volume_confidence) * volatility_response
+        )
         proposed_ticks += flow_move_ticks
-        proposed_ticks = self._clamp(proposed_ticks, -3.0, 3.0)
-        return max(self._min_price, price_before + proposed_ticks * self.gap)
+        max_move_ticks = self._clamp(1.0 + 0.45 * latent.volatility, 1.0, 2.0)
+        proposed_ticks = self._clamp(proposed_ticks, -max_move_ticks, max_move_ticks)
+        self._price_residual_ticks = self._clamp(
+            self._price_residual_ticks + proposed_ticks,
+            -max_move_ticks,
+            max_move_ticks,
+        )
+        emitted_ticks = int(round(self._price_residual_ticks))
+        if emitted_ticks == 0:
+            return price_before
+        self._price_residual_ticks -= emitted_ticks
+        return max(self._min_price, price_before + emitted_ticks * self.gap)
 
     def _price_grid(self, center_price: float) -> list[float]:
         center = self._snap_price(center_price)
@@ -1229,16 +1421,22 @@ class Market:
         )
 
     def price_to_tick(self, price: float) -> int:
-        return max(1, int(round(self._snap_price(price) / self.gap)))
+        return max(1, int(round(price / self.gap)))
 
     def tick_to_price(self, tick: int) -> float:
-        return self._snap_price(max(1, int(tick)) * self.gap)
+        snapped = max(1, int(tick)) * self.gap
+        if self._gap_is_integer:
+            return float(int(snapped))
+        return self._clean_number(snapped)
 
     def relative_tick_grid(self) -> list[int]:
         return list(range(-self.grid_radius, self.grid_radius + 1))
 
     def _snap_price(self, price: float) -> float:
-        snapped = max(self._min_price, round(price / self.gap) * self.gap)
+        tick = max(1, int(round(price / self.gap)))
+        snapped = tick * self.gap
+        if self._gap_is_integer:
+            return float(int(snapped))
         return self._clean_number(snapped)
 
     def _clean_number(self, value: float) -> float:
@@ -1248,7 +1446,7 @@ class Market:
         return rounded
 
     def _next_latent(self, latent: LatentState) -> LatentState:
-        regime = self._regime_settings(self._active_regime)
+        regime = self._active_settings
         micro = self._microstructure
         mood_noise = self._rng.gauss(0.0, 0.11)
         trend_noise = self._rng.gauss(0.0, 0.08)
@@ -1309,8 +1507,6 @@ class Market:
         )
 
     def _squeeze_impulse(self, micro: _MicrostructureState) -> float:
-        if self._active_regime != "squeeze":
-            return 0.0
         return self._clamp(micro.squeeze_pressure, 0.0, 1.5)
 
     def _next_intensity(
@@ -1318,23 +1514,36 @@ class Market:
         latent: LatentState,
         micro: _MicrostructureState | None = None,
     ) -> IntensityState:
-        regime = self._regime_settings(self._active_regime)
+        regime = self._active_settings
         micro = micro or self._microstructure
         augmentation = 1.0 + self.augmentation_strength * self._rng.uniform(-0.18, 0.28)
         flow_reversal = self._flow_reversal_pressure(micro)
         activity = micro.activity
-        activity_multiplier = 1.0 + 0.38 * self._clamp(activity, 0.0, 2.2)
-        event_multiplier = 1.0 + 0.32 * self._clamp(micro.activity_event, 0.0, 1.8)
-        dry_up = self._clamp(1.0 - 0.10 * micro.cancel_pressure, 0.68, 1.0)
-        total = (
+        activity_multiplier = 1.0 + 0.28 * self._clamp(activity, 0.0, 2.2)
+        event_multiplier = 1.0 + 0.18 * self._clamp(micro.activity_event, 0.0, 1.8)
+        dry_up = self._clamp(1.0 - 0.08 * micro.cancel_pressure, 0.74, 1.0)
+        raw_total = (
             self.popularity
-            * (1.0 + 2.2 * latent.volatility)
+            * (1.0 + 1.35 * latent.volatility)
             * regime["intensity"]
             * augmentation
             * activity_multiplier
             * event_multiplier
             * dry_up
         )
+        previous_total = self.state.intensity.total
+        total = (
+            0.55 * raw_total + 0.45 * previous_total
+            if previous_total > 1e-12
+            else raw_total
+        )
+        if previous_total > 1e-12:
+            previous_pressure = self._clamp(
+                previous_total / max(self.popularity * regime["intensity"], 1e-12) - 1.0,
+                0.0,
+                2.0,
+            )
+            total *= 1.0 + 0.08 * previous_pressure
         buy_ratio = self._clamp(
             0.5
             + 0.24 * latent.mood
@@ -1370,7 +1579,7 @@ class Market:
         imbalance: float,
     ) -> _MicrostructureState:
         """Update internal book pressure that links realized flow to future liquidity."""
-        regime = self._regime_settings(self._active_regime)
+        regime = self._active_settings
         previous = self._microstructure
         inputs = self._microstructure_inputs(previous_latent, latent, imbalance)
         realized_activity = (
@@ -1400,7 +1609,6 @@ class Market:
             2.0,
         )
 
-        wall_pressure = self._decay_wall_pressure(previous.wall_pressure_by_absolute_tick, regime)
         recent_signed_return = self._clamp(
             0.86 * previous.recent_signed_return + 0.14 * inputs.signed_return,
             -12.0,
@@ -1413,8 +1621,27 @@ class Market:
         )
         activity_event = self._next_activity_event(previous, inputs, regime)
         squeeze_pressure = self._next_squeeze_pressure(previous, inputs, regime)
+        liquidity_stress = self._next_liquidity_stress(
+            previous,
+            inputs,
+            cancel_pressure,
+            regime,
+        )
+        spread_pressure = self._next_spread_pressure(
+            previous,
+            inputs,
+            cancel_pressure,
+            liquidity_stress,
+            regime,
+        )
+        stress_side = self._next_stress_side(previous, inputs)
         resiliency_target = regime["resiliency"] * self._clamp(
-            1.0 - 0.18 * cancel_pressure + 0.08 * previous.activity - 0.05 * activity_event,
+            1.0
+            - 0.18 * cancel_pressure
+            - 0.16 * liquidity_stress
+            - 0.08 * spread_pressure
+            + 0.08 * previous.activity
+            - 0.05 * activity_event,
             0.30,
             1.30,
         )
@@ -1427,7 +1654,9 @@ class Market:
             recent_flow_imbalance=recent_flow_imbalance,
             squeeze_pressure=squeeze_pressure,
             activity_event=activity_event,
-            wall_pressure_by_absolute_tick=wall_pressure,
+            liquidity_stress=liquidity_stress,
+            stress_side=stress_side,
+            spread_pressure=spread_pressure,
             last_cancelled_volume=previous.last_cancelled_volume,
         )
         self._microstructure = micro
@@ -1461,13 +1690,13 @@ class Market:
         regime: dict[str, float],
     ) -> float:
         burst_seed = (
-            max(0.0, inputs.return_shock - 0.42)
-            + 0.36 * inputs.volatility_shock
-            + 0.22 * max(0.0, abs(inputs.flow_imbalance) - 0.35)
-            + 0.18 * max(0.0, inputs.execution_pressure - 0.90)
+            max(0.0, inputs.return_shock - 0.32)
+            + 0.42 * inputs.volatility_shock
+            + 0.30 * max(0.0, abs(inputs.flow_imbalance) - 0.25)
+            + 0.24 * max(0.0, inputs.execution_pressure - 0.70)
         )
         return self._clamp(
-            0.72 * previous.activity_event + regime["event_gain"] * burst_seed,
+            0.72 * previous.activity_event + 1.18 * regime["event_gain"] * burst_seed,
             0.0,
             1.8,
         )
@@ -1487,30 +1716,76 @@ class Market:
             1.5,
         )
 
+    def _next_liquidity_stress(
+        self,
+        previous: _MicrostructureState,
+        inputs: _MicrostructureInputs,
+        cancel_pressure: float,
+        regime: dict[str, float],
+    ) -> float:
+        raw_stress = (
+            0.34 * inputs.return_shock
+            + 0.26 * inputs.execution_pressure
+            + 0.22 * inputs.imbalance_shock
+            + 0.18 * cancel_pressure
+        ) * regime["stress"]
+        return self._clamp(0.70 * previous.liquidity_stress + 0.30 * raw_stress, 0.0, 2.0)
+
+    def _next_spread_pressure(
+        self,
+        previous: _MicrostructureState,
+        inputs: _MicrostructureInputs,
+        cancel_pressure: float,
+        liquidity_stress: float,
+        regime: dict[str, float],
+    ) -> float:
+        spread_ticks = self._current_spread_ticks()
+        spread_gap = self._clamp((spread_ticks - 2.0) / 5.0, 0.0, 1.0)
+        raw_pressure = (
+            0.26 * inputs.return_shock
+            + 0.20 * inputs.execution_pressure
+            + 0.18 * abs(inputs.flow_imbalance)
+            + 0.22 * cancel_pressure
+            + 0.20 * liquidity_stress
+            + 0.18 * spread_gap
+        ) * regime["stress"]
+        return self._clamp(
+            0.78 * previous.spread_pressure + 0.22 * raw_pressure,
+            0.0,
+            1.8,
+        )
+
+    def _next_stress_side(
+        self,
+        previous: _MicrostructureState,
+        inputs: _MicrostructureInputs,
+    ) -> float:
+        directional_pressure = self._clamp(
+            0.62 * inputs.flow_imbalance
+            + 0.38 * self._clamp(inputs.signed_return / 5.0, -1.0, 1.0),
+            -1.0,
+            1.0,
+        )
+        return self._clamp(0.74 * previous.stress_side + 0.26 * directional_pressure, -1.0, 1.0)
+
     def _squeeze_setup_pressure(self) -> float:
-        if self._active_regime != "squeeze" or self._short_mass_total <= 1e-12:
+        price = self.state.price
+        bid_depth = self._nearby_book_depth("bid", price)
+        ask_depth = self._nearby_book_depth("ask", price)
+        total_depth = bid_depth + ask_depth
+        if total_depth <= 1e-12:
             return 0.0
-        total_mass = self._long_mass_total + self._short_mass_total
-        short_share = self._short_mass_total / max(total_mass, 1e-12)
-        relative_crowding = self._clamp((short_share - 0.45) * 2.0, 0.0, 1.0)
-        absolute_crowding = self._clamp(
-            self._short_mass_total / max(8.0 * self.popularity, 1.0),
+        bid_crowding = bid_depth / total_depth
+        ask_thinness = 1.0 / (1.0 + ask_depth / max(self.popularity, 1e-12))
+        upward_trigger = self._clamp(
+            0.55 * max(0.0, self._last_return_ticks) / 3.0
+            + 0.45 * max(0.0, self._last_imbalance)
+            - 0.10,
             0.0,
             1.0,
         )
-        short_pressure = max(relative_crowding, 0.45 * absolute_crowding)
-        adverse_move = self._clamp(max(0.0, self._last_return_ticks) / 3.0, 0.0, 1.0)
-        buy_pressure = self._clamp(max(0.0, self._last_imbalance), 0.0, 1.0)
-        trigger = self._clamp(0.65 * adverse_move + 0.35 * buy_pressure - 0.15, 0.0, 1.0)
-        return self._clamp(short_pressure * trigger, 0.0, 1.0)
-
-    def _decay_wall_pressure(self, values: TickMap, regime: dict[str, float]) -> TickMap:
-        persistence = regime["wall_persistence"]
-        return {
-            tick: pressure * persistence
-            for tick, pressure in values.items()
-            if pressure * persistence > 1e-4
-        }
+        setup = 0.58 * bid_crowding + 0.42 * ask_thinness
+        return self._clamp(setup * upward_trigger, 0.0, 1.0)
 
     def _next_mdf(
         self,
@@ -1520,6 +1795,7 @@ class Market:
         *,
         step_index: int,
         update_memory: bool,
+        cache: _StepComputationCache | None = None,
     ) -> MDFState:
         del price_grid
         relative_ticks = self.relative_tick_grid()
@@ -1529,52 +1805,84 @@ class Market:
             tick_size=self.gap,
             mood=latent.mood,
             trend=latent.trend,
-            volatility=latent.volatility * self._regime_settings(self._active_regime)["spread"],
+            volatility=latent.volatility * self._active_settings["spread"],
             regime=self._active_regime,
             augmentation_strength=self.augmentation_strength,
             step_index=step_index,
             rng=self._rng,
         )
-        signals = self._mdf_signals(price)
-        temperature = max(0.05, self.mdf_temperature * (0.65 + context.volatility))
-        buy_entry_ticks = self._evolve_mdf(
+        signals = self._cached_mdf_signals(price, cache)
+        mdf_shock = self._clamp(
+            0.34 * signals.liquidity_stress
+            + 0.22 * signals.activity_event
+            + 0.18 * min(abs(signals.last_return_ticks) / 3.0, 1.0)
+            + 0.14 * signals.cancel_pressure / 2.0
+            + 0.12 * latent.volatility / 1.55,
+            0.0,
+            1.0,
+        )
+        entry_memory = self._clamp(self._entry_mdf_memory * (1.0 - 0.35 * mdf_shock), 0.08, 0.20)
+        floor_mix = self._clamp(self._mdf_floor_mix + 0.006 * mdf_shock, 0.010, 0.024)
+        judgments = self._sample_mdf_judgments(context, signals, update_memory=update_memory)
+
+        buy_entry_ticks = self._evolve_raw_mdf(
             "buy_entry",
-            self._model_scores("buy", "entry", relative_ticks, context, signals),
-            temperature=temperature,
+            self._buy_entry_mdf_mass(relative_ticks, context, signals, judgments.buy),
+            current_tick=context.current_tick,
+            memory_mix=entry_memory,
+            floor_mix=floor_mix,
             update_memory=update_memory,
         )
-        sell_entry_ticks = self._evolve_mdf(
+        sell_entry_ticks = self._evolve_raw_mdf(
             "sell_entry",
-            self._model_scores("sell", "entry", relative_ticks, context, signals),
-            temperature=temperature,
+            self._sell_entry_mdf_mass(relative_ticks, context, signals, judgments.sell),
+            current_tick=context.current_tick,
+            memory_mix=entry_memory,
+            floor_mix=floor_mix,
             update_memory=update_memory,
         )
-        long_exit_ticks = self._evolve_mdf(
-            "long_exit",
-            self._model_scores("long", "exit", relative_ticks, context, signals),
-            temperature=temperature,
-            update_memory=update_memory,
+        buy_entry_ticks, sell_entry_ticks = self._resolve_entry_mdf_overlap(
+            relative_ticks,
+            context.current_tick,
+            buy_entry_ticks,
+            sell_entry_ticks,
+            buy_aggression=self._entry_overlap_aggression(
+                "buy",
+                context,
+                signals,
+                judgments.buy,
+                mdf_shock,
+            ),
+            sell_aggression=self._entry_overlap_aggression(
+                "sell",
+                context,
+                signals,
+                judgments.sell,
+                mdf_shock,
+            ),
         )
-        short_exit_ticks = self._evolve_mdf(
-            "short_exit",
-            self._model_scores("short", "exit", relative_ticks, context, signals),
-            temperature=temperature,
-            update_memory=update_memory,
+        entry_noise_ticks = self._centered_entry_noise_mdf(
+            relative_ticks,
+            context.current_tick,
+        )
+        buy_entry_ticks = self._mix_entry_noise_mdf(
+            buy_entry_ticks,
+            entry_noise_ticks,
+            mix=self._entry_noise_mix,
+        )
+        sell_entry_ticks = self._mix_entry_noise_mdf(
+            sell_entry_ticks,
+            entry_noise_ticks,
+            mix=self._entry_noise_mix,
         )
         buy_entry = self._project_tick_mdf(context.current_tick, buy_entry_ticks)
         sell_entry = self._project_tick_mdf(context.current_tick, sell_entry_ticks)
-        long_exit = self._project_tick_mdf(context.current_tick, long_exit_ticks)
-        short_exit = self._project_tick_mdf(context.current_tick, short_exit_ticks)
         return MDFState(
             buy_entry_mdf_by_price=buy_entry,
             sell_entry_mdf_by_price=sell_entry,
-            long_exit_mdf_by_price=long_exit,
-            short_exit_mdf_by_price=short_exit,
             relative_ticks=relative_ticks,
             buy_entry_mdf=buy_entry_ticks,
             sell_entry_mdf=sell_entry_ticks,
-            long_exit_mdf=long_exit_ticks,
-            short_exit_mdf=short_exit_ticks,
         )
 
     def _reproject_mdf(
@@ -1583,16 +1891,14 @@ class Market:
         mdf: MDFState,
     ) -> MDFState:
         current_tick = self.price_to_tick(price)
+        buy_entry_mdf = self._constrain_tick_mdf(current_tick, mdf.buy_entry_mdf)
+        sell_entry_mdf = self._constrain_tick_mdf(current_tick, mdf.sell_entry_mdf)
         return MDFState(
-            buy_entry_mdf_by_price=self._project_tick_mdf(current_tick, mdf.buy_entry_mdf),
-            sell_entry_mdf_by_price=self._project_tick_mdf(current_tick, mdf.sell_entry_mdf),
-            long_exit_mdf_by_price=self._project_tick_mdf(current_tick, mdf.long_exit_mdf),
-            short_exit_mdf_by_price=self._project_tick_mdf(current_tick, mdf.short_exit_mdf),
+            buy_entry_mdf_by_price=self._project_tick_mdf(current_tick, buy_entry_mdf),
+            sell_entry_mdf_by_price=self._project_tick_mdf(current_tick, sell_entry_mdf),
             relative_ticks=list(mdf.relative_ticks),
-            buy_entry_mdf=dict(mdf.buy_entry_mdf),
-            sell_entry_mdf=dict(mdf.sell_entry_mdf),
-            long_exit_mdf=dict(mdf.long_exit_mdf),
-            short_exit_mdf=dict(mdf.short_exit_mdf),
+            buy_entry_mdf=buy_entry_mdf,
+            sell_entry_mdf=sell_entry_mdf,
         )
 
     def _entry_flow(
@@ -1600,39 +1906,19 @@ class Market:
         intensity: IntensityState,
         mdf: MDFState,
     ) -> _EntryFlow:
-        orders: list[_IncomingOrder] = []
-        buy_intent: PriceMap = {}
-        sell_intent: PriceMap = {}
-
-        for price, probability in mdf.buy_entry_mdf_by_price.items():
-            volume = intensity.buy * probability
-            if volume <= 1e-12:
-                continue
-            price = self._snap_price(price)
-            buy_intent[price] = buy_intent.get(price, 0.0) + volume
-            orders.append(
-                _IncomingOrder(
-                    side="buy",
-                    kind="buy_entry",
-                    price=price,
-                    volume=volume,
-                )
-            )
-
-        for price, probability in mdf.sell_entry_mdf_by_price.items():
-            volume = intensity.sell * probability
-            if volume <= 1e-12:
-                continue
-            price = self._snap_price(price)
-            sell_intent[price] = sell_intent.get(price, 0.0) + volume
-            orders.append(
-                _IncomingOrder(
-                    side="sell",
-                    kind="sell_entry",
-                    price=price,
-                    volume=volume,
-                )
-            )
+        buy_orders, buy_intent = self._sample_entry_side(
+            "buy",
+            "buy_entry",
+            intensity.buy,
+            mdf.buy_entry_mdf_by_price,
+        )
+        sell_orders, sell_intent = self._sample_entry_side(
+            "sell",
+            "sell_entry",
+            intensity.sell,
+            mdf.sell_entry_mdf_by_price,
+        )
+        orders = buy_orders + sell_orders
 
         return _EntryFlow(
             orders=orders,
@@ -1640,38 +1926,1049 @@ class Market:
             sell_intent_by_price=self._drop_zeroes(sell_intent),
         )
 
-    def _model_scores(
+    def _sample_entry_side(
         self,
         side: str,
-        intent: str,
+        kind: str,
+        target_volume: float,
+        mdf_by_price: PriceMap,
+    ) -> tuple[list[_IncomingOrder], PriceMap]:
+        if target_volume <= 1e-12:
+            return [], {}
+        probabilities = self._normalized_price_probabilities(mdf_by_price)
+        if not probabilities:
+            return [], {}
+
+        event_probability = self._entry_event_probability(target_volume)
+        if self._unit_random() >= event_probability:
+            return [], {}
+
+        effective_target = target_volume / max(event_probability, 1e-12)
+        max_count = max(1, int(10 + 6 * effective_target + 4 * max(self.popularity, 0.0)))
+        order_count = self._sample_order_count(
+            effective_target,
+            max_count=max_count,
+        )
+        if order_count <= 0:
+            return [], {}
+
+        orders: list[_IncomingOrder] = []
+        intent: PriceMap = {}
+        for _ in range(order_count):
+            price = self._sample_price(probabilities)
+            volume = self._sample_order_size()
+            if volume <= 1e-12:
+                continue
+            orders.append(_IncomingOrder(side=side, kind=kind, price=price, volume=volume))
+            intent[price] = intent.get(price, 0.0) + volume
+        return orders, intent
+
+    def _entry_event_probability(self, target_volume: float) -> float:
+        if target_volume <= 1e-12:
+            return 0.0
+        popularity_term = self.popularity / (1.0 + self.popularity)
+        cluster = self._event_cluster_signal(self._microstructure)
+        probability = (
+            0.075
+            + 0.35 * (1.0 - exp(-target_volume / 1.2))
+            + 0.43 * (1.0 - exp(-target_volume / 9.0))
+            + 0.08 * popularity_term
+        )
+        probability *= 0.80 + 0.52 * cluster
+        high_volume_floor = 0.96 * (1.0 - exp(-target_volume / 7.0))
+        probability = max(probability, high_volume_floor)
+        return self._clamp(probability, 0.07, 0.96)
+
+    def _event_cluster_signal(self, micro: _MicrostructureState) -> float:
+        signal = (
+            0.48 * self._clamp(micro.activity_event, 0.0, 1.8) / 1.8
+            + 0.24 * self._clamp(micro.activity, 0.0, 2.0) / 2.0
+            + 0.18 * self._clamp(micro.cancel_pressure, 0.0, 2.0) / 2.0
+            + 0.10 * self._clamp(micro.spread_pressure, 0.0, 1.8) / 1.8
+        )
+        return self._clamp(signal, 0.0, 1.0)
+
+    def _normalized_price_probabilities(self, values: PriceMap) -> PriceMap:
+        probabilities: PriceMap = {}
+        total = 0.0
+        for raw_price, raw_probability in values.items():
+            if raw_probability <= 0 or not isfinite(raw_probability):
+                continue
+            tick = max(1, int(round(raw_price / self.gap)))
+            if self._gap_is_integer:
+                price = float(int(tick * self.gap))
+            else:
+                price = self._clean_number(tick * self.gap)
+            if price < self._min_price:
+                continue
+            probabilities[price] = probabilities.get(price, 0.0) + raw_probability
+            total += raw_probability
+        if not probabilities or total <= 1e-12:
+            return {}
+        ordered = sorted(probabilities.items())
+        if abs(total - 1.0) <= 1e-12:
+            return dict(ordered)
+        return {price: probability / total for price, probability in ordered}
+
+    def _entry_probabilities_for_book_side(
+        self,
+        side: str,
+        mdf: MDFState,
+        cache: _StepComputationCache | None = None,
+    ) -> PriceMap:
+        if cache is not None and cache.mdf is mdf and side in cache.entry_probabilities_by_side:
+            return cache.entry_probabilities_by_side[side]
+        entry_mdf = mdf.buy_entry_mdf_by_price if side == "bid" else mdf.sell_entry_mdf_by_price
+        probabilities = self._normalized_price_probabilities(entry_mdf)
+        if cache is not None and cache.mdf is mdf:
+            cache.entry_probabilities_by_side[side] = probabilities
+        return probabilities
+
+    def _sample_price(self, probabilities: PriceMap) -> float:
+        if not probabilities:
+            raise ValueError("probabilities must not be empty")
+        draw = self._unit_random()
+        cumulative = 0.0
+        fallback = next(reversed(probabilities))
+        for price, probability in probabilities.items():
+            cumulative += probability
+            if draw <= cumulative:
+                return price
+        return fallback
+
+    def _mean_child_order_size(self) -> float:
+        return self._clamp(0.18 + 0.08 * self.popularity, 0.08, 0.55)
+
+    def _sample_order_count(
+        self,
+        target_volume: float,
+        *,
+        max_count: int,
+    ) -> int:
+        if target_volume <= 1e-12 or max_count <= 0:
+            return 0
+        expected = target_volume / self._mean_child_order_size()
+        count = self._sample_poisson(expected)
+        return max(0, min(max_count, count))
+
+    def _sample_poisson(self, expected: float) -> int:
+        if expected <= 0:
+            return 0
+        if expected > 32.0:
+            if hasattr(self._rng, "gauss"):
+                return max(0, int(round(self._rng.gauss(expected, expected**0.5))))
+            return max(0, int(round(expected)))
+        draw = self._unit_random()
+        probability = exp(-expected)
+        cumulative = probability
+        count = 0
+        while draw > cumulative and count < 256:
+            count += 1
+            probability *= expected / count
+            cumulative += probability
+        return count
+
+    def _sample_order_size(self) -> float:
+        mean_size = self._mean_child_order_size()
+        sigma = 0.62
+        if hasattr(self._rng, "lognormvariate"):
+            size = mean_size * self._rng.lognormvariate(-0.5 * sigma * sigma, sigma)
+        else:
+            size = mean_size * (0.55 + 0.90 * self._unit_random())
+        return self._clamp(size, mean_size * 0.05, mean_size * 8.0)
+
+    def _unit_random(self) -> float:
+        value = self._rng.random()
+        if not isfinite(value):
+            return 0.0
+        return self._clamp(value, 0.0, 1.0 - 1e-12)
+
+    def _sample_mdf_judgments(
+        self,
+        context: MDFContext,
+        signals: MDFSignals,
+        *,
+        update_memory: bool,
+    ) -> _MDFJudgmentSample:
+        volatility = self._clamp(context.volatility, 0.0, 2.2)
+        stress = self._clamp(signals.liquidity_stress, 0.0, 1.8)
+        event = self._clamp(signals.activity_event + 0.45 * signals.activity, 0.0, 1.8)
+        spread = self._clamp(
+            (signals.spread_ticks - 1.0) / max(float(self.grid_radius), 1.0),
+            0.0,
+            1.0,
+        )
+        uncertainty = self._clamp(
+            0.10
+            + 0.20 * volatility
+            + 0.24 * stress
+            + 0.18 * event
+            + 0.10 * context.augmentation_strength,
+            0.08,
+            0.95,
+        )
+        common_value_noise = self._rng.gauss(0.0, 0.16 + 0.24 * uncertainty)
+        buy_noise = self._rng.gauss(0.0, 0.14 + 0.26 * uncertainty)
+        sell_noise = self._rng.gauss(0.0, 0.14 + 0.26 * uncertainty)
+
+        buy_view = (
+            context.trend
+            + 0.42 * context.mood
+            + 0.18 * signals.last_return_ticks
+            + 0.12 * signals.orderbook_imbalance
+            + 0.10 * max(0.0, signals.stress_side)
+        )
+        buy_fair_value_shift = self._clamp(
+            1.10 * buy_view + common_value_noise + buy_noise,
+            -2.4,
+            2.4,
+        )
+        buy_opportunity = self._clamp(
+            0.22 * max(0.0, -signals.last_return_ticks)
+            + 0.20 * max(0.0, -context.trend)
+            + 0.16 * max(0.0, -context.mood)
+            + self._rng.gauss(0.0, 0.10 + 0.16 * uncertainty),
+            0.0,
+            1.5,
+        )
+        buy_urgency = self._clamp(
+            0.10
+            + 0.54 * max(0.0, buy_fair_value_shift)
+            + 0.16 * event
+            + 0.14 * max(0.0, signals.stress_side)
+            + self._rng.gauss(0.0, 0.09 + 0.13 * uncertainty),
+            0.0,
+            1.8,
+        )
+        buy_patience = self._clamp(
+            0.26
+            + 0.44 * max(0.0, -buy_fair_value_shift)
+            + 0.18 * volatility
+            + 0.16 * buy_opportunity
+            + self._rng.gauss(0.0, 0.08 + 0.12 * uncertainty),
+            0.0,
+            1.8,
+        )
+        buy_liquidity_aversion = self._clamp(
+            0.08
+            + 0.30 * stress
+            + 0.18 * spread
+            + 0.12 * max(0.0, -signals.stress_side)
+            + self._rng.gauss(0.0, 0.07 + 0.12 * uncertainty),
+            0.0,
+            1.0,
+        )
+        buy_pocket_bias = self._clamp(
+            0.18
+            + 0.18 * uncertainty
+            + 0.18 * buy_opportunity
+            + self._rng.gauss(0.0, 0.08 + 0.10 * uncertainty),
+            0.0,
+            1.0,
+        )
+
+        sell_view = (
+            0.74 * context.trend
+            + 0.24 * context.mood
+            + 0.10 * signals.last_return_ticks
+            - 0.08 * signals.orderbook_imbalance
+            - 0.10 * max(0.0, -signals.stress_side)
+        )
+        sell_fair_value_shift = self._clamp(
+            sell_view + 0.35 * common_value_noise + sell_noise,
+            -2.4,
+            2.4,
+        )
+        profit_taking = self._clamp(
+            0.26 * max(0.0, signals.last_return_ticks)
+            + 0.18 * max(0.0, context.trend)
+            + 0.12 * max(0.0, context.mood)
+            + self._rng.gauss(0.0, 0.10 + 0.16 * uncertainty),
+            0.0,
+            1.5,
+        )
+        liquidation = self._clamp(
+            0.30 * max(0.0, -context.trend)
+            + 0.22 * max(0.0, -signals.last_return_ticks)
+            + 0.18 * stress
+            + 0.12 * max(0.0, -signals.stress_side)
+            + self._rng.gauss(0.0, 0.10 + 0.16 * uncertainty),
+            0.0,
+            1.6,
+        )
+        sell_urgency = self._clamp(
+            0.10
+            + 0.48 * max(0.0, -sell_fair_value_shift)
+            + 0.24 * liquidation
+            + 0.12 * profit_taking
+            + 0.16 * event
+            + self._rng.gauss(0.0, 0.09 + 0.13 * uncertainty),
+            0.0,
+            1.9,
+        )
+        sell_patience = self._clamp(
+            0.26
+            + 0.48 * max(0.0, sell_fair_value_shift)
+            + 0.16 * volatility
+            + 0.10 * profit_taking
+            + self._rng.gauss(0.0, 0.08 + 0.12 * uncertainty),
+            0.0,
+            1.8,
+        )
+        sell_liquidity_aversion = self._clamp(
+            0.08
+            + 0.30 * stress
+            + 0.18 * spread
+            + 0.12 * max(0.0, signals.stress_side)
+            + self._rng.gauss(0.0, 0.07 + 0.12 * uncertainty),
+            0.0,
+            1.0,
+        )
+        sell_pocket_bias = self._clamp(
+            0.18
+            + 0.18 * uncertainty
+            + 0.14 * profit_taking
+            + 0.12 * liquidation
+            + self._rng.gauss(0.0, 0.08 + 0.10 * uncertainty),
+            0.0,
+            1.0,
+        )
+
+        buy = _MDFSideJudgment(
+            fair_value_shift=buy_fair_value_shift,
+            urgency=buy_urgency,
+            patience=buy_patience,
+            opportunity=buy_opportunity,
+            liquidation=0.0,
+            liquidity_aversion=buy_liquidity_aversion,
+            pocket_bias=buy_pocket_bias,
+            uncertainty=uncertainty,
+        )
+        sell = _MDFSideJudgment(
+            fair_value_shift=sell_fair_value_shift,
+            urgency=sell_urgency,
+            patience=sell_patience,
+            opportunity=profit_taking,
+            liquidation=liquidation,
+            liquidity_aversion=sell_liquidity_aversion,
+            pocket_bias=sell_pocket_bias,
+            uncertainty=uncertainty,
+        )
+        return _MDFJudgmentSample(
+            buy=self._blend_mdf_judgment("buy", buy, update_memory=update_memory),
+            sell=self._blend_mdf_judgment("sell", sell, update_memory=update_memory),
+        )
+
+    def _blend_mdf_judgment(
+        self,
+        key: str,
+        sample: _MDFSideJudgment,
+        *,
+        update_memory: bool,
+    ) -> _MDFSideJudgment:
+        previous = self._mdf_judgment_memory.get(key)
+        if previous is None:
+            blended = sample
+        else:
+            blended = _MDFSideJudgment(
+                fair_value_shift=0.65 * previous.fair_value_shift + 0.35 * sample.fair_value_shift,
+                urgency=0.65 * previous.urgency + 0.35 * sample.urgency,
+                patience=0.65 * previous.patience + 0.35 * sample.patience,
+                opportunity=0.65 * previous.opportunity + 0.35 * sample.opportunity,
+                liquidation=0.65 * previous.liquidation + 0.35 * sample.liquidation,
+                liquidity_aversion=(
+                    0.65 * previous.liquidity_aversion + 0.35 * sample.liquidity_aversion
+                ),
+                pocket_bias=0.65 * previous.pocket_bias + 0.35 * sample.pocket_bias,
+                uncertainty=0.65 * previous.uncertainty + 0.35 * sample.uncertainty,
+            )
+        if update_memory:
+            self._mdf_judgment_memory[key] = blended
+        return blended
+
+    def _buy_entry_mdf_mass(
+        self,
         relative_ticks: list[int],
         context: MDFContext,
         signals: MDFSignals,
-    ) -> list[float]:
-        if self._mdf_model_accepts_signals:
-            return self.mdf_model.scores(side, intent, relative_ticks, context, signals)
-        return self.mdf_model.scores(side, intent, relative_ticks, context)
+        judgment: _MDFSideJudgment,
+    ) -> dict[int, float]:
+        volatility = self._clamp(context.volatility, 0.0, 2.2)
+        stress = self._clamp(signals.liquidity_stress, 0.0, 1.8)
+        event = self._clamp(signals.activity_event + 0.45 * signals.activity, 0.0, 1.8)
+        bid_shortage = signals.bid_shortage_by_tick
+        bid_gap = signals.bid_gap_by_tick
+        bid_front = signals.bid_front_by_tick
+        bid_liquidity = self._normalize_tick_signal(dict(signals.bid_liquidity_by_tick))
+        ask_liquidity = self._normalize_tick_signal(dict(signals.ask_liquidity_by_tick))
+        value_center = self._clamp(
+            judgment.fair_value_shift * (1.0 + 0.35 * judgment.urgency)
+            - 0.55 * judgment.patience,
+            -float(self.grid_radius),
+            min(3.0, float(self.grid_radius)),
+        )
+        value_spread = 1.15 + 0.55 * volatility + 0.50 * judgment.uncertainty
+        spike_evidence = self._clamp(
+            0.22 * judgment.urgency
+            + 0.16 * judgment.patience
+            + 0.16 * event
+            + 0.20 * stress
+            + 0.14 * judgment.uncertainty,
+            0.0,
+            1.0,
+        )
+
+        raw: dict[int, float] = {}
+        for tick in relative_ticks:
+            level = abs(tick)
+            texture = self._mdf_texture("buy", tick, context, salt=0.0)
+            value_fit = self._soft_tick_band(float(tick), value_center, value_spread)
+            mass = 0.007 + 0.005 * texture
+            mass += (0.035 + 0.026 * judgment.uncertainty) * value_fit
+            if -1 <= tick <= 0:
+                mass += 0.048 + 0.018 * volatility + 0.012 * event
+            elif level == 2:
+                mass += 0.026 + 0.010 * volatility
+            else:
+                mass += 0.010 / (1.0 + 0.24 * level)
+
+            if tick <= 0:
+                passive_level = abs(tick)
+                reservation_band = self._entry_reservation_band(passive_level)
+                passive_center = (
+                    0.95
+                    + 1.70 * judgment.patience
+                    + 0.55 * volatility
+                    + 0.85 * judgment.opportunity
+                )
+                passive_band = self._soft_tick_band(
+                    float(passive_level),
+                    passive_center,
+                    1.00 + 0.35 * volatility + 0.25 * stress,
+                )
+                book_signal = (
+                    0.34 * bid_shortage.get(tick, 0.0)
+                    + 0.24 * bid_gap.get(tick, 0.0)
+                    + 0.22 * bid_front.get(tick, 0.0)
+                )
+                book_response = max(0.0, 1.0 - 0.70 * judgment.liquidity_aversion)
+                spike_evidence = max(spike_evidence, 0.55 * self._clamp(book_signal, 0.0, 1.0))
+                mass += (
+                    0.026
+                    + 0.042 * judgment.patience
+                    + 0.038 * judgment.opportunity
+                    + 0.012 * volatility
+                ) * passive_band
+                mass += 0.012 * reservation_band
+                mass += 0.070 * passive_band * book_response * (1.0 - exp(-2.0 * book_signal))
+                mass += 0.018 * bid_liquidity.get(tick, 0.0)
+            else:
+                market_band = self._entry_marketable_band(tick)
+                opposing = ask_liquidity.get(tick, 0.0)
+                crossing_depth = opposing * (0.026 + 0.120 * judgment.urgency)
+                crossing_depth *= max(0.0, 1.0 - 0.35 * judgment.liquidity_aversion)
+                spike_evidence = max(
+                    spike_evidence,
+                    0.50 * opposing * self._clamp(judgment.urgency, 0.0, 1.0),
+                )
+                mass += (0.026 + 0.092 * judgment.urgency + 0.018 * event) * market_band
+                mass += crossing_depth
+
+            if level >= 4:
+                mass += (0.014 * volatility + 0.014 * stress) * texture
+            if level >= 6:
+                mass += (0.020 * volatility + 0.010 * judgment.uncertainty) * texture
+            raw[tick] = mass * (0.80 + 0.38 * texture)
+
+        self._add_buy_entry_pockets(relative_ticks, context, signals, judgment, raw)
+        center_weight = 0.55 + 0.22 * spike_evidence
+        adjacent_weight = 0.16 - 0.045 * spike_evidence
+        outer_weight = max(0.0, (1.0 - center_weight - 2.0 * adjacent_weight) / 2.0)
+        return self._smooth_tick_mass(
+            raw,
+            relative_ticks,
+            center_weight=center_weight,
+            adjacent_weight=adjacent_weight,
+            outer_weight=outer_weight,
+        )
+
+    def _sell_entry_mdf_mass(
+        self,
+        relative_ticks: list[int],
+        context: MDFContext,
+        signals: MDFSignals,
+        judgment: _MDFSideJudgment,
+    ) -> dict[int, float]:
+        volatility = self._clamp(context.volatility, 0.0, 2.2)
+        stress = self._clamp(signals.liquidity_stress, 0.0, 1.8)
+        event = self._clamp(signals.activity_event + 0.45 * signals.activity, 0.0, 1.8)
+        ask_shortage = signals.ask_shortage_by_tick
+        ask_gap = signals.ask_gap_by_tick
+        ask_front = signals.ask_front_by_tick
+        ask_liquidity = self._normalize_tick_signal(dict(signals.ask_liquidity_by_tick))
+        bid_liquidity = self._normalize_tick_signal(dict(signals.bid_liquidity_by_tick))
+        value_center = self._clamp(
+            judgment.fair_value_shift * (1.0 + 0.30 * judgment.patience)
+            + 0.55 * judgment.patience
+            - 0.95 * judgment.urgency
+            - 0.70 * judgment.liquidation,
+            -min(3.0, float(self.grid_radius)),
+            float(self.grid_radius),
+        )
+        value_spread = 1.15 + 0.55 * volatility + 0.50 * judgment.uncertainty
+        spike_evidence = self._clamp(
+            0.22 * judgment.urgency
+            + 0.16 * judgment.patience
+            + 0.20 * judgment.liquidation
+            + 0.16 * event
+            + 0.18 * stress,
+            0.0,
+            1.0,
+        )
+
+        raw: dict[int, float] = {}
+        for tick in relative_ticks:
+            level = abs(tick)
+            texture = self._mdf_texture("sell", tick, context, salt=0.0)
+            value_fit = self._soft_tick_band(float(tick), value_center, value_spread)
+            mass = 0.007 + 0.005 * texture
+            mass += (0.035 + 0.026 * judgment.uncertainty) * value_fit
+            if 0 <= tick <= 1:
+                mass += 0.048 + 0.018 * volatility + 0.012 * event
+            elif level == 2:
+                mass += 0.026 + 0.010 * volatility
+            else:
+                mass += 0.010 / (1.0 + 0.24 * level)
+
+            if tick >= 0:
+                passive_level = tick
+                reservation_band = self._entry_reservation_band(passive_level)
+                passive_center = (
+                    0.95
+                    + 1.60 * judgment.patience
+                    + 0.55 * volatility
+                    - 0.50 * judgment.opportunity
+                    + 0.45 * judgment.fair_value_shift
+                )
+                passive_band = self._soft_tick_band(
+                    float(passive_level),
+                    passive_center,
+                    1.00 + 0.35 * volatility + 0.25 * stress,
+                )
+                book_signal = (
+                    0.34 * ask_shortage.get(tick, 0.0)
+                    + 0.24 * ask_gap.get(tick, 0.0)
+                    + 0.22 * ask_front.get(tick, 0.0)
+                )
+                book_response = max(0.0, 1.0 - 0.70 * judgment.liquidity_aversion)
+                spike_evidence = max(spike_evidence, 0.55 * self._clamp(book_signal, 0.0, 1.0))
+                mass += (
+                    0.026
+                    + 0.040 * judgment.patience
+                    + 0.030 * judgment.opportunity
+                    + 0.012 * volatility
+                ) * passive_band
+                mass += 0.012 * reservation_band
+                mass += 0.070 * passive_band * book_response * (1.0 - exp(-2.0 * book_signal))
+                mass += 0.018 * ask_liquidity.get(tick, 0.0)
+            else:
+                market_band = self._entry_marketable_band(abs(tick))
+                opposing = bid_liquidity.get(tick, 0.0)
+                crossing_depth = opposing * (
+                    0.026 + 0.105 * judgment.urgency + 0.190 * judgment.liquidation
+                )
+                crossing_depth *= max(0.0, 1.0 - 0.35 * judgment.liquidity_aversion)
+                spike_evidence = max(
+                    spike_evidence,
+                    0.50 * opposing * self._clamp(judgment.urgency, 0.0, 1.0),
+                )
+                mass += (
+                    0.026
+                    + 0.086 * judgment.urgency
+                    + 0.150 * judgment.liquidation
+                    + 0.018 * event
+                ) * market_band
+                mass += crossing_depth
+
+            if level >= 4:
+                mass += (0.014 * volatility + 0.014 * stress) * texture
+            if level >= 6:
+                mass += (0.020 * volatility + 0.010 * judgment.uncertainty) * texture
+            raw[tick] = mass * (0.80 + 0.38 * texture)
+
+        self._add_sell_entry_pockets(relative_ticks, context, signals, judgment, raw)
+        center_weight = 0.55 + 0.22 * spike_evidence
+        adjacent_weight = 0.16 - 0.045 * spike_evidence
+        outer_weight = max(0.0, (1.0 - center_weight - 2.0 * adjacent_weight) / 2.0)
+        return self._smooth_tick_mass(
+            raw,
+            relative_ticks,
+            center_weight=center_weight,
+            adjacent_weight=adjacent_weight,
+            outer_weight=outer_weight,
+        )
+
+    def _evolve_raw_mdf(
+        self,
+        key: str,
+        raw_mass: dict[int, float],
+        *,
+        current_tick: int,
+        memory_mix: float,
+        floor_mix: float,
+        update_memory: bool,
+    ) -> dict[int, float]:
+        ticks = self.relative_tick_grid()
+        valid_ticks = [tick for tick in ticks if current_tick + tick >= 1]
+        proposal = self._normalize_tick_map(
+            {tick: max(0.0, raw_mass.get(tick, 0.0)) for tick in valid_ticks}
+        )
+        previous = self._mdf_memory.get(key)
+        if previous is None:
+            previous = proposal
+        else:
+            previous = self._normalize_tick_map(
+                {tick: previous.get(tick, 0.0) for tick in valid_ticks}
+            )
+        uniform = 1.0 / len(valid_ticks)
+        mixed = self._normalize_tick_map(
+            {
+                tick: (1.0 - memory_mix) * proposal.get(tick, 0.0)
+                + memory_mix * previous.get(tick, uniform)
+                for tick in valid_ticks
+            }
+        )
+        evolved = self._normalize_tick_map(
+            {
+                tick: (1.0 - floor_mix) * mixed.get(tick, 0.0) + floor_mix * uniform
+                for tick in valid_ticks
+            }
+        )
+        constrained = {tick: evolved.get(tick, 0.0) for tick in ticks}
+        if update_memory:
+            self._mdf_memory[key] = constrained
+        return constrained
+
+    def _centered_entry_noise_mdf(
+        self,
+        relative_ticks: list[int],
+        current_tick: int,
+    ) -> TickMap:
+        valid_ticks = [tick for tick in relative_ticks if current_tick + tick >= 1]
+        if not valid_ticks:
+            return {tick: 0.0 for tick in relative_ticks}
+        sigma = max(self._entry_noise_sigma_ticks, 1e-12)
+        mass = {
+            tick: exp(-0.5 * (float(tick) / sigma) ** 2)
+            for tick in valid_ticks
+        }
+        normalized = self._normalize_tick_map(mass)
+        return {tick: normalized.get(tick, 0.0) for tick in relative_ticks}
+
+    def _mix_entry_noise_mdf(
+        self,
+        raw_mdf: TickMap,
+        noise_mdf: TickMap,
+        *,
+        mix: float,
+    ) -> TickMap:
+        mix = self._clamp(mix, 0.0, 1.0)
+        ticks = list(raw_mdf)
+        if not ticks:
+            return {}
+        if mix <= 1e-12:
+            normalized = self._normalize_tick_map(raw_mdf)
+            return {tick: normalized.get(tick, 0.0) for tick in ticks}
+        mixed = {
+            tick: (1.0 - mix) * max(0.0, raw_mdf.get(tick, 0.0))
+            + mix * max(0.0, noise_mdf.get(tick, 0.0))
+            for tick in ticks
+        }
+        normalized = self._normalize_tick_map(mixed)
+        return {tick: normalized.get(tick, 0.0) for tick in ticks}
+
+    def _resolve_entry_mdf_overlap(
+        self,
+        relative_ticks: list[int],
+        current_tick: int,
+        raw_buy: TickMap,
+        raw_sell: TickMap,
+        *,
+        buy_aggression: float,
+        sell_aggression: float,
+    ) -> tuple[TickMap, TickMap]:
+        valid_ticks = [tick for tick in relative_ticks if current_tick + tick >= 1]
+        if not valid_ticks:
+            empty = {tick: 0.0 for tick in relative_ticks}
+            return empty, empty.copy()
+
+        buy = self._normalize_tick_map(
+            {tick: max(0.0, raw_buy.get(tick, 0.0)) for tick in valid_ticks}
+        )
+        sell = self._normalize_tick_map(
+            {tick: max(0.0, raw_sell.get(tick, 0.0)) for tick in valid_ticks}
+        )
+        buy_aggression = self._clamp(buy_aggression, 0.0, 1.0)
+        sell_aggression = self._clamp(sell_aggression, 0.0, 1.0)
+
+        local_buy = {tick: self._local_mdf_overlap(buy, tick) for tick in valid_ticks}
+        local_sell = {tick: self._local_mdf_overlap(sell, tick) for tick in valid_ticks}
+
+        resolved_buy: TickMap = {}
+        resolved_sell: TickMap = {}
+        for tick in valid_ticks:
+            local_total = local_buy[tick] + local_sell[tick] + 1e-12
+            buy_overlap = local_sell[tick] / local_total
+            sell_overlap = local_buy[tick] / local_total
+            if tick < 0:
+                buy_overlap *= 0.84
+                sell_overlap = min(1.0, sell_overlap * 1.10)
+            elif tick > 0:
+                buy_overlap = min(1.0, buy_overlap * 1.10)
+                sell_overlap *= 0.84
+            else:
+                buy_overlap = min(1.0, buy_overlap * 1.03)
+                sell_overlap = min(1.0, sell_overlap * 1.03)
+
+            resolved_buy[tick] = buy.get(tick, 0.0) * self._entry_overlap_factor(
+                buy_aggression,
+                buy_overlap,
+            )
+            resolved_sell[tick] = sell.get(tick, 0.0) * self._entry_overlap_factor(
+                sell_aggression,
+                sell_overlap,
+            )
+
+        resolved_buy = self._normalize_tick_map(resolved_buy)
+        resolved_sell = self._normalize_tick_map(resolved_sell)
+        return (
+            {tick: resolved_buy.get(tick, 0.0) for tick in relative_ticks},
+            {tick: resolved_sell.get(tick, 0.0) for tick in relative_ticks},
+        )
+
+    def _entry_overlap_aggression(
+        self,
+        side: str,
+        context: MDFContext,
+        signals: MDFSignals,
+        judgment: _MDFSideJudgment,
+        mdf_shock: float,
+    ) -> float:
+        stress = self._clamp(signals.liquidity_stress, 0.0, 1.8) / 1.8
+        event = self._clamp(signals.activity_event + 0.45 * signals.activity, 0.0, 1.8) / 1.8
+        volatility = self._clamp(context.volatility, 0.0, 2.2) / 2.2
+        last_return = self._clamp(signals.last_return_ticks / 4.0, -1.0, 1.0)
+        if side == "buy":
+            directional = self._clamp(
+                0.62 * max(0.0, context.trend)
+                + 0.28 * max(0.0, context.mood)
+                + 0.10 * max(0.0, last_return),
+                0.0,
+                1.0,
+            )
+            liquidation = 0.0
+        else:
+            directional = self._clamp(
+                0.62 * max(0.0, -context.trend)
+                + 0.28 * max(0.0, -context.mood)
+                + 0.10 * max(0.0, -last_return),
+                0.0,
+                1.0,
+            )
+            liquidation = judgment.liquidation / 1.6
+        return self._clamp(
+            0.20
+            + 0.30 * (judgment.urgency / 1.9)
+            + 0.16 * event
+            + 0.14 * stress
+            + 0.12 * volatility
+            + 0.12 * directional
+            + 0.08 * liquidation
+            + 0.10 * self._clamp(mdf_shock, 0.0, 1.0)
+            - 0.10 * judgment.liquidity_aversion,
+            0.0,
+            1.0,
+        )
+
+    def _local_mdf_overlap(self, mdf: TickMap, tick: int) -> float:
+        return (
+            0.70 * mdf.get(tick, 0.0)
+            + 0.15 * mdf.get(tick - 1, 0.0)
+            + 0.15 * mdf.get(tick + 1, 0.0)
+        )
+
+    def _entry_overlap_factor(
+        self,
+        aggression: float,
+        overlap: float,
+    ) -> float:
+        overlap = self._clamp(overlap, 0.0, 1.0)
+        aggression = self._clamp(aggression, 0.0, 1.0)
+        retained = max(0.0, 1.0 - overlap)
+        sharpness = 7.70 - 3.00 * aggression
+        floor = 0.004 + 0.050 * aggression
+        return floor + (1.0 - floor) * retained**sharpness
+
+    def _constrain_tick_mdf(self, current_tick: int, mdf_by_tick: TickMap) -> TickMap:
+        ticks = self.relative_tick_grid()
+        valid_ticks = [tick for tick in ticks if current_tick + tick >= 1]
+        valid_mass = {
+            tick: max(0.0, mdf_by_tick.get(tick, 0.0))
+            for tick in valid_ticks
+        }
+        normalized = self._normalize_tick_map(valid_mass)
+        return {tick: normalized.get(tick, 0.0) for tick in ticks}
+
+    def _smooth_tick_mass(
+        self,
+        raw: TickMap,
+        relative_ticks: list[int],
+        *,
+        center_weight: float,
+        adjacent_weight: float,
+        outer_weight: float,
+    ) -> TickMap:
+        tick_set = set(relative_ticks)
+        kernel = (
+            (0, center_weight),
+            (-1, adjacent_weight),
+            (1, adjacent_weight),
+            (-2, outer_weight),
+            (2, outer_weight),
+        )
+        smoothed: TickMap = {}
+        for tick, mass in raw.items():
+            if mass <= 0:
+                continue
+            for offset, weight in kernel:
+                target = tick + offset
+                if target in tick_set and weight > 0:
+                    smoothed[target] = smoothed.get(target, 0.0) + mass * weight
+        return {tick: smoothed.get(tick, 0.0) for tick in relative_ticks}
+
+    def _add_buy_entry_pockets(
+        self,
+        relative_ticks: list[int],
+        context: MDFContext,
+        signals: MDFSignals,
+        judgment: _MDFSideJudgment,
+        raw: dict[int, float],
+    ) -> None:
+        centers = self._buy_entry_pocket_centers(relative_ticks, context, signals, judgment)
+        self._add_entry_pocket_mass("buy", centers, context, raw)
+
+    def _buy_entry_pocket_centers(
+        self,
+        relative_ticks: list[int],
+        context: MDFContext,
+        signals: MDFSignals,
+        judgment: _MDFSideJudgment,
+    ) -> list[tuple[int, float]]:
+        scores: dict[int, float] = {}
+        volatility = self._clamp(context.volatility, 0.0, 2.2)
+        stress = self._clamp(signals.liquidity_stress, 0.0, 1.8)
+        bid_liquidity = self._normalize_tick_signal(dict(signals.bid_liquidity_by_tick))
+        for tick in relative_ticks:
+            if tick > 0:
+                continue
+            level = abs(tick)
+            texture = self._mdf_texture("buy", tick, context, salt=5.0)
+            book_signal = (
+                0.34 * signals.bid_shortage_by_tick.get(tick, 0.0)
+                + 0.25 * signals.bid_gap_by_tick.get(tick, 0.0)
+                + 0.22 * signals.bid_front_by_tick.get(tick, 0.0)
+            )
+            aversion_drag = max(0.0, 1.0 - 0.55 * judgment.liquidity_aversion)
+            passive_center = (
+                0.95
+                + 1.70 * judgment.patience
+                + 0.60 * volatility
+                + 0.85 * judgment.opportunity
+            )
+            score = (
+                0.38 * aversion_drag * (1.0 - exp(-2.1 * book_signal))
+                + 0.040 * bid_liquidity.get(tick, 0.0)
+                + 0.16 * texture
+                + 0.20
+                * judgment.pocket_bias
+                * self._soft_tick_band(float(level), passive_center, 1.05 + 0.25 * stress)
+            )
+            scores[tick] = score
+        return self._ordered_entry_pocket_centers(scores)
+
+    def _add_sell_entry_pockets(
+        self,
+        relative_ticks: list[int],
+        context: MDFContext,
+        signals: MDFSignals,
+        judgment: _MDFSideJudgment,
+        raw: dict[int, float],
+    ) -> None:
+        centers = self._sell_entry_pocket_centers(relative_ticks, context, signals, judgment)
+        self._add_entry_pocket_mass("sell", centers, context, raw)
+
+    def _sell_entry_pocket_centers(
+        self,
+        relative_ticks: list[int],
+        context: MDFContext,
+        signals: MDFSignals,
+        judgment: _MDFSideJudgment,
+    ) -> list[tuple[int, float]]:
+        scores: dict[int, float] = {}
+        volatility = self._clamp(context.volatility, 0.0, 2.2)
+        stress = self._clamp(signals.liquidity_stress, 0.0, 1.8)
+        ask_liquidity = self._normalize_tick_signal(dict(signals.ask_liquidity_by_tick))
+        for tick in relative_ticks:
+            if tick < 0:
+                continue
+            level = abs(tick)
+            texture = self._mdf_texture("sell", tick, context, salt=5.0)
+            book_signal = (
+                0.34 * signals.ask_shortage_by_tick.get(tick, 0.0)
+                + 0.25 * signals.ask_gap_by_tick.get(tick, 0.0)
+                + 0.22 * signals.ask_front_by_tick.get(tick, 0.0)
+            )
+            aversion_drag = max(0.0, 1.0 - 0.55 * judgment.liquidity_aversion)
+            passive_center = (
+                0.95
+                + 1.60 * judgment.patience
+                + 0.60 * volatility
+                - 0.50 * judgment.opportunity
+                + 0.40 * judgment.fair_value_shift
+            )
+            score = (
+                0.38 * aversion_drag * (1.0 - exp(-2.1 * book_signal))
+                + 0.040 * ask_liquidity.get(tick, 0.0)
+                + 0.16 * texture
+                + 0.20
+                * judgment.pocket_bias
+                * self._soft_tick_band(float(level), passive_center, 1.05 + 0.25 * stress)
+            )
+            scores[tick] = score
+        return self._ordered_entry_pocket_centers(scores)
+
+    def _ordered_entry_pocket_centers(self, scores: dict[int, float]) -> list[tuple[int, float]]:
+        ordered = sorted(scores.items(), key=lambda item: (-item[1], abs(item[0]), item[0]))
+        centers: list[tuple[int, float]] = []
+        for tick, score in ordered:
+            if all(abs(tick - existing) > 1 for existing, _ in centers):
+                centers.append((tick, score))
+            if len(centers) >= 4:
+                break
+        return centers
+
+    def _add_entry_pocket_mass(
+        self,
+        side: str,
+        centers: list[tuple[int, float]],
+        context: MDFContext,
+        raw: dict[int, float],
+    ) -> None:
+        for rank, (center, score) in enumerate(centers):
+            strength = self._clamp(0.024 + 0.082 * score, 0.018, 0.110)
+            strength *= 1.0 / (1.0 + 0.18 * rank)
+            for offset, shape in (
+                (0, 0.70),
+                (-1, 0.64),
+                (1, 0.66),
+                (-2, 0.35),
+                (2, 0.34),
+                (-3, 0.14),
+                (3, 0.14),
+            ):
+                tick = center + offset
+                if tick not in raw:
+                    continue
+                texture = self._mdf_texture(side, tick, context, salt=rank + 3.0)
+                raw[tick] += strength * shape * (0.82 + 0.36 * texture)
 
     @staticmethod
-    def _scores_accepts_signals(scores) -> bool:
-        try:
-            parameters = list(inspect.signature(scores).parameters.values())
-        except (TypeError, ValueError):
-            return True
-        if any(
-            parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
-            for parameter in parameters
-        ):
-            return True
-        return len(parameters) >= 5
+    def _soft_tick_band(value: float, center: float, spread: float) -> float:
+        return exp(-abs(value - center) / max(spread, 1e-12))
+
+    def _entry_reservation_band(self, level: int) -> float:
+        if level <= 1:
+            return 0.92
+        if level == 2:
+            return 0.68
+        if level == 3:
+            return 0.50
+        if level <= 5:
+            return 0.32
+        if level <= 8:
+            return 0.20
+        return 0.12
+
+    def _entry_marketable_band(self, level: int) -> float:
+        if level <= 1:
+            return 1.0
+        if level == 2:
+            return 0.48
+        if level <= 4:
+            return 0.16
+        return 0.035
+
+    def _mdf_texture(
+        self,
+        side: str,
+        tick: int,
+        context: MDFContext,
+        *,
+        salt: float,
+    ) -> float:
+        side_seed = {"buy": 0.37, "sell": 0.91}[side]
+        seed = 0.0 if self._seed is None else float(self._seed)
+        primary = sin(
+            tick * 12.9898
+            + context.step_index * 0.917
+            + context.current_tick * 0.071
+            + seed * 0.0031
+            + side_seed
+            + salt * 1.618
+        )
+        secondary = sin(
+            tick * 4.231
+            + context.step_index * 0.113
+            + seed * 0.017
+            + side_seed * 3.0
+            + salt
+        )
+        return 0.72 + 0.34 * (0.5 + 0.5 * primary) + 0.18 * (0.5 + 0.5 * secondary)
+
+    def _cached_mdf_signals(
+        self,
+        price: float,
+        cache: _StepComputationCache | None = None,
+    ) -> MDFSignals:
+        if cache is None or cache.basis_price != price:
+            return self._mdf_signals(price)
+        if cache.signals is None:
+            cache.signals = self._mdf_signals(price)
+        return cache.signals
 
     def _mdf_signals(self, price: float) -> MDFSignals:
         orderbook = self._snapshot_orderbook()
+        best_bid = self._best_bid()
+        best_ask = self._best_ask()
+        spread_ticks = (
+            max(1.0, (best_ask - best_bid) / self.gap)
+            if best_bid is not None and best_ask is not None
+            else 1.0 + self._microstructure.liquidity_stress
+        )
         liquidity = self._price_map_to_relative_ticks(
             price,
             self._merge_maps(orderbook.bid_volume_by_price, orderbook.ask_volume_by_price),
         )
-        position = self._snapshot_position_mass()
+        bid_shortage, bid_gap, bid_front = self._book_observable_maps(
+            price,
+            "bid",
+            orderbook.bid_volume_by_price,
+        )
+        ask_shortage, ask_gap, ask_front = self._book_observable_maps(
+            price,
+            "ask",
+            orderbook.ask_volume_by_price,
+        )
         return MDFSignals(
             orderbook_imbalance=self._last_imbalance,
             last_return_ticks=self._last_return_ticks,
@@ -1680,66 +2977,86 @@ class Market:
                 price, self._last_executed_by_price
             ),
             liquidity_by_tick=liquidity,
-            long_position_mass_by_tick=self._price_map_to_relative_ticks(
-                price, position.long_exit_mass_by_price
+            bid_liquidity_by_tick=self._price_map_to_relative_ticks(
+                price, orderbook.bid_volume_by_price
             ),
-            short_position_mass_by_tick=self._price_map_to_relative_ticks(
-                price, position.short_exit_mass_by_price
+            ask_liquidity_by_tick=self._price_map_to_relative_ticks(
+                price, orderbook.ask_volume_by_price
             ),
+            bid_shortage_by_tick=bid_shortage,
+            ask_shortage_by_tick=ask_shortage,
+            bid_gap_by_tick=bid_gap,
+            ask_gap_by_tick=ask_gap,
+            bid_front_by_tick=bid_front,
+            ask_front_by_tick=ask_front,
+            spread_ticks=spread_ticks,
+            cancel_pressure=self._microstructure.cancel_pressure,
+            liquidity_stress=self._microstructure.liquidity_stress,
+            stress_side=self._microstructure.stress_side,
+            resiliency=self._microstructure.resiliency,
+            activity=self._microstructure.activity,
+            activity_event=self._microstructure.activity_event,
         )
 
-    def _evolve_mdf(
-        self, key: str, scores: list[float], *, temperature: float, update_memory: bool
-    ) -> dict[int, float]:
-        ticks = self.relative_tick_grid()
-        if len(scores) != len(ticks):
-            raise ValueError("mdf_model.scores must return one score per relative tick")
-        previous = self._mdf_memory.get(key)
-        if previous is None:
-            uniform = 1.0 / len(ticks)
-            previous = {tick: uniform for tick in ticks}
-        cleaned = [score if isfinite(score) else 0.0 for score in scores]
-        logits = [
-            self._mdf_persistence * log(max(previous.get(tick, 0.0), self._mdf_eps))
-            + score / temperature
-            for tick, score in zip(ticks, cleaned, strict=False)
+    def _book_observable_maps(
+        self,
+        basis_price: float,
+        side: str,
+        volume_by_price: PriceMap,
+    ) -> tuple[TickMap, TickMap, TickMap]:
+        """Return shortage, gap, and near-front pressure on the side's passive grid."""
+
+        raw_depth = self._price_map_to_relative_ticks(basis_price, volume_by_price)
+        regime = self._active_settings
+        side_ticks = [
+            tick
+            for tick in self.relative_tick_grid()
+            if (tick < 0 if side == "bid" else tick > 0)
         ]
-        logit_peak = max(logits, default=0.0)
-        weights = [exp(self._clamp(logit - logit_peak, -50.0, 0.0)) for logit in logits]
-        proposal = self._normalize_tick_map(
-            {tick: weight for tick, weight in zip(ticks, weights, strict=False)}
-        )
-        diffused = self._diffuse_tick_mdf(proposal, self._mdf_diffusion)
-        uniform = 1.0 / len(ticks)
-        evolved = self._normalize_tick_map(
-            {
-                tick: (1.0 - self._mdf_floor_mix) * diffused.get(tick, 0.0)
-                + self._mdf_floor_mix * uniform
-                for tick in ticks
-            }
-        )
-        if update_memory:
-            self._mdf_memory[key] = evolved
-        return evolved
+        if not side_ticks:
+            return {}, {}, {}
+        side_ticks.sort(key=abs)
 
-    def _diffuse_tick_mdf(self, values: dict[int, float], diffusion: float) -> dict[int, float]:
-        if diffusion <= 0:
-            return dict(values)
-        ticks = self.relative_tick_grid()
-        diffused = {}
-        for index, tick in enumerate(ticks):
-            neighbors = []
-            if index > 0:
-                neighbors.append(ticks[index - 1])
-            if index < len(ticks) - 1:
-                neighbors.append(ticks[index + 1])
-            neighbor_mass = (
-                sum(values.get(neighbor, 0.0) for neighbor in neighbors) / len(neighbors)
-                if neighbors
-                else values.get(tick, 0.0)
+        depth_values = {tick: max(0.0, raw_depth.get(tick, 0.0)) for tick in side_ticks}
+        occupancies: dict[int, float] = {}
+        shortages: dict[int, float] = {}
+        front_signal: dict[int, float] = {}
+        expected_scale = max(0.08, self.popularity * regime["liquidity"])
+
+        for tick in side_ticks:
+            level = max(1.0, abs(float(tick)))
+            expected = expected_scale * regime["near_touch_liquidity"] / (
+                level ** regime["depth_exponent"]
             )
-            diffused[tick] = (1.0 - diffusion) * values.get(tick, 0.0) + diffusion * neighbor_mass
-        return self._normalize_tick_map(diffused)
+            depth = depth_values[tick]
+            occupancy = depth / (depth + expected + 1e-12)
+            shortage = self._clamp(1.0 - occupancy, 0.0, 1.0)
+            near_weight = exp(-max(0.0, level - 1.0) / 2.2)
+            occupancies[tick] = occupancy
+            shortages[tick] = shortage
+            front_signal[tick] = shortage * near_weight
+
+        gap_signal: dict[int, float] = {}
+        previous_occupancy = None
+        for tick in side_ticks:
+            occupancy = occupancies[tick]
+            discontinuity = (
+                0.0 if previous_occupancy is None else abs(occupancy - previous_occupancy)
+            )
+            gap_signal[tick] = shortages[tick] * (0.15 + discontinuity)
+            previous_occupancy = occupancy
+
+        return (
+            self._normalize_tick_signal(shortages),
+            self._normalize_tick_signal(gap_signal),
+            self._normalize_tick_signal(front_signal),
+        )
+
+    def _normalize_tick_signal(self, values: TickMap) -> TickMap:
+        peak = max(values.values(), default=0.0)
+        if peak <= 1e-12:
+            return {}
+        return {tick: value / peak for tick, value in values.items() if value > 1e-12}
 
     def _project_tick_mdf(self, current_tick: int, mdf_by_tick: dict[int, float]) -> PriceMap:
         projected: PriceMap = {}
@@ -1753,68 +3070,6 @@ class Market:
         if total <= 0:
             return {}
         return {price: probability / total for price, probability in sorted(projected.items())}
-
-    def _with_cohort_exit_mdfs(
-        self,
-        basis_price: float,
-        mdf: MDFState,
-        long_exit_intent: PriceMap,
-        short_exit_intent: PriceMap,
-    ) -> MDFState:
-        long_by_price = (
-            self._cohort_intent_price_mdf(basis_price, long_exit_intent)
-            or mdf.long_exit_mdf_by_price
-        )
-        short_by_price = (
-            self._cohort_intent_price_mdf(basis_price, short_exit_intent)
-            or mdf.short_exit_mdf_by_price
-        )
-        return MDFState(
-            buy_entry_mdf_by_price=mdf.buy_entry_mdf_by_price,
-            sell_entry_mdf_by_price=mdf.sell_entry_mdf_by_price,
-            long_exit_mdf_by_price=long_by_price,
-            short_exit_mdf_by_price=short_by_price,
-            relative_ticks=list(mdf.relative_ticks),
-            buy_entry_mdf=dict(mdf.buy_entry_mdf),
-            sell_entry_mdf=dict(mdf.sell_entry_mdf),
-            long_exit_mdf=self._price_map_to_normalized_relative_mdf(
-                basis_price, long_by_price
-            )
-            or dict(mdf.long_exit_mdf),
-            short_exit_mdf=self._price_map_to_normalized_relative_mdf(
-                basis_price, short_by_price
-            )
-            or dict(mdf.short_exit_mdf),
-        )
-
-    def _cohort_intent_price_mdf(self, basis_price: float, values: PriceMap) -> PriceMap:
-        grid = self._price_grid(basis_price)
-        grid_set = set(grid)
-        cleaned = {
-            price: max(0.0, value)
-            for price, value in values.items()
-            if price in grid_set and value > 1e-12
-        }
-        total = sum(cleaned.values())
-        if total <= 1e-12:
-            return {}
-        uniform = 1.0 / len(grid)
-        floor_mix = min(0.44, max(self._mdf_floor_mix, 0.42))
-        return self._normalize_price_map(
-            {
-                price: (1.0 - floor_mix) * cleaned.get(price, 0.0) / total
-                + floor_mix * uniform
-                for price in grid
-            }
-        )
-
-    def _price_map_to_normalized_relative_mdf(
-        self, basis_price: float, values: PriceMap
-    ) -> TickMap:
-        raw_by_tick = self._price_map_to_relative_ticks(basis_price, values)
-        return self._normalize_tick_map(
-            {tick: raw_by_tick.get(tick, 0.0) for tick in self.relative_tick_grid()}
-        )
 
     def _normalize_price_map(self, values: PriceMap) -> PriceMap:
         total = sum(max(0.0, value) for value in values.values())
@@ -1831,7 +3086,7 @@ class Market:
         return {tick: max(0.0, value) / total for tick, value in values.items()}
 
     def _taker_share(self, latent: LatentState, imbalance: float) -> float:
-        regime = self._regime_settings(self._active_regime)
+        regime = self._active_settings
         base = (
             0.12
             + 0.08 * latent.volatility
@@ -1839,215 +3094,727 @@ class Market:
         )
         return self._clamp(base * regime["taker"], 0.08, 0.62)
 
-    def _exit_flow(
-        self,
-        side: str,
-        current_price: float,
-        latent: LatentState,
-        exit_mdf: PriceMap,
-    ) -> _ExitFlow:
-        del exit_mdf
-        cohorts = self._long_cohorts if side == "long" else self._short_cohorts
-        market_orders: list[_IncomingOrder] = []
-        limit_orders: list[_ExitOrder] = []
-        intent_volume_by_price: PriceMap = {}
-        for cohort in cohorts:
-            if cohort.mass <= 0:
-                continue
-            pnl_ticks = self._cohort_pnl_ticks(side, cohort, current_price)
-            adverse_trend = max(0.0, -latent.trend) if side == "long" else max(0.0, latent.trend)
-            stop_ticks = 2.0 + 1.4 * latent.volatility
-            target_ticks = 3.0 + 1.8 * latent.volatility
-            stop_pressure = self._threshold_pressure(-pnl_ticks - stop_ticks, 2.0)
-            take_profit_pressure = self._threshold_pressure(pnl_ticks - target_ticks, 3.0)
-            age_pressure = min(0.10, cohort.age * 0.002)
-            volatility_pressure = 0.025 * latent.volatility / (1.0 + latent.volatility)
-            urgency = self._clamp(
-                0.006
-                + age_pressure
-                + 0.18 * stop_pressure
-                + 0.10 * take_profit_pressure
-                + 0.06 * adverse_trend
-                + volatility_pressure,
-                0.0,
-                0.42,
-            )
-            desired = min(cohort.mass, cohort.mass * urgency)
-            if desired <= 1e-12:
-                continue
-
-            market_share = self._clamp(
-                0.14
-                + 0.48 * stop_pressure
-                + 0.15 * adverse_trend
-                + 0.20 * latent.volatility / (1.0 + latent.volatility),
-                0.12,
-                0.88,
-            )
-            market_volume = desired * market_share
-            passive_volume = desired - market_volume
-
-            if market_volume > 1e-12:
-                stop_price = self._exit_stop_price(side, current_price)
-                market_orders.append(
-                    _IncomingOrder(
-                        side="sell" if side == "long" else "buy",
-                        kind="long_exit" if side == "long" else "short_exit",
-                        price=stop_price,
-                        volume=market_volume,
-                        cohort_id=cohort.id,
-                    )
-                )
-                intent_volume_by_price[stop_price] = (
-                    intent_volume_by_price.get(stop_price, 0.0) + market_volume
-                )
-
-            if passive_volume <= 1e-12:
-                continue
-            for price, volume in self._passive_exit_kernel(
-                side,
-                cohort,
-                current_price,
-                latent,
-                pnl_ticks,
-                target_ticks,
-                passive_volume,
-            ):
-                limit_orders.append(_ExitOrder(price=price, volume=volume, cohort_id=cohort.id))
-                intent_volume_by_price[price] = intent_volume_by_price.get(price, 0.0) + volume
-
-        return _ExitFlow(
-            market_orders=market_orders,
-            limit_orders=limit_orders,
-            intent_volume_by_price=self._drop_zeroes(intent_volume_by_price),
-        )
-
-    def _cohort_pnl_ticks(
-        self, side: str, cohort: _PositionCohort, current_price: float
-    ) -> float:
-        if side == "long":
-            return (current_price - cohort.entry_price) / self.gap
-        return (cohort.entry_price - current_price) / self.gap
-
-    def _threshold_pressure(self, value: float, scale: float) -> float:
-        if value <= 0:
-            return 0.0
-        scaled = self._clamp(value / max(scale, 1e-12), -50.0, 50.0)
-        return 2.0 * (1.0 / (1.0 + exp(-scaled)) - 0.5)
-
-    def _exit_stop_price(self, side: str, current_price: float) -> float:
-        if side == "long":
-            return max(self._min_price, self._snap_price(current_price - self.gap))
-        return self._snap_price(current_price + self.gap)
-
-    def _passive_exit_kernel(
-        self,
-        side: str,
-        cohort: _PositionCohort,
-        current_price: float,
-        latent: LatentState,
-        pnl_ticks: float,
-        target_ticks: float,
-        volume: float,
-    ) -> list[tuple[float, float]]:
-        if volume <= 1e-12:
-            return []
-        if side == "long":
-            raw_target = cohort.entry_price + target_ticks * self.gap
-            target = max(current_price + self.gap, raw_target)
-            side_floor = current_price + self.gap
-        else:
-            raw_target = cohort.entry_price - target_ticks * self.gap
-            target = min(current_price - self.gap, raw_target)
-            side_floor = max(self._min_price, current_price - self.gap)
-
-        target = self._snap_price(target)
-        min_price = self._snap_price(current_price - self.grid_radius * self.gap)
-        max_price = self._snap_price(current_price + self.grid_radius * self.gap)
-        target = self._clamp(target, max(self._min_price, min_price), max_price)
-        spread_ticks = max(1.1, 1.4 + 1.4 * latent.volatility + 0.08 * abs(pnl_ticks))
-        center_tick = self.price_to_tick(target)
-        candidates: list[tuple[float, float]] = []
-        for offset in range(-2, 3):
-            price = self.tick_to_price(center_tick + offset)
-            if side == "long" and price < side_floor:
-                continue
-            if side == "short" and price > side_floor:
-                continue
-            if price < self._min_price or price < min_price or price > max_price:
-                continue
-            weight = exp(-abs(offset) / spread_ticks)
-            candidates.append((price, weight))
-        total_weight = sum(weight for _, weight in candidates)
-        if total_weight <= 1e-12:
-            fallback = self._snap_price(side_floor)
-            return [(fallback, volume)]
-        return [(price, volume * weight / total_weight) for price, weight in candidates]
-
     def _cancel_orders(
         self,
         current_price: float,
         latent: LatentState,
         micro: _MicrostructureState,
+        mdf: MDFState | None = None,
+        cache: _StepComputationCache | None = None,
     ) -> PriceMap:
+        mdf = mdf or self.state.mdf
         cancelled: PriceMap = {}
-        for side, lots_by_price in (
-            ("bid", self._orderbook.bid_lots),
-            ("ask", self._orderbook.ask_lots),
-        ):
-            for price, lots in list(lots_by_price.items()):
-                survivors = []
-                for lot in lots:
-                    probability = self._lot_cancel_probability(
-                        side,
-                        price,
-                        current_price,
-                        lot,
-                        latent,
-                        micro,
+        for side in ("bid", "ask"):
+            volumes = self._orderbook.volumes_for_side(side)
+            side_weights, cancel_pressure, side_volume = self._cancel_sampling_profile(
+                side,
+                current_price,
+                latent,
+                micro,
+                mdf,
+                cache,
+            )
+            if side_volume <= 1e-12:
+                continue
+            if side_weights:
+                regime = self._active_settings
+                state_multiplier = (
+                    1.0
+                    + 0.50 * micro.cancel_pressure
+                    + 0.28 * micro.liquidity_stress
+                    + 0.17 * micro.spread_pressure
+                )
+                event_probability = self._cancel_event_probability(
+                    side_volume,
+                    cancel_pressure,
+                    micro,
+                )
+                if self._unit_random() < event_probability:
+                    expected_events = (
+                        0.0061
+                        * regime["cancel"]
+                        * state_multiplier
+                        * (0.045 + cancel_pressure)
+                        * side_volume
+                        / max(self._mean_child_order_size(), 1e-12)
+                        / max(event_probability, 1e-12)
                     )
-                    cancel_fraction = probability * self._rng.random()
-                    removed = lot.volume * cancel_fraction
-                    lot.volume -= removed
-                    if removed > 1e-12:
-                        cancelled[price] = cancelled.get(price, 0.0) + removed
-                        self._orderbook.adjust_volume(side, price, -removed)
-                    if lot.volume > 1e-12:
-                        survivors.append(lot)
-                    elif lot.volume > 0:
-                        self._orderbook.adjust_volume(side, price, -lot.volume)
-                if survivors:
-                    lots_by_price[price] = survivors
-                else:
-                    del lots_by_price[price]
+                    event_count = min(
+                        max(1, int(6 + 4 * side_volume + 5 * self.popularity)),
+                        self._sample_poisson(expected_events),
+                    )
+                    for _ in range(event_count):
+                        price = self._sample_price(side_weights)
+                        available = volumes.get(price, 0.0)
+                        if available <= 1e-12:
+                            continue
+                        size_scale = self._clamp(
+                            1.0
+                            - 0.08 * micro.cancel_pressure
+                            - 0.06 * micro.liquidity_stress
+                            - 0.04 * micro.spread_pressure,
+                            0.82,
+                            1.0,
+                        )
+                        requested = min(available, size_scale * self._sample_order_size())
+                        self._cancel_or_requote_volume(
+                            cancelled,
+                            side,
+                            price,
+                            requested,
+                            current_price,
+                            micro,
+                            mdf,
+                        )
+            self._refresh_deep_passive_quotes(
+                cancelled,
+                side,
+                current_price,
+                micro,
+                mdf,
+                cache,
+                side_volume,
+            )
+            self._orderbook.clean()
         cancelled = self._drop_zeroes(cancelled)
         micro.last_cancelled_volume = sum(cancelled.values())
         return cancelled
 
-    def _lot_cancel_probability(
+    def _refresh_deep_passive_quotes(
+        self,
+        cancelled: PriceMap,
+        side: str,
+        current_price: float,
+        micro: _MicrostructureState,
+        mdf: MDFState,
+        cache: _StepComputationCache | None,
+        side_volume: float,
+    ) -> None:
+        if side_volume <= 1e-12:
+            return
+        event_probability = self._deep_refresh_event_probability(side_volume, micro)
+        if self._unit_random() >= event_probability:
+            return
+        volumes = self._orderbook.volumes_for_side(side)
+        deep_prices = sorted(
+            (
+                (self._snap_price(price), max(0.0, volume))
+                for price, volume in volumes.items()
+                if volume > 1e-12
+            ),
+            key=lambda item: abs(item[0] - current_price),
+            reverse=True,
+        )
+        if not deep_prices:
+            return
+
+        activity = self._event_cluster_signal(micro)
+        stress = self._clamp(
+            0.55 * micro.cancel_pressure
+            + 0.35 * micro.liquidity_stress
+            + 0.25 * micro.spread_pressure,
+            0.0,
+            2.5,
+        ) / 2.5
+        mean_child = max(self._mean_child_order_size(), 1e-12)
+        side_cap = side_volume * self._clamp(
+            0.010 + 0.024 * activity + 0.018 * stress,
+            0.010,
+            0.060,
+        )
+        refreshed = 0.0
+        for price, _ in deep_prices:
+            if refreshed >= side_cap:
+                break
+            distance = abs(price - current_price) / self.gap
+            if distance < 4.0:
+                continue
+            actual = max(0.0, volumes.get(price, 0.0))
+            if actual <= 1e-12:
+                continue
+            texture = self._quote_texture(side, price, current_price, distance)
+            texture_fade = 1.0 - self._clamp(texture, 0.0, 1.0)
+            expected = self._expected_mdf_volume_for_price(
+                side,
+                price,
+                mdf,
+                micro=micro,
+                cache=cache,
+            )
+            allowance = self._deep_refresh_allowance(distance) * (0.72 + 0.28 * texture)
+            excess = actual - allowance * expected - (0.14 + 0.08 * texture) * mean_child
+            fade_excess = (
+                actual
+                * texture_fade
+                * texture_fade
+                * self._clamp((distance - 3.0) / 5.0, 0.0, 1.0)
+                - 0.10 * mean_child
+            )
+            excess = max(excess, fade_excess)
+            if excess <= 1e-12:
+                continue
+            deepness = self._clamp((distance - 4.0) / 5.0, 0.0, 1.0)
+            refresh_rate = self._clamp(
+                0.045
+                + 0.055 * deepness
+                + 0.035 * activity
+                + 0.030 * stress
+                + 0.060 * texture_fade,
+                0.035,
+                0.190,
+            )
+            if self._unit_random() >= refresh_rate:
+                continue
+            requested = min(
+                excess * refresh_rate,
+                actual * (0.08 + 0.05 * deepness + 0.10 * texture_fade),
+                mean_child * (0.36 + 0.36 * activity + 0.20 * texture_fade),
+                side_cap - refreshed,
+            )
+            removed = self._cancel_or_requote_volume(
+                cancelled,
+                side,
+                price,
+                requested,
+                current_price,
+                micro,
+                mdf,
+            )
+            refreshed += removed
+
+    def _refresh_post_event_deep_quotes(
+        self,
+        cancelled: PriceMap,
+        current_price: float,
+        micro: _MicrostructureState,
+        mdf: MDFState,
+        cache: _StepComputationCache | None,
+    ) -> None:
+        for side in ("bid", "ask"):
+            volumes = self._orderbook.volumes_for_side(side)
+            side_volume = sum(max(0.0, volume) for volume in volumes.values())
+            self._refresh_deep_passive_quotes(
+                cancelled,
+                side,
+                current_price,
+                micro,
+                mdf,
+                cache,
+                side_volume,
+            )
+            self._orderbook.clean()
+
+    def _deep_refresh_event_probability(
+        self,
+        side_volume: float,
+        micro: _MicrostructureState,
+    ) -> float:
+        if side_volume <= 1e-12:
+            return 0.0
+        activity = self._event_cluster_signal(micro)
+        stress = self._clamp(
+            0.55 * micro.cancel_pressure
+            + 0.35 * micro.liquidity_stress
+            + 0.25 * micro.spread_pressure,
+            0.0,
+            2.5,
+        ) / 2.5
+        volume_term = 1.0 - exp(-side_volume / max(10.0 + 7.0 * self.popularity, 1e-12))
+        probability = 0.016 + 0.090 * activity + 0.070 * stress + 0.065 * volume_term
+        return self._clamp(probability, 0.0, 0.30)
+
+    def _deep_refresh_allowance(self, distance: float) -> float:
+        return self._clamp(1.65 - 0.12 * max(0.0, distance - 4.0), 1.08, 1.65)
+
+    def _quote_texture(
         self,
         side: str,
         price: float,
         current_price: float,
-        lot: _OrderLot,
+        distance: float,
+    ) -> float:
+        tick = self.price_to_tick(price)
+        current_tick = self.price_to_tick(current_price)
+        seed = 0.0 if self._seed is None else float(self._seed)
+        step_index = float(self.state.step_index + 1)
+        side_seed = 0.43 if side == "bid" else 1.11
+        primary = 0.5 + 0.5 * sin(
+            tick * 12.9898
+            + current_tick * 0.071
+            + step_index * 0.521
+            + seed * 0.0031
+            + side_seed
+        )
+        secondary = 0.5 + 0.5 * sin(
+            tick * 4.231
+            + current_tick * 0.173
+            + step_index * 0.197
+            + seed * 0.017
+            + side_seed * 3.0
+        )
+        texture = 0.64 * primary + 0.36 * secondary
+        if distance <= 2.0:
+            return self._clamp(0.92 + 0.14 * texture, 0.92, 1.06)
+        if distance <= 4.0:
+            return self._clamp(0.58 + 0.58 * texture, 0.58, 1.12)
+        return self._clamp(0.34 + 0.80 * texture, 0.34, 1.12)
+
+    def _level_cancel_probability(
+        self,
+        side: str,
+        price: float,
+        current_price: float,
         latent: LatentState,
         micro: _MicrostructureState,
+        mdf: MDFState | None = None,
     ) -> float:
-        regime = self._regime_settings(self._active_regime)
+        regime = self._active_settings
         distance = abs(price - current_price) / self.gap
         adverse_side = (side == "bid" and latent.trend < 0) or (side == "ask" and latent.trend > 0)
         adverse = abs(latent.trend) if adverse_side else 0.0
-        age_term = 0.075 * (1.0 - exp(-lot.age / 9.0))
         distance_term = 0.045 * (1.0 - exp(-distance / 5.0))
         volatility_term = 0.026 * latent.volatility / (1.0 + latent.volatility)
+        side_stress = self._stress_for_book_side(side, micro)
+        stress_cancel = 0.12 * micro.liquidity_stress * side_stress * exp(-distance / 2.4)
+        mismatch = self._mdf_cancel_mismatch(side, price, mdf or self.state.mdf, micro=micro)
+        survival_weakness = self._resting_level_survival_weakness(
+            side, price, current_price, latent, micro
+        )
+        survival_cancel = (
+            0.12 * survival_weakness + 0.20 * mismatch
+        ) * (0.72 + 0.28 * exp(-distance / 3.0))
         probability = (
             0.016
-            + age_term
             + distance_term
             + volatility_term
             + self._cancel_burst_multiplier(micro, distance, adverse)
+            + stress_cancel
+            + survival_cancel
         ) * regime["cancel"]
-        return self._clamp(probability, 0.01, 0.55)
+        return self._clamp(probability, 0.006, 0.32)
+
+    def _cancel_side_pressure(
+        self,
+        side: str,
+        current_price: float,
+        micro: _MicrostructureState,
+        mdf: MDFState,
+        cache: _StepComputationCache | None = None,
+    ) -> float:
+        volumes = self._orderbook.volumes_for_side(side)
+        side_volume = sum(max(0.0, volume) for volume in volumes.values())
+        if side_volume <= 1e-12:
+            return 0.0
+        weighted_pressure = 0.0
+        for price, volume in volumes.items():
+            if volume <= 1e-12:
+                continue
+            weighted_pressure += volume * self._cancel_price_pressure(
+                side,
+                price,
+                current_price,
+                micro,
+                mdf,
+                cache,
+                side_volume=side_volume,
+            )
+        return self._clamp(weighted_pressure / side_volume, 0.0, 1.25)
+
+    def _cancel_event_probability(
+        self,
+        side_volume: float,
+        cancel_pressure: float,
+        micro: _MicrostructureState,
+    ) -> float:
+        if side_volume <= 1e-12:
+            return 0.0
+        volume_term = 1.0 - exp(-side_volume / max(7.5 + 6.0 * self.popularity, 1e-12))
+        mismatch_term = 1.0 - exp(-cancel_pressure / 0.42)
+        probability = (
+            0.032
+            + 0.35 * mismatch_term
+            + 0.18 * volume_term
+            + 0.12 * self._clamp(micro.cancel_pressure, 0.0, 2.0) / 2.0
+            + 0.09 * self._clamp(micro.liquidity_stress, 0.0, 2.0) / 2.0
+            + 0.05 * self._clamp(micro.spread_pressure, 0.0, 1.8) / 1.8
+        )
+        probability *= 0.82 + 0.46 * self._event_cluster_signal(micro)
+        return self._clamp(probability, 0.035, 0.86)
+
+    def _cancel_price_pressure(
+        self,
+        side: str,
+        price: float,
+        current_price: float,
+        micro: _MicrostructureState,
+        mdf: MDFState,
+        cache: _StepComputationCache | None = None,
+        side_volume: float | None = None,
+        current_tick: int | None = None,
+    ) -> float:
+        distance = abs(price - current_price) / self.gap
+        mismatch = self._mdf_cancel_mismatch(
+            side,
+            price,
+            mdf,
+            micro=micro,
+            cache=cache,
+            side_volume=side_volume,
+        )
+        side_stress = self._stress_for_book_side(side, micro)
+        stress = micro.liquidity_stress * side_stress * exp(-distance / 2.5)
+        survival_weakness = self._resting_level_survival_weakness(
+            side,
+            price,
+            current_price,
+            LatentState(mood=0.0, trend=0.0, volatility=0.0),
+            micro,
+            cache,
+            current_tick,
+        )
+        near_touch = exp(-max(0.0, distance - 1.0) / 1.0)
+        deep_stale = self._clamp((distance - 3.0) / 3.0, 0.0, 1.0)
+        distance_pressure = 1.0 - exp(-max(0.0, distance - 2.0) / 2.2)
+        near_alignment = (
+            near_touch
+            * (1.0 - mismatch)
+            * (1.0 - 0.45 * self._clamp(stress, 0.0, 1.0))
+            * (1.0 + 0.30 * near_touch)
+        )
+        stale_pressure = distance_pressure * survival_weakness * (1.0 + 0.65 * deep_stale)
+        return self._clamp(
+            0.015
+            + 0.74 * mismatch
+            + 0.20 * stress
+            + 0.08 * survival_weakness
+            + 0.52 * distance_pressure
+            + 0.26 * stale_pressure
+            + 0.10 * deep_stale
+            - 0.16 * near_alignment,
+            0.0,
+            1.25,
+        )
+
+    def _cancel_sampling_weights(
+        self,
+        side: str,
+        current_price: float,
+        latent: LatentState,
+        micro: _MicrostructureState,
+        mdf: MDFState,
+        cache: _StepComputationCache | None = None,
+    ) -> PriceMap:
+        weights, _, _ = self._cancel_sampling_profile(
+            side,
+            current_price,
+            latent,
+            micro,
+            mdf,
+            cache,
+        )
+        return weights
+
+    def _cancel_sampling_profile(
+        self,
+        side: str,
+        current_price: float,
+        latent: LatentState,
+        micro: _MicrostructureState,
+        mdf: MDFState,
+        cache: _StepComputationCache | None = None,
+    ) -> tuple[PriceMap, float, float]:
+        del latent
+        volumes = self._orderbook.volumes_for_side(side)
+        side_volume = sum(max(0.0, volume) for volume in volumes.values())
+        if side_volume <= 1e-12:
+            return {}, 0.0, 0.0
+
+        weights: PriceMap = {}
+        weighted_pressure = 0.0
+        current_tick = self.price_to_tick(current_price)
+        for price, volume in volumes.items():
+            if volume <= 1e-12:
+                continue
+            pressure = self._cancel_price_pressure(
+                side,
+                price,
+                current_price,
+                micro,
+                mdf,
+                cache,
+                side_volume=side_volume,
+                current_tick=current_tick,
+            )
+            weighted_pressure += volume * pressure
+            weights[price] = volume * pressure
+        pressure = self._clamp(weighted_pressure / side_volume, 0.0, 1.25)
+        return (self._normalize_price_map(weights) if weights else {}, pressure, side_volume)
+
+    def _mdf_cancel_mismatch(
+        self,
+        side: str,
+        price: float,
+        mdf: MDFState,
+        *,
+        micro: _MicrostructureState | None = None,
+        cache: _StepComputationCache | None = None,
+        side_volume: float | None = None,
+    ) -> float:
+        volumes = self._orderbook.volumes_for_side(side)
+        side_volume = (
+            sum(max(0.0, volume) for volume in volumes.values())
+            if side_volume is None
+            else side_volume
+        )
+        if side_volume <= 1e-12:
+            return 0.0
+        price = self._snap_price(price)
+        book_share = max(0.0, volumes.get(price, 0.0)) / side_volume
+        probabilities = self._entry_probabilities_for_book_side(side, mdf, cache)
+        mdf_share = probabilities.get(price, 0.0)
+        excess_book = max(0.0, book_share - mdf_share)
+        unsupported = 1.0 - self._clamp(mdf_share / max(book_share, 1e-12), 0.0, 1.0)
+        expected = self._expected_mdf_volume_for_price(side, price, mdf, micro=micro, cache=cache)
+        actual = max(0.0, volumes.get(price, 0.0))
+        absolute_excess = max(0.0, actual - expected) / max(actual + expected, 1e-12)
+        return self._clamp(
+            0.48 * excess_book + 0.24 * unsupported + 0.28 * absolute_excess,
+            0.0,
+            1.0,
+        )
+
+    def _expected_mdf_side_depth(
+        self,
+        side: str,
+        *,
+        micro: _MicrostructureState | None = None,
+        cache: _StepComputationCache | None = None,
+    ) -> float:
+        if cache is not None and cache.micro is micro and side in cache.expected_depth_by_side:
+            return cache.expected_depth_by_side[side]
+        regime = self._active_settings
+        micro = micro or self._microstructure
+        side_stress = self._stress_for_book_side(side, micro)
+        stress_drag = self._clamp(
+            1.0 - 0.28 * self._clamp(micro.liquidity_stress * side_stress, 0.0, 2.0) / 2.0,
+            0.45,
+            1.15,
+        )
+        resiliency = self._clamp(micro.resiliency, 0.20, 1.55)
+        depth = max(
+            0.20,
+            self.popularity
+            * regime["liquidity"]
+            * regime["near_touch_liquidity"]
+            * resiliency
+            * stress_drag
+            * (7.5 + 0.35 * self.grid_radius),
+        )
+        if cache is not None and cache.micro is micro:
+            cache.expected_depth_by_side[side] = depth
+        return depth
+
+    def _expected_mdf_volume_for_price(
+        self,
+        side: str,
+        price: float,
+        mdf: MDFState,
+        *,
+        micro: _MicrostructureState | None = None,
+        cache: _StepComputationCache | None = None,
+    ) -> float:
+        price = self._snap_price(price)
+        cache_key = (side, price)
+        if (
+            cache is not None
+            and cache.mdf is mdf
+            and cache_key in cache.expected_volume_by_side_price
+        ):
+            return cache.expected_volume_by_side_price[cache_key]
+        probabilities = self._entry_probabilities_for_book_side(side, mdf, cache)
+        expected = self._expected_mdf_side_depth(
+            side,
+            micro=micro,
+            cache=cache,
+        ) * probabilities.get(price, 0.0)
+        if cache is not None and cache.mdf is mdf:
+            cache.expected_volume_by_side_price[cache_key] = expected
+        return expected
+
+    def _cancel_price_volume(
+        self,
+        cancelled: PriceMap,
+        side: str,
+        price: float,
+        requested: float,
+    ) -> float:
+        volume_by_price = self._orderbook.volumes_for_side(side)
+        removed = min(max(0.0, requested), max(0.0, volume_by_price.get(price, 0.0)))
+        if removed <= 1e-12:
+            return 0.0
+        cancelled[price] = cancelled.get(price, 0.0) + removed
+        self._orderbook.adjust_volume(side, price, -removed)
+        return removed
+
+    def _cancel_or_requote_volume(
+        self,
+        cancelled: PriceMap,
+        side: str,
+        price: float,
+        requested: float,
+        current_price: float,
+        micro: _MicrostructureState,
+        mdf: MDFState,
+    ) -> float:
+        should_requote = self._unit_random() < self._cancel_requote_probability(
+            side,
+            price,
+            current_price,
+            micro,
+            mdf,
+        )
+        destination_weights = (
+            self._cancel_requote_sampling_weights(
+                side,
+                current_price,
+                price,
+                mdf,
+                micro,
+            )
+            if should_requote
+            else {}
+        )
+        removed = self._cancel_price_volume(cancelled, side, price, requested)
+        if removed <= 1e-12:
+            return 0.0
+        if not destination_weights:
+            return removed
+        destination = self._sample_price(destination_weights)
+        self._orderbook.add_lot(destination, removed, side, "requote")
+        return removed
+
+    def _cancel_requote_probability(
+        self,
+        side: str,
+        price: float,
+        current_price: float,
+        micro: _MicrostructureState,
+        mdf: MDFState,
+    ) -> float:
+        probabilities = self._normalized_price_probabilities(
+            mdf.buy_entry_mdf_by_price if side == "bid" else mdf.sell_entry_mdf_by_price
+        )
+        if not probabilities:
+            return 0.0
+        price = self._snap_price(price)
+        max_support = max(probabilities.values())
+        support = probabilities.get(price, 0.0) / max(max_support, 1e-12)
+        mismatch = self._mdf_cancel_mismatch(side, price, mdf, micro=micro)
+        distance = abs(price - current_price) / self.gap
+        distance_drag = 1.0 - exp(-max(0.0, distance - 2.0) / 2.5)
+        spread_ticks = self._current_spread_ticks()
+        spread_opportunity = self._clamp((spread_ticks - 1.0) / 4.0, 0.0, 1.0)
+        side_stress = self._stress_for_book_side(side, micro)
+        probability = (
+            0.07
+            + 0.22 * support
+            + 0.08 * self._clamp(micro.resiliency, 0.0, 1.4) / 1.4
+            + 0.09 * spread_opportunity
+            - 0.16 * mismatch
+            - 0.10 * self._clamp(micro.cancel_pressure, 0.0, 2.0) / 2.0
+            - 0.10 * self._clamp(micro.liquidity_stress * side_stress, 0.0, 2.0) / 2.0
+            - 0.07 * distance_drag
+        )
+        return self._clamp(probability, 0.0, 0.30)
+
+    def _cancel_requote_sampling_weights(
+        self,
+        side: str,
+        current_price: float,
+        old_price: float,
+        mdf: MDFState,
+        micro: _MicrostructureState,
+    ) -> PriceMap:
+        probabilities = self._normalized_price_probabilities(
+            mdf.buy_entry_mdf_by_price if side == "bid" else mdf.sell_entry_mdf_by_price
+        )
+        weights: PriceMap = {}
+        old_price = self._snap_price(old_price)
+        spread_ticks = self._current_spread_ticks()
+        wide_spread_bonus = self._clamp((spread_ticks - 2.0) / 4.0, 0.0, 0.80)
+        spread_pressure = self._clamp(micro.spread_pressure, 0.0, 1.8) / 1.8
+        stress = self._clamp(micro.liquidity_stress, 0.0, 2.0) / 2.0
+        stress_drag = self._clamp(
+            1.0
+            - 0.18 * self._clamp(micro.cancel_pressure, 0.0, 2.0) / 2.0
+            - 0.12 * stress,
+            0.55,
+            1.0,
+        )
+        for price, probability in probabilities.items():
+            if price == old_price:
+                continue
+            if side == "bid":
+                if price >= current_price or price < self._min_price:
+                    continue
+                distance = (current_price - price) / self.gap
+            elif price <= current_price:
+                continue
+            else:
+                distance = (price - current_price) / self.gap
+            near_touch_bias = 0.55 + 1.45 * exp(-max(0.0, distance - 1.0) / 1.25)
+            if distance <= 2.0:
+                near_touch_bias *= 1.0 + wide_spread_bonus * (
+                    0.25
+                    + 0.18 * self._clamp(micro.resiliency, 0.0, 1.4) / 1.4
+                    + 0.10 * spread_pressure
+                )
+            deep_drag = 1.0 / (
+                1.0 + (0.10 + 0.18 * stress) * max(0.0, distance - 3.0)
+            )
+            weights[price] = probability * near_touch_bias * stress_drag * deep_drag
+        return self._normalize_price_map(weights) if weights else {}
+
+    def _resting_level_survival_weakness(
+        self,
+        side: str,
+        price: float,
+        current_price: float,
+        latent: LatentState,
+        micro: _MicrostructureState,
+        cache: _StepComputationCache | None = None,
+        current_tick: int | None = None,
+    ) -> float:
+        distance = abs(price - current_price) / self.gap
+        if current_tick is None:
+            current_tick = self.price_to_tick(current_price)
+        tick = self.price_to_tick(price) - current_tick
+        signals = self._cached_mdf_signals(current_price, cache)
+        if side == "bid":
+            shortage = signals.bid_shortage_by_tick.get(tick, 0.0)
+            adverse = max(0.0, -latent.trend)
+        else:
+            shortage = signals.ask_shortage_by_tick.get(tick, 0.0)
+            adverse = max(0.0, latent.trend)
+        distance_weakness = self._clamp(
+            (distance - 1.0) / max(float(self.grid_radius), 1.0),
+            0.0,
+            1.0,
+        )
+        side_stress = self._stress_for_book_side(side, micro)
+        return self._clamp(
+            0.35 * distance_weakness
+            + 0.22 * shortage
+            + 0.24 * adverse
+            + 0.19 * micro.liquidity_stress * side_stress,
+            0.0,
+            1.0,
+        )
+
+    def _stress_for_book_side(self, side: str, micro: _MicrostructureState) -> float:
+        if side == "ask":
+            return self._clamp(max(0.0, micro.stress_side), 0.0, 1.0)
+        return self._clamp(max(0.0, -micro.stress_side), 0.0, 1.0)
 
     def _cancel_burst_multiplier(
         self,
@@ -2057,7 +3824,109 @@ class Market:
     ) -> float:
         vulnerability = 0.65 + 0.10 * min(distance, 6.0) + 0.45 * adverse
         pressure = 1.0 - exp(-micro.cancel_pressure)
-        return 0.050 * pressure * vulnerability
+        return 0.026 * pressure * vulnerability
+
+    def _add_post_event_quote_arrivals(
+        self,
+        current_price: float,
+        latent: LatentState,
+        micro: _MicrostructureState,
+        stats: _TradeStats,
+        flow_imbalance: float,
+        mdf: MDFState | None = None,
+        cache: _StepComputationCache | None = None,
+    ) -> None:
+        if self.popularity <= 0:
+            return
+        mdf = mdf or self.state.mdf
+        regime = self._active_settings
+        stress_drag = 1.0 - 0.18 * self._clamp(micro.liquidity_stress, 0.0, 1.0)
+        idle_maker_flow = (
+            self.popularity
+            * (0.12 + 0.13 / (1.0 + latent.volatility))
+            * regime["liquidity"]
+            * micro.resiliency
+            * stress_drag
+        )
+        execution_refill = (
+            stats.total_volume
+            * regime["liquidity"]
+            * micro.resiliency
+            * (0.13 + 0.07 / (1.0 + latent.volatility))
+        )
+        repair_drag = self._clamp(
+            1.0
+            - 0.22 * self._clamp(micro.liquidity_stress, 0.0, 2.0) / 2.0
+            - 0.14 * self._clamp(micro.cancel_pressure, 0.0, 2.0) / 2.0,
+            0.62,
+            1.0,
+        )
+        spread_repair = (
+            self.popularity
+            * regime["liquidity"]
+            * micro.resiliency
+            * 0.10
+            * repair_drag
+            * self._clamp((self._current_spread_ticks(cache) - 1.0) / 4.0, 0.0, 1.0)
+        )
+        base = idle_maker_flow + execution_refill + spread_repair
+        if base <= 1e-12:
+            return
+        generic_base = 0.76 * base
+        spread_gap = self._clamp((self._current_spread_ticks(cache) - 1.0) / 4.0, 0.0, 1.0)
+        front_base = base * self._clamp(
+            0.18
+            + 0.28 * spread_gap
+            + 0.08 * self._clamp(micro.liquidity_stress, 0.0, 2.0) / 2.0,
+            0.14,
+            0.48,
+        )
+        bid_tilt = self._replenishment_side_tilt("bid", flow_imbalance, latent, micro)
+        ask_tilt = self._replenishment_side_tilt("ask", flow_imbalance, latent, micro)
+        bid_target = generic_base * bid_tilt
+        ask_target = generic_base * ask_tilt
+        self._add_sampled_replenishment(
+            "bid",
+            "buy_entry",
+            current_price,
+            bid_target,
+            mdf,
+            latent,
+            micro,
+            cache,
+        )
+        self._add_sampled_replenishment(
+            "ask",
+            "sell_entry",
+            current_price,
+            ask_target,
+            mdf,
+            latent,
+            micro,
+            cache,
+        )
+        self._add_sampled_replenishment(
+            "bid",
+            "buy_entry",
+            current_price,
+            front_base * bid_tilt,
+            mdf,
+            latent,
+            micro,
+            cache,
+            max_passive_distance=2,
+        )
+        self._add_sampled_replenishment(
+            "ask",
+            "sell_entry",
+            current_price,
+            front_base * ask_tilt,
+            mdf,
+            latent,
+            micro,
+            cache,
+            max_passive_distance=2,
+        )
 
     def _add_liquidity_replenishment(
         self,
@@ -2065,72 +3934,268 @@ class Market:
         latent: LatentState,
         imbalance: float,
         micro: _MicrostructureState,
+        mdf: MDFState | None = None,
     ) -> None:
-        regime = self._regime_settings(self._active_regime)
-        base = (
-            self.popularity
-            * (0.18 + 0.20 / (1.0 + latent.volatility))
-            * regime["liquidity"]
-            * micro.resiliency
+        self._add_post_event_quote_arrivals(
+            current_price,
+            latent,
+            micro,
+            _TradeStats(executed_by_price={}),
+            imbalance,
+            mdf,
+            None,
         )
-        depth = min(13, self.grid_radius + 1)
-        current_tick = self.price_to_tick(current_price)
-        for level in range(1, depth):
-            bid_volume = self._replenishment_volume_for_level(
-                level,
-                "bid",
-                current_tick,
-                base,
-                imbalance,
-                latent,
-                micro,
+
+    def _add_post_trade_replenishment(
+        self,
+        current_price: float,
+        latent: LatentState,
+        micro: _MicrostructureState,
+        stats: _TradeStats,
+        flow_imbalance: float,
+        mdf: MDFState | None = None,
+    ) -> None:
+        self._add_post_event_quote_arrivals(
+            current_price,
+            latent,
+            micro,
+            stats,
+            flow_imbalance,
+            mdf,
+            None,
+        )
+
+    def _replenishment_side_tilt(
+        self,
+        side: str,
+        imbalance: float,
+        latent: LatentState,
+        micro: _MicrostructureState,
+    ) -> float:
+        side_tilt = imbalance if side == "bid" else -imbalance
+        trend_tilt = latent.trend if side == "bid" else -latent.trend
+        pressure_drag = self._clamp(1.0 - 0.16 * micro.cancel_pressure, 0.35, 1.0)
+        stress_drag = self._stress_replenishment_multiplier(side, 1, micro)
+        spread_drag = self._clamp(1.0 - 0.06 * micro.spread_pressure, 0.78, 1.0)
+        return pressure_drag * stress_drag * self._clamp(
+            0.58 + 0.18 * side_tilt + 0.09 * trend_tilt,
+            0.08,
+            1.05,
+        ) * spread_drag
+
+    def _add_sampled_replenishment(
+        self,
+        side: str,
+        kind: str,
+        current_price: float,
+        target_volume: float,
+        mdf: MDFState,
+        latent: LatentState,
+        micro: _MicrostructureState,
+        cache: _StepComputationCache | None = None,
+        max_passive_distance: int | None = None,
+    ) -> None:
+        if target_volume <= 1e-12:
+            return
+        weights = self._replenishment_sampling_weights(
+            side,
+            current_price,
+            mdf,
+            latent,
+            micro,
+            cache,
+            max_passive_distance=max_passive_distance,
+        )
+        if not weights:
+            return
+        event_probability = self._replenishment_event_probability(target_volume, micro)
+        if self._unit_random() >= event_probability:
+            return
+        effective_target = target_volume / max(event_probability, 1e-12)
+        event_count = self._sample_order_count(
+            effective_target,
+            max_count=max(1, int(4 + 5 * effective_target + 2 * self.popularity)),
+        )
+        if event_count <= 0:
+            return
+        volume_by_price: PriceMap = {}
+        for _ in range(event_count):
+            price = self._sample_price(weights)
+            volume = self._sample_order_size()
+            volume_by_price[price] = volume_by_price.get(price, 0.0) + volume
+        if volume_by_price:
+            self._add_lots(volume_by_price, side, kind)
+
+    def _replenishment_event_probability(
+        self,
+        target_volume: float,
+        micro: _MicrostructureState,
+    ) -> float:
+        if target_volume <= 1e-12:
+            return 0.0
+        if self.popularity >= 10.0 and target_volume >= 0.25:
+            return 1.0
+        if target_volume >= 1.0:
+            return 1.0
+        pressure_drag = 1.0 - 0.16 * self._clamp(micro.cancel_pressure, 0.0, 2.0) / 2.0
+        stress_drag = 1.0 - 0.10 * self._clamp(micro.liquidity_stress, 0.0, 2.0) / 2.0
+        spread_drag = 1.0 - 0.03 * self._clamp(micro.spread_pressure, 0.0, 1.8) / 1.8
+        probability = (
+            0.10
+            + 0.54 * (1.0 - exp(-target_volume / 0.42))
+            + 0.08 * self.popularity / (1.0 + self.popularity)
+        ) * pressure_drag * stress_drag * spread_drag
+        probability *= 0.88 + 0.26 * self._event_cluster_signal(micro)
+        return self._clamp(probability, 0.07, 0.92)
+
+    def _replenishment_sampling_weights(
+        self,
+        side: str,
+        current_price: float,
+        mdf: MDFState,
+        latent: LatentState,
+        micro: _MicrostructureState,
+        cache: _StepComputationCache | None = None,
+        max_passive_distance: int | None = None,
+    ) -> PriceMap:
+        del latent
+        probabilities = self._entry_probabilities_for_book_side(side, mdf, cache)
+        weights: PriceMap = {}
+        spread_ticks = self._current_spread_ticks(cache)
+        spread_pressure = self._clamp(micro.spread_pressure, 0.0, 1.8) / 1.8
+        wide_spread_bonus = self._clamp((spread_ticks - 2.0) / 4.0, 0.0, 0.80)
+        side_stress = self._stress_for_book_side(side, micro)
+        near_stress_drag = self._clamp(
+            1.0 - 0.10 * spread_pressure - 0.04 * micro.liquidity_stress * side_stress,
+            0.80,
+            1.30,
+        )
+        volumes = self._orderbook.volumes_for_side(side)
+        for price, probability in probabilities.items():
+            if side == "bid":
+                if price >= current_price or price < self._min_price:
+                    continue
+                distance = (current_price - price) / self.gap
+            elif price <= current_price:
+                continue
+            else:
+                distance = (price - current_price) / self.gap
+            if max_passive_distance is not None and distance > max_passive_distance:
+                continue
+            near_touch_bias = 0.78 + 2.10 * exp(-max(0.0, distance - 1.0) / 1.35)
+            if distance <= 2.0:
+                quote_improvement = 1.0 + (
+                    0.46
+                    * wide_spread_bonus
+                    * micro.resiliency
+                    * self._clamp(1.0 - 0.35 * spread_pressure, 0.45, 1.0)
+                )
+                near_touch_bias *= quote_improvement * near_stress_drag
+            expected = self._expected_mdf_volume_for_price(
+                side,
+                price,
+                mdf,
+                micro=micro,
+                cache=cache,
             )
-            ask_volume = self._replenishment_volume_for_level(
-                level,
-                "ask",
-                current_tick,
-                base,
-                imbalance,
-                latent,
-                micro,
+            actual = max(0.0, volumes.get(price, 0.0))
+            scale = max(expected, self._mean_child_order_size(), 1e-12)
+            shortage = max(0.0, expected - actual) / scale
+            overdepth = max(0.0, actual - expected) / scale
+            shortage_gain = 0.82 + 0.16 * wide_spread_bonus if distance <= 2.0 else 0.58
+            overdepth_penalty = 0.98 + 0.26 * self._clamp(distance - 3.0, 0.0, 4.0)
+            depth_tilt = (1.0 + shortage_gain * self._clamp(shortage, 0.0, 2.0)) / (
+                1.0 + overdepth_penalty * self._clamp(overdepth, 0.0, 3.2)
             )
-            self._add_lots(
-                {self._snap_price(current_price - level * self.gap): bid_volume}, "bid", "buy_entry"
+            stress_tail = self._clamp(
+                micro.liquidity_stress + 0.70 * micro.spread_pressure,
+                0.0,
+                2.4,
+            ) / 2.4
+            deep_tail_drag = 1.0 / (1.0 + 0.34 * stress_tail * max(0.0, distance - 5.0))
+            texture = self._quote_texture(side, price, current_price, distance)
+            weights[price] = (
+                probability
+                * near_touch_bias
+                * depth_tilt
+                * deep_tail_drag
+                * texture
             )
-            self._add_lots(
-                {self._snap_price(current_price + level * self.gap): ask_volume},
-                "ask",
-                "sell_entry",
-            )
+        if weights:
+            return self._normalize_price_map(weights)
+        return {}
 
     def _replenishment_volume_for_level(
         self,
         level: int,
         side: str,
-        current_tick: int,
         base: float,
         imbalance: float,
         latent: LatentState,
         micro: _MicrostructureState,
+        mdf: MDFState | None = None,
+        current_price: float | None = None,
     ) -> float:
-        regime = self._regime_settings(self._active_regime)
-        near_touch = regime["near_touch_liquidity"] if level <= 2 else 1.0
-        shape = base * near_touch / (level ** regime["depth_exponent"])
+        regime = self._active_settings
+        current_price = self.state.price if current_price is None else current_price
+        shape = base * self._mdf_replenishment_shape(side, level, current_price, mdf)
         side_tilt = imbalance if side == "bid" else -imbalance
         trend_tilt = latent.trend if side == "bid" else -latent.trend
-        tick = -level if side == "bid" else level
-        wall = 1.0 + regime["wall_strength"] * self._wall_pressure_at_relative_tick(
-            micro,
-            current_tick,
-            tick,
-        )
         pressure_drag = self._clamp(1.0 - 0.16 * micro.cancel_pressure, 0.35, 1.0)
         level_noise = self._book_level_noise(regime["book_noise"])
-        return shape * wall * pressure_drag * self._clamp(
+        stress_drag = self._stress_replenishment_multiplier(side, level, micro)
+        volume = shape * pressure_drag * stress_drag * self._clamp(
             1.0 + 0.20 * side_tilt + 0.10 * trend_tilt,
             0.45,
             1.65,
         ) * level_noise
+        cap = max(0.025, self.popularity * 0.45 / (1.0 + 0.18 * level))
+        return min(volume, cap)
+
+    def _mdf_replenishment_shape(
+        self,
+        side: str,
+        level: int,
+        current_price: float,
+        mdf: MDFState | None,
+    ) -> float:
+        del mdf
+        regime = self._active_settings
+        baseline = 0.25 * regime["near_touch_liquidity"] / (
+            max(1.0, float(level)) ** (regime["depth_exponent"] + 0.20)
+        )
+        signals = self._mdf_signals(current_price)
+        tick = -level if side == "bid" else level
+        if side == "bid":
+            shortage = signals.bid_shortage_by_tick.get(tick, 0.0)
+            front = signals.bid_front_by_tick.get(tick, 0.0)
+            gap = signals.bid_gap_by_tick.get(tick, 0.0)
+        else:
+            shortage = signals.ask_shortage_by_tick.get(tick, 0.0)
+            front = signals.ask_front_by_tick.get(tick, 0.0)
+            gap = signals.ask_gap_by_tick.get(tick, 0.0)
+        repair_signal = self._clamp(0.40 * shortage + 0.28 * front + 0.18 * gap, 0.0, 1.0)
+        side_stress = self._stress_for_book_side(side, self._microstructure)
+        stress_avoidance = self._clamp(signals.liquidity_stress * side_stress, 0.0, 1.0)
+        maker_willingness = self._clamp(
+            0.72 + 0.36 * signals.resiliency + 0.22 * repair_signal - 0.58 * stress_avoidance,
+            0.10,
+            1.45,
+        )
+        return baseline * maker_willingness
+
+    def _stress_replenishment_multiplier(
+        self,
+        side: str,
+        level: int,
+        micro: _MicrostructureState,
+    ) -> float:
+        side_stress = self._stress_for_book_side(side, micro)
+        if side_stress <= 1e-12 or micro.liquidity_stress <= 1e-12:
+            return 1.0
+        near_touch = exp(-max(0, level - 1) / 2.0)
+        drag = 0.62 * micro.liquidity_stress * side_stress * near_touch
+        return self._clamp(1.0 - drag, 0.18, 1.0)
 
     def _book_level_noise(self, sigma: float) -> float:
         if sigma <= 0:
@@ -2141,98 +4206,50 @@ class Market:
             2.10,
         )
 
-    def _update_wall_memory_from_book(
-        self,
-        current_price: float,
-        micro: _MicrostructureState,
-    ) -> None:
-        orderbook = self._snapshot_orderbook()
-        current_tick = self.price_to_tick(current_price)
-        relative = self._price_map_to_relative_ticks(
-            current_price,
-            self._merge_maps(
-                orderbook.bid_volume_by_price,
-                orderbook.ask_volume_by_price,
-            ),
-        )
-        positive = [volume for volume in relative.values() if volume > 1e-12]
-        if not positive:
-            micro.wall_pressure_by_absolute_tick = self._decay_wall_pressure(
-                micro.wall_pressure_by_absolute_tick,
-                self._regime_settings(self._active_regime),
-            )
-            return
-        baseline = sorted(positive)[len(positive) // 2]
-        updated = dict(micro.wall_pressure_by_absolute_tick)
-        # Wall pressure is anchored by absolute tick so walls can be consumed or left behind.
-        for relative_tick, volume in relative.items():
-            if relative_tick == 0 or abs(relative_tick) > self.grid_radius:
-                continue
-            prominence = self._clamp(volume / max(baseline, 1e-12) - 1.0, 0.0, 4.0)
-            absolute_tick = current_tick + relative_tick
-            if absolute_tick < 1:
-                continue
-            old = updated.get(absolute_tick, 0.0)
-            updated[absolute_tick] = self._clamp(0.86 * old + 0.14 * prominence, 0.0, 3.0)
-        micro.wall_pressure_by_absolute_tick = {
-            tick: pressure
-            for tick, pressure in updated.items()
-            if pressure > 1e-4 and abs(tick - current_tick) <= 2 * self.grid_radius
-        }
-
-    def _wall_pressure_at_relative_tick(
-        self,
-        micro: _MicrostructureState,
-        current_tick: int,
-        relative_tick: int,
-    ) -> float:
-        return micro.wall_pressure_by_absolute_tick.get(current_tick + relative_tick, 0.0)
-
     def _add_lots(self, volume_by_price: PriceMap, side: str, kind: str) -> None:
         self._orderbook.add_lots(volume_by_price, side, kind)
-
-    def _add_exit_orders(self, orders: list[_ExitOrder], side: str, kind: str) -> None:
-        for order in orders:
-            self._orderbook.add_lot(
-                order.price,
-                order.volume,
-                side,
-                kind,
-                cohort_id=order.cohort_id,
-            )
 
     def _execute_market_flows(
         self,
         *,
         entry_orders: list[_IncomingOrder],
-        short_exit_market_orders: list[_IncomingOrder],
-        long_exit_market_orders: list[_IncomingOrder],
-        mdf: MDFState,
         stats: _TradeStats,
     ) -> _ExecutionResult:
-        orders = [
-            *entry_orders,
-            *short_exit_market_orders,
-            *long_exit_market_orders,
-        ]
+        orders = list(entry_orders)
         self._rng.shuffle(orders)
         market_buy_volume = 0.0
         market_sell_volume = 0.0
+        residual_market_buy = 0.0
+        residual_market_sell = 0.0
+        residual_buy_by_price: PriceMap = {}
+        residual_sell_by_price: PriceMap = {}
         for order in orders:
-            executed = self._process_incoming_order(
+            result = self._process_incoming_order(
                 order,
-                mdf=mdf,
                 stats=stats,
+                rest_residual=False,
             )
             if order.side == "buy":
-                market_buy_volume += executed
+                market_buy_volume += result.executed
+                residual_market_buy += result.rested
+                if result.rested > 1e-12:
+                    price = self._snap_price(order.price)
+                    residual_buy_by_price[price] = (
+                        residual_buy_by_price.get(price, 0.0) + result.rested
+                    )
             else:
-                market_sell_volume += executed
+                market_sell_volume += result.executed
+                residual_market_sell += result.rested
+                if result.rested > 1e-12:
+                    price = self._snap_price(order.price)
+                    residual_sell_by_price[price] = (
+                        residual_sell_by_price.get(price, 0.0) + result.rested
+                    )
+        self._orderbook.add_lots(residual_buy_by_price, "bid", "buy_entry")
+        self._orderbook.add_lots(residual_sell_by_price, "ask", "sell_entry")
         return _ExecutionResult(
-            residual_market_buy=0.0,
-            residual_short_exit=0.0,
-            residual_market_sell=0.0,
-            residual_long_exit=0.0,
+            residual_market_buy=residual_market_buy,
+            residual_market_sell=residual_market_sell,
             crossed_market_volume=0.0,
             market_buy_volume=market_buy_volume,
             market_sell_volume=market_sell_volume,
@@ -2241,11 +4258,12 @@ class Market:
     def _process_incoming_order(
         self,
         order: _IncomingOrder,
-        mdf: MDFState,
         stats: _TradeStats,
-    ) -> float:
+        *,
+        rest_residual: bool = True,
+    ) -> _ProcessedOrder:
         if order.volume <= 0:
-            return 0.0
+            return _ProcessedOrder(executed=0.0, rested=0.0)
         remaining = order.volume
         executed = 0.0
         price_limit = self._snap_price(order.price)
@@ -2258,203 +4276,53 @@ class Market:
             if order.side == "sell" and price < price_limit - 1e-12:
                 break
 
-            lots_by_price = self._orderbook.lots_for_taker_side(order.side)
-            resting_lot = lots_by_price[price][0]
-            fill_volume = min(remaining, resting_lot.volume)
-            taker_actual = self._available_fill_volume(
-                order.kind,
-                fill_volume,
-                order.cohort_id,
-            )
-            resting_actual = self._available_fill_volume(
-                resting_lot.kind, fill_volume, resting_lot.cohort_id
-            )
-            actual = min(taker_actual, resting_actual)
+            volume_by_price = self._orderbook.volumes_for_taker_side(order.side)
+            actual = min(remaining, max(0.0, volume_by_price.get(price, 0.0)))
             if actual <= 1e-12:
-                if self._is_exit_kind(resting_lot.kind) and resting_actual <= 1e-12:
-                    resting_side = "ask" if order.side == "buy" else "bid"
-                    self._orderbook.adjust_volume(resting_side, price, -resting_lot.volume)
-                    resting_lot.volume = 0.0
-                    self._discard_empty_head(price, resting_side)
-                    continue
-                break
-            resting_lot.volume -= actual
+                self._discard_empty_head(price, "ask" if order.side == "buy" else "bid")
+                continue
             resting_side = "ask" if order.side == "buy" else "bid"
             self._orderbook.adjust_volume(resting_side, price, -actual)
             remaining -= actual
             executed += actual
-            self._apply_fill(order.kind, actual, price, mdf, cohort_id=order.cohort_id)
-            self._apply_fill(
-                resting_lot.kind,
-                actual,
-                price,
-                mdf,
-                cohort_id=resting_lot.cohort_id,
-            )
             stats.record(price, actual)
             self._discard_empty_head(price, "ask" if order.side == "buy" else "bid")
 
-        restable = self._available_fill_volume(order.kind, remaining, order.cohort_id)
-        if restable > 1e-12:
+        restable = remaining
+        if rest_residual and restable > 1e-12:
             passive_side = "bid" if order.side == "buy" else "ask"
             self._orderbook.add_lot(
                 price_limit,
                 restable,
                 passive_side,
                 order.kind,
-                cohort_id=order.cohort_id,
             )
-        return executed
-
-    def _apply_fill(
-        self,
-        kind: str,
-        volume: float,
-        execution_price: float,
-        mdf: MDFState,
-        cohort_id: int | None = None,
-    ) -> float:
-        del mdf
-        if volume <= 0:
-            return 0.0
-        if kind == "buy_entry":
-            self._add_position_cohort("long", execution_price, volume)
-            self._long_mass_total += volume
-            return volume
-        elif kind == "sell_entry":
-            self._add_position_cohort("short", execution_price, volume)
-            self._short_mass_total += volume
-            return volume
-        elif kind == "long_exit":
-            removed = self._remove_cohort_mass(
-                self._long_cohorts,
-                execution_price,
-                volume,
-                cohort_id=cohort_id,
-            )
-            self._long_mass_total = max(0.0, self._long_mass_total - removed)
-            return removed
-        elif kind == "short_exit":
-            removed = self._remove_cohort_mass(
-                self._short_cohorts,
-                execution_price,
-                volume,
-                cohort_id=cohort_id,
-            )
-            self._short_mass_total = max(0.0, self._short_mass_total - removed)
-            return removed
-        return 0.0
-
-    def _add_position_cohort(self, side: str, execution_price: float, volume: float) -> None:
-        bucket = self._cohort_bucket_tick(execution_price)
-        cohorts_by_bucket = (
-            self._long_cohorts_by_bucket if side == "long" else self._short_cohorts_by_bucket
-        )
-        cohort = cohorts_by_bucket.get(bucket)
-        if cohort is not None:
-            total = cohort.mass + volume
-            if total > 1e-12:
-                cohort.age = int(round((cohort.age * cohort.mass) / total))
-                cohort.mass = total
-            return
-        cohort = _PositionCohort(
-            side=side,
-            entry_price=self.tick_to_price(bucket),
-            mass=volume,
-            id=self._next_cohort_id,
-        )
-        self._next_cohort_id += 1
-        cohorts_by_bucket[bucket] = cohort
-        self._cohorts_by_id[cohort.id] = cohort
-        if side == "long":
-            self._long_cohorts.append(cohort)
-        else:
-            self._short_cohorts.append(cohort)
-
-    def _remove_cohort_mass(
-        self,
-        cohorts: list[_PositionCohort],
-        execution_price: float,
-        volume: float,
-        cohort_id: int | None = None,
-    ) -> float:
-        remaining = volume
-        removed_total = 0.0
-        if cohort_id is not None:
-            cohort = self._cohorts_by_id.get(cohort_id)
-            if cohort is not None and cohort.mass > 0:
-                removed = min(cohort.mass, remaining)
-                cohort.mass -= removed
-                return removed
-        ordered = sorted(
-            cohorts,
-            key=lambda cohort: (
-                -abs(cohort.entry_price - execution_price) / self.gap,
-                -cohort.age,
-            ),
-        )
-        for cohort in ordered:
-            if remaining <= 1e-12:
-                break
-            removed = min(cohort.mass, remaining)
-            cohort.mass -= removed
-            remaining -= removed
-            removed_total += removed
-        return removed_total
-
-    def _available_fill_volume(
-        self, kind: str, requested: float, cohort_id: int | None = None
-    ) -> float:
-        if requested <= 0:
-            return 0.0
-        if cohort_id is not None and kind in {"long_exit", "short_exit"}:
-            cohort = self._cohorts_by_id.get(cohort_id)
-            return min(requested, cohort.mass) if cohort is not None else 0.0
-        if kind == "long_exit":
-            return min(requested, self._long_mass_total)
-        if kind == "short_exit":
-            return min(requested, self._short_mass_total)
-        return requested
-
-    def _is_exit_kind(self, kind: str) -> bool:
-        return kind in {"long_exit", "short_exit"}
-
-    def _position_mass_from_cohorts(
-        self, long_exit_mdf_by_price: PriceMap, short_exit_mdf_by_price: PriceMap
-    ) -> PositionMassState:
-        return PositionMassState(
-            long_exit_mass_by_price=self._drop_zeroes(
-                {
-                    price: self._long_mass_total * probability
-                    for price, probability in long_exit_mdf_by_price.items()
-                }
-            ),
-            short_exit_mass_by_price=self._drop_zeroes(
-                {
-                    price: self._short_mass_total * probability
-                    for price, probability in short_exit_mdf_by_price.items()
-                }
-            ),
-        )
-
-    def _clear_stale_exit_lots(self) -> None:
-        for lots_by_price in (self._orderbook.bid_lots, self._orderbook.ask_lots):
-            for price in list(lots_by_price):
-                lots_by_price[price] = [
-                    lot for lot in lots_by_price[price] if not self._is_exit_kind(lot.kind)
-                ]
-                if not lots_by_price[price]:
-                    del lots_by_price[price]
-        self._orderbook.rebuild_totals()
+        return _ProcessedOrder(executed=executed, rested=restable)
 
     def _trim_orderbook_through_last_price(self, last_price: float) -> None:
-        for price in list(self._orderbook.bid_lots):
-            if price >= last_price:
-                del self._orderbook.bid_lots[price]
-        for price in list(self._orderbook.ask_lots):
-            if price <= last_price:
-                del self._orderbook.ask_lots[price]
-        self._orderbook.rebuild_totals()
+        last_price = self._snap_price(last_price)
+        while True:
+            best_bid = self._best_bid()
+            best_ask = self._best_ask()
+            if best_bid is None or best_ask is None or best_bid < best_ask:
+                break
+            removed = False
+            if best_bid >= last_price:
+                self._orderbook.bid_volume_by_price.pop(best_bid, None)
+                self._orderbook.invalidate("bid")
+                removed = True
+            if best_ask <= last_price:
+                self._orderbook.ask_volume_by_price.pop(best_ask, None)
+                self._orderbook.invalidate("ask")
+                removed = True
+            if not removed:
+                if abs(best_bid - last_price) <= abs(best_ask - last_price):
+                    self._orderbook.bid_volume_by_price.pop(best_bid, None)
+                    self._orderbook.invalidate("bid")
+                else:
+                    self._orderbook.ask_volume_by_price.pop(best_ask, None)
+                    self._orderbook.invalidate("ask")
+        self._orderbook.clean()
 
     def _prune_orderbook_window(self, current_price: float) -> None:
         min_price = max(
@@ -2462,36 +4330,15 @@ class Market:
             self._snap_price(current_price - self.grid_radius * self.gap),
         )
         max_price = self._snap_price(current_price + self.grid_radius * self.gap)
-        for lots_by_price in (self._orderbook.bid_lots, self._orderbook.ask_lots):
-            for price in list(lots_by_price):
+        for volume_by_price in (
+            self._orderbook.bid_volume_by_price,
+            self._orderbook.ask_volume_by_price,
+        ):
+            for price in list(volume_by_price):
                 if price < min_price or price > max_price:
-                    del lots_by_price[price]
-        self._orderbook.rebuild_totals()
-
-    def _clean_cohorts(self) -> None:
-        self._prune_cohort_buckets(self._long_cohorts_by_bucket)
-        self._prune_cohort_buckets(self._short_cohorts_by_bucket)
-        self._long_cohorts = sorted(
-            self._long_cohorts_by_bucket.values(), key=lambda cohort: cohort.entry_price
-        )
-        self._short_cohorts = sorted(
-            self._short_cohorts_by_bucket.values(), key=lambda cohort: cohort.entry_price
-        )
-        self._cohorts_by_id = {
-            cohort.id: cohort for cohort in (*self._long_cohorts, *self._short_cohorts)
-        }
-        self._long_mass_total = sum(cohort.mass for cohort in self._long_cohorts)
-        self._short_mass_total = sum(cohort.mass for cohort in self._short_cohorts)
-
-    def _prune_cohort_buckets(self, cohorts_by_bucket: dict[int, _PositionCohort]) -> None:
-        for bucket, cohort in list(cohorts_by_bucket.items()):
-            if cohort.mass <= 1e-8:
-                del cohorts_by_bucket[bucket]
-
-    def _cohort_bucket_tick(self, entry_price: float) -> int:
-        tick = self.price_to_tick(entry_price)
-        bucket_width = max(1, self.grid_radius // 4)
-        return int(round(tick / bucket_width)) * bucket_width
+                    del volume_by_price[price]
+                    self._orderbook.invalidate()
+        self._orderbook.clean()
 
     def _best_bid(self) -> float | None:
         return self._orderbook.best_bid()
@@ -2504,8 +4351,33 @@ class Market:
             return None
         return ask - bid
 
+    def _current_spread_ticks(self, cache: _StepComputationCache | None = None) -> float:
+        if cache is not None and cache.spread_ticks is not None:
+            return cache.spread_ticks
+        spread = self._spread(self._best_bid(), self._best_ask())
+        if spread is None:
+            spread_ticks = 2.0 + self._clamp(self._microstructure.liquidity_stress, 0.0, 2.0)
+        else:
+            spread_ticks = max(1.0, spread / self.gap)
+        if cache is not None:
+            cache.spread_ticks = spread_ticks
+        return spread_ticks
+
     def _near_touch_imbalance(self, current_price: float) -> float:
         return self._orderbook.near_touch_imbalance(current_price, self.gap)
+
+    def _nearby_book_depth(self, side: str, current_price: float) -> float:
+        volumes = (
+            self._orderbook.bid_volume_by_price
+            if side == "bid"
+            else self._orderbook.ask_volume_by_price
+        )
+        depth = 0.0
+        for price, volume in volumes.items():
+            distance = max(1.0, abs(current_price - price) / self.gap)
+            if distance <= 5:
+                depth += volume / distance
+        return depth
 
     def _discard_empty_head(self, price: float, side: str) -> None:
         self._orderbook.discard_empty_head(price, side)
@@ -2515,12 +4387,6 @@ class Market:
 
     def _snapshot_orderbook(self) -> OrderBookState:
         return self._orderbook.snapshot()
-
-    def _snapshot_position_mass(self) -> PositionMassState:
-        return PositionMassState(
-            long_exit_mass_by_price=dict(self.state.position_mass.long_exit_mass_by_price),
-            short_exit_mass_by_price=dict(self.state.position_mass.short_exit_mass_by_price),
-        )
 
     def _merge_maps(self, *maps: PriceMap) -> PriceMap:
         merged: PriceMap = {}

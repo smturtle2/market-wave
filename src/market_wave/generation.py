@@ -222,8 +222,6 @@ def _config_from_market(market: Market) -> dict[str, Any]:
         "grid_radius": market.grid_radius,
         "regime": market.regime,
         "augmentation_strength": market.augmentation_strength,
-        "mdf_temperature": market.mdf_temperature,
-        "mdf_model": market.mdf_model,
     }
 
 

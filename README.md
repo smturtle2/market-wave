@@ -19,11 +19,11 @@
   English | <a href="README.ko.md">한국어</a>
 </p>
 
-`market-wave` is a Python library for generating synthetic market paths from
-market-wide entry and exit intent. It does not create individual participants.
-Instead, it models aggregate buy/sell entry intent, position exits,
-order-book depth, cancellations, taker flow, and execution-driven price movement
-from probability mass over relative ticks.
+`market-wave` is a Python library for generating synthetic market paths from a
+market-wide entry price distribution. It does not create individual
+participants. Instead, it models aggregate buy/sell entry intent, resting
+order-book depth, probabilistic order cancellation, taker flow, and
+execution-driven price movement from probability mass over relative ticks.
 
 It is not a forecasting model. It is a lightweight simulation primitive for
 experiments, visualization, teaching, and strategy-environment prototyping.
@@ -32,17 +32,16 @@ experiments, visualization, teaching, and strategy-environment prototyping.
 
 - **Aggregate intent, not agents**: market participants are represented by
   probability mass over relative ticks, not by individual objects.
-- **Dynamic MDF**: entry and exit intent live in four stateful
-  `MDF(relative_tick)` fields that evolve from the previous step.
-- **Pluggable score model**: swap the MDF score function with
-  `DynamicMDFModel` or a custom `MDFModel`.
+- **Raw-mass MDF**: buy/sell entry intent is built by summing observable
+  tick-level mass, then normalizing directly.
 - **Separated shape and size**: MDFs decide where intent sits; intensity decides
   how much order flow appears.
 - **Execution-driven prices**: prices stay flat unless trades execute.
 - **Batch generation**: generate many reproducible synthetic paths without
   keeping every path in `market.history`.
 - **Inspectable state**: every step returns a `StepInfo` snapshot with MDFs,
-  volumes, order book state, position mass, VWAP, spread, and imbalance.
+  submitted volume, cancelled volume, executions, order book state, VWAP,
+  spread, and imbalance.
 - **Built-in plotting**: `matplotlib` is included, with a clean light chart style
   by default.
 
@@ -107,11 +106,11 @@ For simple export workflows, use `step.to_dict()`, `step.to_json()`, or
 Example output with `seed=42`:
 
 ```text
-10020.0 -> 10010.0
-entry: 2.955
-executed: 0.976
-resting bid/ask: 24.662 25.83
-imbalance: 0.484
+9930.0 -> 9930.0
+entry: 1.943
+executed: 0.715
+resting bid/ask: 26.187 25.893
+imbalance: -0.119
 ```
 
 ## Smoke Matrix
@@ -144,52 +143,50 @@ for name, kwargs, steps_count in cases:
 Recent verification on the current implementation:
 
 ```text
-baseline  range=  9900.0- 10080.0 unique= 19 moves=369 exec_steps=500 final= 10010.0
-busy      range=  9890.0- 10030.0 unique= 15 moves=388 exec_steps=500 final=  9910.0
-thin      range=   455.0-   535.0 unique= 17 moves=318 exec_steps=500 final=   500.0
-low_price range=     2.0-    24.0 unique= 23 moves=380 exec_steps=500 final=    19.0
-trend_up  range= 10000.0- 10320.0 unique= 33 moves=388 exec_steps=500 final= 10320.0
-high_vol  range=  9960.0- 10040.0 unique=  9 moves=405 exec_steps=500 final=  9970.0
+baseline  range=  9910.0- 10030.0 unique= 13 moves=229 exec_steps=500 final=  9930.0
+busy      range=  9980.0- 10080.0 unique= 11 moves=232 exec_steps=500 final= 10040.0
+thin      range=   485.0-   550.0 unique= 14 moves=207 exec_steps=500 final=   485.0
+low_price range=     2.0-    24.0 unique= 23 moves=221 exec_steps=500 final=    20.0
+trend_up  range=  9980.0- 10330.0 unique= 36 moves=273 exec_steps=500 final= 10330.0
+high_vol  range=  9990.0- 10120.0 unique= 14 moves=362 exec_steps=500 final= 10100.0
 inactive  range=   100.0-   100.0 unique=  1 moves=  0 exec_steps=  0 final=   100.0
 ```
 
 Those runs also checked that current-state MDF projections stay aligned with
 `state.price_grid`, MDFs remain normalized, prices never fall below one tick,
-order book and position mass stay non-negative, and price changes only occur on
-steps with executed volume. Dynamic MDF acceptance also runs seeds `10..19` at
-`mdf_temperature=1.0` and checks that every MDF remains finite, non-negative,
-normalized, and broad enough not to collapse to a single price.
+order-book depth stays non-negative, and price changes only occur on steps with
+executed volume. Dynamic MDF acceptance also runs seeds `10..19` and checks that
+every MDF remains finite, non-negative, normalized, and broad enough not to
+collapse to a single price.
 
-Diagnostic note for `0.4.1`: the simulator still has no anchor price or stored
+Diagnostic note for the current engine: the simulator still has no anchor price or stored
 target that pulls paths back to the initial price. Seeded `mood`, `trend`,
 `volatility`, microstructure activity, cancellation pressure, and event pressure
 evolve each step and reshape the MDFs and visible book. Prices remain
-execution-driven, with a small flow-implied price-discovery component when
-executed flow reveals one-sided pressure. Treat these ranges, move counts, and
+execution-driven, with volatility-aware price discovery when executed flow
+reveals one-sided pressure. Treat these ranges, move counts, and
 execution counts as regression diagnostics, not claims that generated paths
 match any specific real market.
 
 Entry MDF prices are treated as incoming order prices. Buy entry orders arrive as
 bids, sell entry orders arrive as asks, and they execute only when they overlap
 existing opposite-side quotes. Executions print at the resting quote price.
-Unfilled volume remains in the book at the sampled MDF price. Exit flow is
-cohort-conditioned, so exit orders carry the originating cohort id and still
-route through visible order-book liquidity.
+Unfilled volume remains in the book at the sampled MDF price. Resting orders
+then leave through probabilistic cancellation: orders at prices that the current
+same-side entry MDF no longer supports are more likely to shrink or disappear.
 
-MDF note for `0.4.1`: the default entry MDF now uses a side-relative
-reservation-price mixture. Buy entry intent is spread across deep value,
-passive bid, arrival, and small chase zones; sell entry intent mirrors that on
-the ask side. This keeps passive limit interest in the MDF itself instead of
-adding synthetic fixed walls, while reducing excessive buy-ask and sell-bid
-tail mass.
+MDF note for the current engine: buy/sell MDFs no longer use score softmax
+updates. The engine builds raw mass at each relative tick from near-market
+continuity, visible book shortage, front depletion, liquidity pockets, flow
+pressure, volatility, stress, and microstructure texture. The raw mass is
+normalized directly, with only a small linear memory mix so the previous shape
+has inertia without becoming an anchor.
 
-Microstructure note for `0.4.0`: order-book replenishment now includes
-regime-specific depth shape, resiliency, wall memory by absolute tick,
-event-driven volume bursts, dry-up after cancellation pressure, trend
-exhaustion, and squeeze pressure derived from short crowding plus recent
-one-sided flow. Live order-book and position totals remain cached by price/side,
-lots are coalesced by price/kind, and position inventory is kept in bounded
-entry-price cohort buckets.
+Microstructure note for the current engine: order-book replenishment is shaped
+by the current entry MDF, resiliency, stress-aware cancellation, event-driven
+volume bursts, dry-up after cancellation pressure, trend exhaustion, and
+book-pressure squeeze signals from one-sided visible liquidity. Live order-book
+totals remain cached by price/side, and lots are coalesced by price/kind.
 
 ## Visualization
 
@@ -249,28 +246,6 @@ optional: install `market-wave[dataframe]` to use `to_dataframe()`.
 `ValidationMetrics.volatility_clustering_score` is computed within each generated
 path and aggregated, so independent path boundaries do not affect the diagnostic.
 
-## Pluggable MDF
-
-```python
-from market_wave import Market
-
-class CenterSeekingMDF:
-    def scores(self, side, intent, relative_ticks, context, signals=None):
-        del side, intent, context, signals
-        return [-abs(tick) for tick in relative_ticks]
-
-market = Market(initial_price=100, gap=1, mdf_model=CenterSeekingMDF(), seed=7)
-
-step = market.step(1)[0]
-print(step.relative_ticks)
-print(step.buy_entry_mdf)
-```
-
-Custom MDF models return scores, not probabilities. Treat each score as
-log-growth evidence: additive score differences become multiplicative changes
-to the previous MDF. `Market` applies those scores through the stabilized MDF
-update described below.
-
 ## Core Concepts
 
 At every step, the market builds relative ticks around the current price:
@@ -280,42 +255,49 @@ relative_tick = (price - current_price) / tick_size
 relative_ticks = [-grid_radius, ..., 0, ..., +grid_radius]
 ```
 
-The simulator maintains four Market Distribution Functions on that relative grid:
+The simulator maintains two Market Distribution Functions on that relative grid:
 
 - `buy_entry_mdf`
 - `sell_entry_mdf`
-- `long_exit_mdf`
-- `short_exit_mdf`
 
-Each MDF is normalized. It is not recreated from scratch each step; it evolves
-from the previous MDF:
+Each MDF is normalized. It is built from raw tick-level mass:
 
 ```text
-logits = persistence * log(MDF_prev(tick) + eps)
-       + score(tick) / effective_temperature
-proposal = softmax(clamp(logits - max(logits), -50, 0))
-MDF_next = Normalize((1 - floor_mix) * Diffuse(proposal) + floor_mix * Uniform)
+raw_mass(tick) =
+    near_market_continuity
+  + book_shortage_or_front_mass
+  + local_liquidity_pockets
+  + flow_pressure_tail
+  + microstructure_texture
+
+proposal = Normalize(raw_mass)
+raw_MDF_next = Normalize((1 - memory_mix) * proposal + memory_mix * raw_MDF_prev + floor)
+resolved_buy_MDF, resolved_sell_MDF = ResolveOverlap(raw_buy_MDF_next, raw_sell_MDF_next)
+MDF_next = Mix(resolved_MDF, CenteredNormalNoise(current_tick))
 ```
 
-`score(tick)` can include placement shape, trend, liquidity attraction, memory,
-risk, and order-book imbalance. `mdf_temperature` controls how sharply scores
-reshape the distribution. The effective temperature also includes current volatility, so
-high-volatility regimes soften score updates instead of letting one tick absorb
-all mass. Persistence, diffusion, and uniform floor mixing prevent repeated
-small score advantages from collapsing the MDF into a single tick.
+There is no custom score model, no temperature, and no score softmax path.
+`mood`, `trend`, `volatility`, visible liquidity, shortage, recent flow,
+and stress reshape the raw MDF directly. Market-adjacent ticks keep nonzero
+mass, while shortage/front/liquidity signals can create multiple local pockets
+away from the current price.
+
+The public MDF fields are the effective distributions used for sampling.
+The raw buy/sell judgments stay internal; a small memoryless normal component
+around the current price is mixed into those two MDFs after buy/sell overlap
+resolution, immediately before sampling. It is not a third public MDF or a
+separate noise order path. Before order, cancel, re-quote, or replenishment
+sampling, buy/sell overlap is resolved with the same local competition rule on
+every relative tick, so the resolver does not branch on passive/marketable
+regions or special-case the current tick.
 
 Those relative MDFs are projected onto the pre-trade grid
 `price_grid = price_before +/- k * gap` for order-book formation.
 `StepInfo.mdf_price_basis` records that pre-trade price basis.
 
-```text
-low temperature  -> sharper, concentrated MDF
-high temperature -> wider, smoother MDF
-```
-
 MDFs generate aggregate intent. Intensity controls total size. The order book and
 execution layer then turn that intent into limit flow, taker flow, cancellations,
-exits, matched volume, and price changes.
+matched volume, and price changes.
 
 ## Execution Guarantee
 
@@ -323,8 +305,8 @@ Price movement is execution-driven:
 
 - If a step has no executed volume, `price_after == price_before`.
 - If trades execute, `price_after` is derived from that step's execution
-  statistics. Random quote jitter is bounded and cannot move the price by itself
-  when executions print at the previous price.
+  statistics. The flow term is bounded and cannot move the price by itself when
+  executions print at the previous price.
 - `seed` makes the simulation reproducible for the same version and inputs.
 
 This is a simulator, not a market data replay engine and not financial advice.
@@ -334,19 +316,13 @@ This is a simulator, not a market data replay engine and not financial advice.
 ```python
 from market_wave import (
     Market,
-    DynamicMDFModel,
     generate_paths,
     compute_metrics,
     MarketState,
     IntensityState,
     LatentState,
-    MDFContext,
-    MDFSignals,
-    MDFModel,
-    RelativeMDFComponent,
     MDFState,
     OrderBookState,
-    PositionMassState,
     StepInfo,
 )
 ```
@@ -356,21 +332,21 @@ Useful `StepInfo` fields include:
 - `price_before`, `price_after`, `price_change`
 - `tick_before`, `tick_after`, `tick_change`, `relative_ticks`
 - `mdf_price_basis`, `price_grid`
-- `buy_entry_mdf`, `sell_entry_mdf`, `long_exit_mdf`, `short_exit_mdf`
+- `buy_entry_mdf`, `sell_entry_mdf`
 - `buy_entry_mdf_by_price`, `sell_entry_mdf_by_price`
-- `entry_volume_by_price`, `exit_volume_by_price`
+- `entry_volume_by_price`, `cancelled_volume_by_price`
 - `buy_volume_by_price`, `sell_volume_by_price`
 - `executed_volume_by_price`, `total_executed_volume`, `trade_count`
 - `market_buy_volume`, `market_sell_volume`
 - `vwap_price`, `best_bid_before`, `best_ask_before`, `spread_after`
 - `orderbook_before`, `orderbook_after`
-- `position_mass_before`, `position_mass_after`
 
 `buy_volume_by_price` and `sell_volume_by_price` are submitted side-intent maps
 keyed by sampled order price, not executed or resting liquidity. `market_*`
-volume fields report the executed incoming buy/sell volume. Unfilled incoming
-volume rests in `orderbook_after`; legacy `residual_market_*` and
-`crossed_market_volume` fields remain compatibility zeroes in the current
+volume fields report the executed incoming buy/sell volume. `residual_market_*`
+fields report incoming buy/sell volume that did not execute and was restable in
+the book. Unfilled incoming volume rests in `orderbook_after`; `crossed_market_volume`
+is kept as a compatibility diagnostic and remains zero in the current
 order-book-first engine.
 
 The `*_mdf_by_price` fields are pre-trade MDF projections keyed by
@@ -381,10 +357,10 @@ examples from earlier prototypes should be considered obsolete.
 ### Public Contract and Snapshot Policy
 
 The public import surface is the package `__all__`: `Market`, `generate_paths`,
-`compute_metrics`, generated-path metadata, MDF model/protocol types, metrics,
-and the state dataclasses shown above. The entrypoints are intentionally small,
-but the observation contract is broad because `StepInfo` and `MarketState`
-expose detailed simulator diagnostics.
+`compute_metrics`, generated-path metadata, metrics, and the state dataclasses
+shown above. Custom MDF model/protocol types are no longer public API. The
+entrypoints are intentionally small, but the observation contract is broad
+because `StepInfo` and `MarketState` expose detailed simulator diagnostics.
 
 During the current alpha line, existing public names and existing `StepInfo` /
 state fields are kept compatible where practical. New diagnostic fields may be

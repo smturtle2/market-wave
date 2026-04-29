@@ -110,65 +110,32 @@ def test_generate_paths_rejects_reusing_one_market_for_multiple_paths():
         generate_paths(2, 3, market)
 
 
-def test_config_hash_is_stable_for_equivalent_custom_models():
-    class PlainModel:
-        def __init__(self, scale):
-            self.scale = scale
-
-        def scores(self, side, intent, relative_ticks, context, signals=None):
-            del side, intent, context, signals
-            weights = [self.scale / (1.0 + abs(tick)) for tick in relative_ticks]
-            return weights
-
-    left = generate_paths(1, 0, {"initial_price": 100.0, "gap": 1.0, "mdf_model": PlainModel(2.0)})[
-        0
-    ]
-    right = generate_paths(
-        1, 0, {"initial_price": 100.0, "gap": 1.0, "mdf_model": PlainModel(2.0)}
-    )[0]
-
-    assert left.metadata.config_hash == right.metadata.config_hash
-    json.loads(left.metadata.to_json())
-
-
-def test_config_hash_captures_slotted_custom_model_state():
-    class SlottedModel:
-        __slots__ = ("scale",)
-
-        def __init__(self, scale):
-            self.scale = scale
-
-        def scores(self, side, intent, relative_ticks, context, signals=None):
-            del side, intent, context, signals
-            return [self.scale / (1.0 + abs(tick)) for tick in relative_ticks]
-
+def test_config_hash_captures_market_shape_inputs():
     left = generate_paths(
-        1, 0, {"initial_price": 100.0, "gap": 1.0, "mdf_model": SlottedModel(1.0)}
+        1,
+        0,
+        {
+            "initial_price": 100.0,
+            "gap": 1.0,
+            "seed": 5,
+            "grid_radius": 8,
+            "regime": "normal",
+        },
     )[0]
     right = generate_paths(
-        1, 0, {"initial_price": 100.0, "gap": 1.0, "mdf_model": SlottedModel(2.0)}
+        1,
+        0,
+        {
+            "initial_price": 100.0,
+            "gap": 1.0,
+            "seed": 5,
+            "grid_radius": 12,
+            "regime": "normal",
+        },
     )[0]
 
     assert left.metadata.config_hash != right.metadata.config_hash
-    assert json.loads(left.metadata.to_json())["config"]["mdf_model"]["attrs"]["scale"] == 1.0
-
-
-def test_prebuilt_market_config_hash_includes_custom_mdf_model_identity():
-    class PlainModel:
-        def __init__(self, scale):
-            self.scale = scale
-
-        def scores(self, side, intent, relative_ticks, context, signals=None):
-            del side, intent, context, signals
-            return [self.scale / (1.0 + abs(tick)) for tick in relative_ticks]
-
-    left_market = Market(initial_price=100.0, gap=1.0, seed=5, mdf_model=PlainModel(1.0))
-    right_market = Market(initial_price=100.0, gap=1.0, seed=5, mdf_model=PlainModel(2.0))
-
-    left = generate_paths(1, 0, left_market)[0]
-    right = generate_paths(1, 0, right_market)[0]
-
-    assert left.metadata.config_hash != right.metadata.config_hash
+    assert json.loads(left.metadata.to_json())["config"]["grid_radius"] == 8
 
 
 def test_generated_path_records_are_exportable():

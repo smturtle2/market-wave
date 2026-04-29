@@ -230,6 +230,25 @@ def test_orderbook_heatmap_uses_level_depth_not_price_axis():
         _close(fig)
 
 
+def test_orderbook_heatmap_maps_price_gaps_to_actual_tick_levels():
+    market = Market(initial_price=100.0, gap=1.0, popularity=0.0, seed=2027, grid_radius=6)
+    step = market.step(1)[0]
+    step.orderbook_after.bid_volume_by_price.clear()
+    step.orderbook_after.ask_volume_by_price.clear()
+    step.orderbook_after.bid_volume_by_price.update({98.0: 2.0, 95.0: 5.0})
+    step.orderbook_after.ask_volume_by_price.update({102.0: 3.0, 105.0: 7.0})
+
+    _x_values, levels, bid_matrix, ask_matrix = market._orderbook_heatmap_matrices(
+        [step],
+        snapshot="after",
+        depth=6,
+    )
+
+    assert levels == [1, 2, 3, 4, 5, 6]
+    assert [row[0] for row in bid_matrix] == [0.0, 2.0, 0.0, 0.0, 5.0, 0.0]
+    assert [row[0] for row in ask_matrix] == [0.0, 3.0, 0.0, 0.0, 7.0, 0.0]
+
+
 def test_orderbook_heatmap_default_depth_is_min_grid_radius_and_twenty():
     market = Market(initial_price=100.0, gap=1.0, popularity=1.1, seed=2026, grid_radius=30)
     market.step(4)

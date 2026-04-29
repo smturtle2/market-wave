@@ -19,10 +19,10 @@
   <a href="README.md">English</a> | 한국어
 </p>
 
-`market-wave`는 개별 참여자를 만들지 않고 시장 전체의 진입 가격과 탈출 가격
-의도로 synthetic market path를 만드는 Python 라이브러리입니다. 집계된 매수/매도
-진입 의도, 포지션 청산, 호가창 깊이, 주문 취소, taker flow, 체결 기반 가격 변화를
-relative tick 위의 확률질량으로 다룹니다.
+`market-wave`는 개별 참여자를 만들지 않고 시장 전체의 진입 가격 분포로
+synthetic market path를 만드는 Python 라이브러리입니다. 집계된 매수/매도
+진입 의도, resting order-book 깊이, 확률적 주문 취소, taker flow, 체결 기반
+가격 변화를 relative tick 위의 확률질량으로 다룹니다.
 
 이 라이브러리는 가격 예측 모델이 아닙니다. 실험, 시각화, 교육, 전략 환경
 프로토타이핑을 위한 가벼운 시뮬레이션 도구입니다.
@@ -31,17 +31,15 @@ relative tick 위의 확률질량으로 다룹니다.
 
 - **개별 agent가 아닌 집계 의도**: 참여자 객체를 만들지 않고 relative tick별 확률질량으로
   시장 의도를 표현합니다.
-- **Dynamic MDF**: 네 개의 `MDF(relative_tick)`가 이전 step의 상태를 이어받아
-  진입/탈출 의도를 표현합니다.
-- **교체 가능한 score 모델**: `DynamicMDFModel` 또는 custom `MDFModel`로 MDF
-  score 함수만 바꿀 수 있습니다.
+- **Raw-mass MDF**: 관측 가능한 tick별 질량을 직접 더한 뒤 정규화해서
+  매수/매도 진입 의도를 표현합니다.
 - **분포와 거래강도 분리**: MDF는 의도가 어느 가격대에 있는지, intensity는 총
   주문량이 얼마나 되는지를 담당합니다.
 - **체결 기반 가격**: 체결이 없으면 가격은 움직이지 않습니다.
 - **batch generation**: 많은 synthetic path를 만들 때 `market.history`를 계속
   쌓지 않고 재현 가능한 경로를 생성할 수 있습니다.
-- **관찰 가능한 상태**: 매 step마다 MDF, 거래량, 호가창, 포지션 mass, VWAP,
-  spread, imbalance가 담긴 `StepInfo`를 반환합니다.
+- **관찰 가능한 상태**: 매 step마다 MDF, 제출 물량, 취소 물량, 체결, 호가창,
+  VWAP, spread, imbalance가 담긴 `StepInfo`를 반환합니다.
 - **내장 시각화**: `matplotlib` 기반의 깔끔한 light chart 스타일을 제공합니다.
 
 ## 설치
@@ -105,11 +103,11 @@ for step in market.stream(512, keep_history=False):
 `seed=42` 기준 예시 출력:
 
 ```text
-10020.0 -> 10010.0
-entry: 2.955
-executed: 0.976
-resting bid/ask: 24.662 25.83
-imbalance: 0.484
+9930.0 -> 9930.0
+entry: 1.943
+executed: 0.715
+resting bid/ask: 26.187 25.893
+imbalance: -0.119
 ```
 
 ## 스모크 매트릭스
@@ -142,49 +140,47 @@ for name, kwargs, steps_count in cases:
 현재 구현에서 최근 검증한 결과:
 
 ```text
-baseline  range=  9900.0- 10080.0 unique= 19 moves=369 exec_steps=500 final= 10010.0
-busy      range=  9890.0- 10030.0 unique= 15 moves=388 exec_steps=500 final=  9910.0
-thin      range=   455.0-   535.0 unique= 17 moves=318 exec_steps=500 final=   500.0
-low_price range=     2.0-    24.0 unique= 23 moves=380 exec_steps=500 final=    19.0
-trend_up  range= 10000.0- 10320.0 unique= 33 moves=388 exec_steps=500 final= 10320.0
-high_vol  range=  9960.0- 10040.0 unique=  9 moves=405 exec_steps=500 final=  9970.0
+baseline  range=  9910.0- 10030.0 unique= 13 moves=229 exec_steps=500 final=  9930.0
+busy      range=  9980.0- 10080.0 unique= 11 moves=232 exec_steps=500 final= 10040.0
+thin      range=   485.0-   550.0 unique= 14 moves=207 exec_steps=500 final=   485.0
+low_price range=     2.0-    24.0 unique= 23 moves=221 exec_steps=500 final=    20.0
+trend_up  range=  9980.0- 10330.0 unique= 36 moves=273 exec_steps=500 final= 10330.0
+high_vol  range=  9990.0- 10120.0 unique= 14 moves=362 exec_steps=500 final= 10100.0
 inactive  range=   100.0-   100.0 unique=  1 moves=  0 exec_steps=  0 final=   100.0
 ```
 
-이 실행들은 현재 state의 MDF projection이 `state.price_grid`와 정렬되는지, MDF가 정규화되는지,
-가격이 한 tick 아래로 내려가지 않는지, order book과 position mass가 음수가
+이 실행들은 현재 state의 MDF projection이 `state.price_grid`와 정렬되는지, MDF가
+정규화되는지, 가격이 한 tick 아래로 내려가지 않는지, order-book depth가 음수가
 아닌지, 가격 변화가 체결량이 있는 step에서만 발생하는지도 함께 확인했습니다.
-Dynamic MDF acceptance는 `mdf_temperature=1.0`에서 seed `10..19`도 실행해
-모든 MDF가 finite, non-negative, normalized 상태를 유지하고 한 가격으로
-붕괴하지 않는지도 확인합니다.
+Dynamic MDF acceptance는 seed `10..19`도 실행해 모든 MDF가 finite,
+non-negative, normalized 상태를 유지하고 한 가격으로 붕괴하지 않는지도 확인합니다.
 
-`0.4.1` 진단 메모: 시뮬레이터는 여전히 가격을 초기값으로 되돌리는 anchor나
+현재 엔진 진단 메모: 시뮬레이터는 여전히 가격을 초기값으로 되돌리는 anchor나
 저장된 목표 가격을 갖지 않습니다. seed로 정해진 `mood`, `trend`, `volatility`,
 microstructure activity, cancellation pressure, event pressure가 매 step 전이되며
 MDF와 visible book을 바꿉니다. 가격은 체결 기반으로 움직이고, 체결 flow가
-한쪽 압력을 드러낼 때 작은 price-discovery 성분을 반영합니다. 위 range,
+한쪽 압력을 드러낼 때 volatility-aware price-discovery 성분을 반영합니다. 위 range,
 move count, execution count는 특정 실제 시장과의 일치 주장이 아니라
 regression diagnostic으로 보아야 합니다.
 
 Entry MDF의 가격은 incoming order 가격으로 취급됩니다. 매수 entry는 bid로,
 매도 entry는 ask로 들어오며, 기존 반대편 호가와 겹칠 때만 체결됩니다. 체결
 가격은 resting quote 가격입니다. 체결되지 않은 물량은 sampled MDF 가격에
-그대로 미체결 호가로 남습니다. Exit flow는 cohort 조건부로 생성되며, exit
-주문도 원래 cohort id를 들고 visible order-book liquidity를 통해 처리됩니다.
+그대로 미체결 호가로 남습니다. 이후 resting order는 확률적 취소로 빠져나갑니다.
+현재 같은 side의 entry MDF가 더 이상 지지하지 않는 가격의 주문일수록 더 많이
+줄어들거나 사라질 가능성이 큽니다.
 
-`0.4.1` MDF 메모: 기본 entry MDF는 이제 side-relative reservation-price
-mixture를 사용합니다. 매수 entry 의도는 deep value, passive bid, arrival,
-작은 chase 구간에 분산되고, 매도 entry 의도는 ask 쪽에서 이를 대칭적으로
-반영합니다. 고정된 synthetic wall을 추가하지 않고 MDF 자체에 passive limit
-interest가 남도록 하며, buy-ask와 sell-bid 방향으로 과하게 새던 tail mass를
-줄입니다.
+현재 MDF 메모: buy/sell MDF는 더 이상 score softmax update를 사용하지 않습니다.
+엔진은 near-market continuity, visible book shortage, front depletion, liquidity
+pocket, flow pressure, volatility, stress, microstructure texture에서 relative
+tick별 raw mass를 만들고 직접 정규화합니다. 이전 MDF는 작은 선형 memory로만
+섞이므로 관성은 생기지만 anchor처럼 남지는 않습니다.
 
-`0.4.0` microstructure 메모: orderbook 보충은 regime별 depth shape, resiliency,
-absolute tick 기준 wall memory, event-driven volume burst, cancellation pressure
-이후 dry-up, trend exhaustion, short crowding과 최근 one-sided flow에서 파생한
-squeeze pressure를 반영합니다. live orderbook과 position total은 계속
-price/side별로 cache하고, lot은 price/kind별로 합치며, position inventory는
-제한된 entry-price cohort bucket으로 유지합니다.
+현재 엔진 microstructure 메모: orderbook 보충은 현재 entry MDF, resiliency,
+stress-aware cancellation, event-driven volume burst, cancellation pressure 이후
+dry-up, trend exhaustion, 한쪽 visible liquidity에서 나온 book-pressure squeeze
+signal을 반영합니다. live orderbook total은 계속 price/side별로 cache하고, lot은
+price/kind별로 합칩니다.
 
 ## 시각화
 
@@ -243,28 +239,6 @@ optional입니다. `to_dataframe()`을 쓰려면 `market-wave[dataframe]`으로 
 `ValidationMetrics.volatility_clustering_score`는 각 generated path 내부에서 계산한 뒤
 집계하므로 독립 path 사이의 경계가 diagnostic에 섞이지 않습니다.
 
-## 교체 가능한 MDF
-
-```python
-from market_wave import Market
-
-class CenterSeekingMDF:
-    def scores(self, side, intent, relative_ticks, context, signals=None):
-        del side, intent, context, signals
-        return [-abs(tick) for tick in relative_ticks]
-
-market = Market(initial_price=100, gap=1, mdf_model=CenterSeekingMDF(), seed=7)
-
-step = market.step(1)[0]
-print(step.relative_ticks)
-print(step.buy_entry_mdf)
-```
-
-Custom MDF model은 확률이 아니라 score를 반환합니다. 각 score는 log-growth
-evidence로 해석할 수 있으며, additive score 차이는 이전 MDF에 대한
-multiplicative 변화가 됩니다. `Market`은 아래의 안정화된 MDF update로 이
-score를 반영합니다.
-
 ## 핵심 개념
 
 매 step마다 현재 가격 주변의 relative tick 그리드를 만듭니다.
@@ -274,42 +248,46 @@ relative_tick = (price - current_price) / tick_size
 relative_ticks = [-grid_radius, ..., 0, ..., +grid_radius]
 ```
 
-시뮬레이터는 이 relative grid 위에 네 개의 Market Distribution Function을 유지합니다.
+시뮬레이터는 이 relative grid 위에 두 개의 Market Distribution Function을 유지합니다.
 
 - `buy_entry_mdf`
 - `sell_entry_mdf`
-- `long_exit_mdf`
-- `short_exit_mdf`
 
-각 MDF는 정규화됩니다. 매 step 새로 만들어지는 것이 아니라 이전 MDF에서
-진화합니다.
+각 MDF는 정규화됩니다. MDF는 tick별 raw mass에서 만들어집니다.
 
 ```text
-logits = persistence * log(MDF_prev(tick) + eps)
-       + score(tick) / effective_temperature
-proposal = softmax(clamp(logits - max(logits), -50, 0))
-MDF_next = Normalize((1 - floor_mix) * Diffuse(proposal) + floor_mix * Uniform)
+raw_mass(tick) =
+    near_market_continuity
+  + book_shortage_or_front_mass
+  + local_liquidity_pockets
+  + flow_pressure_tail
+  + microstructure_texture
+
+proposal = Normalize(raw_mass)
+raw_MDF_next = Normalize((1 - memory_mix) * proposal + memory_mix * raw_MDF_prev + floor)
+resolved_buy_MDF, resolved_sell_MDF = ResolveOverlap(raw_buy_MDF_next, raw_sell_MDF_next)
+MDF_next = Mix(resolved_MDF, CenteredNormalNoise(current_tick))
 ```
 
-`score(tick)`에는 placement shape, trend, liquidity attraction, memory, risk,
-orderbook imbalance가 반영될 수 있습니다. `mdf_temperature`는 score가 분포를
-얼마나 날카롭게 바꾸는지 조절합니다. effective temperature에는 현재 volatility도
-반영되므로 high-volatility regime에서 한 tick이 모든 질량을 흡수하지 않도록
-score update가 완만해집니다. persistence, diffusion, uniform floor mixing은 작은
-score 우위가 반복되면서 MDF가 한 tick으로 붕괴되는 일을 막습니다.
+custom score model, temperature, score softmax 경로는 없습니다. `mood`,
+`trend`, `volatility`, visible liquidity, shortage, 최근 flow, stress가 raw MDF
+shape를 직접 바꿉니다. 시장가 주변 tick은 0이 아닌 질량을 유지하고,
+shortage/front/liquidity 신호는 현재가에서 떨어진 여러 local pocket을 만들 수
+있습니다.
+
+public MDF field는 최종 샘플링에 쓰이는 effective distribution입니다. raw buy/sell
+판단은 내부에만 남고, 현재가 주변의 작은 memoryless normal 성분이 이 두 MDF에만
+overlap 정리 후, 샘플링 직전에 섞입니다. 세 번째 public MDF나 별도 noise 주문
+경로는 아닙니다. 주문/취소/포지션 이동/유동성 보충 샘플링 전에 buy/sell overlap을
+모든 relative tick에 같은 local competition 규칙으로 정리하므로, resolver는
+passive/marketable 영역이나 현재 tick을 별도로 분기하지 않습니다.
 
 relative MDF는 호가 형성을 위해
 pre-trade grid인 `price_grid = price_before +/- k * gap`에 투영됩니다.
 `StepInfo.mdf_price_basis`는 이 pre-trade 가격 기준을 기록합니다.
 
-```text
-low temperature  -> 더 뾰족하고 집중된 MDF
-high temperature -> 더 넓고 부드러운 MDF
-```
-
 MDF는 집계 의도를 만들고, intensity는 총 주문량을 결정합니다. 호가창/체결
-레이어는 이를 limit flow, taker flow, 주문 취소, 청산, 체결량, 가격 변화로
-바꿉니다.
+레이어는 이를 limit flow, taker flow, 주문 취소, 체결량, 가격 변화로 바꿉니다.
 
 ## 체결 보장
 
@@ -317,7 +295,7 @@ MDF는 집계 의도를 만들고, intensity는 총 주문량을 결정합니다
 
 - 해당 step의 체결량이 없으면 `price_after == price_before`입니다.
 - 체결이 있으면 `price_after`는 해당 step의 체결 통계에서 계산됩니다. bounded
-  quote jitter는 보조 역할만 하며, 이전 가격에서만 체결된 경우 혼자 가격을
+  flow term은 보조 역할만 하며, 이전 가격에서만 체결된 경우 혼자 가격을
   움직이지 않습니다.
 - 같은 버전과 같은 입력에서 `seed`는 재현 가능한 시뮬레이션을 만듭니다.
 
@@ -328,19 +306,13 @@ MDF는 집계 의도를 만들고, intensity는 총 주문량을 결정합니다
 ```python
 from market_wave import (
     Market,
-    DynamicMDFModel,
     generate_paths,
     compute_metrics,
     MarketState,
     IntensityState,
     LatentState,
-    MDFContext,
-    MDFSignals,
-    MDFModel,
-    RelativeMDFComponent,
     MDFState,
     OrderBookState,
-    PositionMassState,
     StepInfo,
 )
 ```
@@ -350,22 +322,22 @@ from market_wave import (
 - `price_before`, `price_after`, `price_change`
 - `tick_before`, `tick_after`, `tick_change`, `relative_ticks`
 - `mdf_price_basis`, `price_grid`
-- `buy_entry_mdf`, `sell_entry_mdf`, `long_exit_mdf`, `short_exit_mdf`
+- `buy_entry_mdf`, `sell_entry_mdf`
 - `buy_entry_mdf_by_price`, `sell_entry_mdf_by_price`
-- `entry_volume_by_price`, `exit_volume_by_price`
+- `entry_volume_by_price`, `cancelled_volume_by_price`
 - `buy_volume_by_price`, `sell_volume_by_price`
 - `executed_volume_by_price`, `total_executed_volume`, `trade_count`
 - `market_buy_volume`, `market_sell_volume`
 - `vwap_price`, `best_bid_before`, `best_ask_before`, `spread_after`
 - `orderbook_before`, `orderbook_after`
-- `position_mass_before`, `position_mass_after`
 
 `buy_volume_by_price`와 `sell_volume_by_price`는 sampled order price별 제출
 의도 물량이며, 체결량이나 남은 호가 물량이 아닙니다. `market_*` volume field는
-실제로 체결된 incoming buy/sell 물량을 뜻합니다. 체결되지 않은 incoming 물량은
-`orderbook_after`에 남습니다. legacy `residual_market_*`와
+실제로 체결된 incoming buy/sell 물량을 뜻합니다. `residual_market_*` field는
+체결되지 않았고 book에 남길 수 있었던 incoming buy/sell 물량을 뜻합니다.
+체결되지 않은 incoming 물량은 `orderbook_after`에 남습니다.
 `crossed_market_volume` field는 현재 order-book-first engine에서 호환성을 위한
-0 값으로 유지됩니다.
+diagnostic이며 0 값으로 유지됩니다.
 
 `*_mdf_by_price` 필드는 `mdf_price_basis`를 기준으로 한 pre-trade MDF projection입니다.
 현재 `Market.state.mdf.*_by_price`는 post-trade state 가격에 맞춰 다시 투영됩니다.
@@ -375,10 +347,10 @@ obsolete로 보아야 합니다.
 ### Public Contract와 Snapshot 정책
 
 public import surface는 package `__all__`입니다. 여기에는 `Market`,
-`generate_paths`, `compute_metrics`, generated path metadata, MDF model/protocol
-type, metric, 그리고 위에 보인 state dataclass들이 포함됩니다. entrypoint는
-작지만, `StepInfo`와 `MarketState`가 상세 simulator diagnostic을 노출하므로
-observation contract는 넓습니다.
+`generate_paths`, `compute_metrics`, generated path metadata, metric, 그리고
+위에 보인 state dataclass들이 포함됩니다. custom MDF model/protocol type은 더
+이상 public API가 아닙니다. entrypoint는 작지만, `StepInfo`와 `MarketState`가
+상세 simulator diagnostic을 노출하므로 observation contract는 넓습니다.
 
 현재 alpha line에서는 기존 public name과 기존 `StepInfo` / state field를 가능한
 한 호환되게 유지합니다. alpha release 중 새 diagnostic field가 추가될 수 있습니다.

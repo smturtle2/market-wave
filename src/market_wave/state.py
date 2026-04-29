@@ -41,12 +41,8 @@ class MDFState:
     relative_ticks: list[int] = field(default_factory=list)
     buy_entry_mdf: TickMap = field(default_factory=dict)
     sell_entry_mdf: TickMap = field(default_factory=dict)
-    long_exit_mdf: TickMap = field(default_factory=dict)
-    short_exit_mdf: TickMap = field(default_factory=dict)
     buy_entry_mdf_by_price: PriceMap = field(default_factory=dict)
     sell_entry_mdf_by_price: PriceMap = field(default_factory=dict)
-    long_exit_mdf_by_price: PriceMap = field(default_factory=dict)
-    short_exit_mdf_by_price: PriceMap = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -55,14 +51,6 @@ class OrderBookState:
 
     bid_volume_by_price: PriceMap = field(default_factory=dict)
     ask_volume_by_price: PriceMap = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class PositionMassState:
-    """Position mass snapshot with plain mutable price maps."""
-
-    long_exit_mass_by_price: PriceMap = field(default_factory=dict)
-    short_exit_mass_by_price: PriceMap = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -82,7 +70,6 @@ class MarketState:
     price_grid: list[float]
     mdf: MDFState
     orderbook: OrderBookState
-    position_mass: PositionMassState
 
 
 @dataclass(frozen=True)
@@ -111,16 +98,11 @@ class StepInfo:
     relative_ticks: list[int]
     buy_entry_mdf: TickMap
     sell_entry_mdf: TickMap
-    long_exit_mdf: TickMap
-    short_exit_mdf: TickMap
     buy_entry_mdf_by_price: PriceMap
     sell_entry_mdf_by_price: PriceMap
-    long_exit_mdf_by_price: PriceMap
-    short_exit_mdf_by_price: PriceMap
     buy_volume_by_price: PriceMap
     sell_volume_by_price: PriceMap
     entry_volume_by_price: PriceMap
-    exit_volume_by_price: PriceMap
     cancelled_volume_by_price: PriceMap
     executed_volume_by_price: PriceMap
     total_executed_volume: float
@@ -140,8 +122,6 @@ class StepInfo:
     order_flow_imbalance: float
     orderbook_before: OrderBookState
     orderbook_after: OrderBookState
-    position_mass_before: PositionMassState
-    position_mass_after: PositionMassState
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
