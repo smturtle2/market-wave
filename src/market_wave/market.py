@@ -12,12 +12,12 @@ from ._orderbook import _OrderBook as _OrderBook
 from ._plotting import _MarketPlottingMixin
 from ._types import (
     _EntryFlow,
+    _EventSizeState,
     _ExecutionResult,
     _IncomingOrder,
     _MarketConditionInputs,
     _MarketConditionState,
-    _MDFJudgmentSample,
-    _MDFSideJudgment,
+    _MarketEvent,
     _MicrostructureInputs,
     _MicrostructureState,
     _ProcessedOrder,
@@ -36,12 +36,12 @@ from .state import (
 
 _PRIVATE_COMPAT_EXPORTS = (
     _EntryFlow,
+    _EventSizeState,
     _ExecutionResult,
     _IncomingOrder,
+    _MarketEvent,
     _MarketConditionInputs,
     _MarketConditionState,
-    _MDFJudgmentSample,
-    _MDFSideJudgment,
     _MicrostructureInputs,
     _MicrostructureState,
     _ProcessedOrder,
@@ -103,10 +103,12 @@ class Market(
         self._last_imbalance = 0.0
         self._last_execution_volume = 0.0
         self._last_executed_by_price: PriceMap = {}
-        self._price_residual_ticks = 0.0
         self._microstructure = _MicrostructureState()
         self._mdf_memory: dict[str, dict[int, float]] = {}
-        self._mdf_judgment_memory: dict[str, _MDFSideJudgment] = {}
+        self._mdf_pockets_by_side_tick: dict[str, dict[int, float]] = {
+            "bid": {},
+            "ask": {},
+        }
 
         price = self._snap_price(float(initial_price))
         grid = self._price_grid(price)
@@ -211,12 +213,12 @@ class Market(
         )
         pre_trade_cache.mdf = mdf
 
-        cancelled_volume = self._cancel_orders(price_before, latent, micro, mdf, pre_trade_cache)
         entry_flow = self._entry_flow(intensity, mdf)
 
         stats = _TradeStats(executed_by_price={})
         execution = self._execute_market_flows(
             entry_orders=entry_flow.orders,
+            events=entry_flow.events,
             stats=stats,
         )
         self._clean_orderbook()
@@ -231,50 +233,35 @@ class Market(
         total_market_sell = execution.market_sell_volume
         residual_market_buy = execution.residual_market_buy
         residual_market_sell = execution.residual_market_sell
+        cancelled_volume = self._drop_zeroes(execution.cancelled_volume_by_price)
+        micro.last_cancelled_volume = sum(cancelled_volume.values())
         order_flow_imbalance = self._step_order_flow_imbalance(
             price_after,
             execution,
             cancelled_volume,
         )
         self._last_imbalance = order_flow_imbalance
-        self._trim_orderbook_through_last_price(price_after)
-        self._prune_orderbook_window(price_after)
-        post_trade_mdf = self._reproject_mdf(price_after, mdf)
-        post_trade_cache = _StepComputationCache(price_after, mdf=post_trade_mdf, micro=micro)
-        self._add_post_event_quote_arrivals(
+        self._update_mdf_pockets(
             price_after,
             latent,
             micro,
             stats,
             order_flow_imbalance,
-            post_trade_mdf,
-            post_trade_cache,
-        )
-        self._refresh_post_event_deep_quotes(
+            mdf,
+            pre_trade_cache,
             cancelled_volume,
-            price_after,
-            micro,
-            post_trade_mdf,
-            post_trade_cache,
         )
-        cancelled_volume = self._drop_zeroes(cancelled_volume)
-        micro.last_cancelled_volume = sum(cancelled_volume.values())
-        self._trim_orderbook_through_last_price(price_after)
         self._clean_orderbook()
 
-        state_grid = self._price_grid(price_after)
-        state_mdf = post_trade_mdf
+        state_mdf = self._reproject_mdf(price_after, mdf)
         orderbook_after = self._snapshot_orderbook()
         best_bid_after = self._best_bid()
         best_ask_after = self._best_ask()
         spread_after = self._spread(best_bid_after, best_ask_after)
 
-        entry_volume = self._merge_maps(
-            entry_flow.buy_intent_by_price,
-            entry_flow.sell_intent_by_price,
-        )
-        buy_volume = entry_flow.buy_intent_by_price
-        sell_volume = entry_flow.sell_intent_by_price
+        buy_volume = self._drop_zeroes(entry_flow.buy_intent_by_price)
+        sell_volume = self._drop_zeroes(entry_flow.sell_intent_by_price)
+        entry_volume = self._merge_maps(buy_volume, sell_volume)
         vwap = stats.notional / stats.total_volume if stats.total_volume > 0 else None
         step_info = StepInfo(
             step_index=step_index,
@@ -328,7 +315,7 @@ class Market(
             tick_grid=self.relative_tick_grid(),
             intensity=intensity,
             latent=latent,
-            price_grid=state_grid,
+            price_grid=self._price_grid(price_after),
             mdf=state_mdf,
             orderbook=orderbook_after,
         )
@@ -409,59 +396,10 @@ class Market(
         execution: _ExecutionResult,
         latent: LatentState | None = None,
     ) -> float:
+        del execution, latent
         if stats.total_volume <= 0 or stats.last_price is None:
             return price_before
-        latent = latent or self.state.latent
-        regime = self._active_settings
-        vwap = stats.notional / stats.total_volume
-        execution_price = 0.68 * stats.last_price + 0.32 * vwap
-        execution_move_ticks = (execution_price - price_before) / self.gap
-        flow_total = execution.market_buy_volume + execution.market_sell_volume
-        flow_imbalance = (
-            self._clamp(
-                (execution.market_buy_volume - execution.market_sell_volume) / flow_total,
-                -1.0,
-                1.0,
-            )
-            if flow_total > 1e-12
-            else 0.0
-        )
-        if abs(execution_move_ticks) <= 1e-12 and abs(flow_imbalance) <= 1e-12:
-            return price_before
-        volume_confidence = self._clamp(
-            stats.total_volume / max(0.7, self.popularity),
-            0.35,
-            1.65,
-        )
-        volatility_response = self._clamp(
-            0.86 + 0.18 * regime["volatility"] + 0.14 * latent.volatility,
-            0.90,
-            1.50,
-        )
-        # Last price shows where trades occurred; flow only nudges revealed pressure.
-        price_discovery = self._clamp(abs(execution_move_ticks) / 1.35, 0.25, 1.0)
-        flow_move_ticks = (
-            flow_imbalance
-            * (0.06 + 0.045 * volume_confidence)
-            * price_discovery
-            * volatility_response
-        )
-        proposed_ticks = (
-            execution_move_ticks * (0.52 + 0.12 * volume_confidence) * volatility_response
-        )
-        proposed_ticks += flow_move_ticks
-        max_move_ticks = self._clamp(1.0 + 0.45 * latent.volatility, 1.0, 2.0)
-        proposed_ticks = self._clamp(proposed_ticks, -max_move_ticks, max_move_ticks)
-        self._price_residual_ticks = self._clamp(
-            self._price_residual_ticks + proposed_ticks,
-            -max_move_ticks,
-            max_move_ticks,
-        )
-        emitted_ticks = int(round(self._price_residual_ticks))
-        if emitted_ticks == 0:
-            return price_before
-        self._price_residual_ticks -= emitted_ticks
-        return max(self._min_price, price_before + emitted_ticks * self.gap)
+        return max(self._min_price, stats.last_price)
 
     def _price_grid(self, center_price: float) -> list[float]:
         center = self._snap_price(center_price)

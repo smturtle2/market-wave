@@ -36,10 +36,21 @@ class MDFSignals:
     ask_gap_by_tick: Mapping[int, float] = field(default_factory=dict)
     bid_front_by_tick: Mapping[int, float] = field(default_factory=dict)
     ask_front_by_tick: Mapping[int, float] = field(default_factory=dict)
+    bid_occupancy_by_tick: Mapping[int, float] = field(default_factory=dict)
+    ask_occupancy_by_tick: Mapping[int, float] = field(default_factory=dict)
+    bid_depth_pressure: float = 0.0
+    ask_depth_pressure: float = 0.0
     spread_ticks: float = 1.0
+    spread_pressure: float = 0.0
     cancel_pressure: float = 0.0
     liquidity_stress: float = 0.0
     stress_side: float = 0.0
     resiliency: float = 1.0
     activity: float = 0.0
     activity_event: float = 0.0
+    flow_persistence: float = 0.0
+    meta_order_side: float = 0.0
+    volatility_cluster: float = 0.0
+    participation_burst: float = 0.0
+    liquidity_drought: float = 0.0
+    cancel_burst: float = 0.0

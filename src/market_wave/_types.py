@@ -15,10 +15,31 @@ class _IncomingOrder:
 
 
 @dataclass
+class _MarketEvent:
+    event_type: str
+    side: str
+    price: float
+    volume: float
+
+
+@dataclass(frozen=True)
+class _EventSizeState:
+    maker_scale: float
+    buy_taker_scale: float
+    sell_taker_scale: float
+    cancel_scale: float
+    taker_tail_probability: float
+    taker_medium_probability: float
+
+
+@dataclass
 class _EntryFlow:
     orders: list[_IncomingOrder]
     buy_intent_by_price: PriceMap
     sell_intent_by_price: PriceMap
+    events: list[_MarketEvent] = field(default_factory=list)
+    bid_cancel_intent_by_price: PriceMap = field(default_factory=dict)
+    ask_cancel_intent_by_price: PriceMap = field(default_factory=dict)
 
 
 @dataclass
@@ -46,6 +67,7 @@ class _ExecutionResult:
     crossed_market_volume: float
     market_buy_volume: float = 0.0
     market_sell_volume: float = 0.0
+    cancelled_volume_by_price: PriceMap = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -67,6 +89,12 @@ class _MicrostructureState:
     stress_side: float = 0.0
     spread_pressure: float = 0.0
     last_cancelled_volume: float = 0.0
+    flow_persistence: float = 0.0
+    meta_order_side: float = 0.0
+    volatility_cluster: float = 0.0
+    participation_burst: float = 0.0
+    liquidity_drought: float = 0.0
+    cancel_burst: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -102,24 +130,6 @@ class _MarketConditionState:
     stress_pressure: float = 0.0
     participation_bias: float = 0.0
     squeeze_pressure: float = 0.0
-
-
-@dataclass(frozen=True)
-class _MDFSideJudgment:
-    fair_value_shift: float
-    urgency: float
-    patience: float
-    opportunity: float
-    liquidation: float
-    liquidity_aversion: float
-    pocket_bias: float
-    uncertainty: float
-
-
-@dataclass(frozen=True)
-class _MDFJudgmentSample:
-    buy: _MDFSideJudgment
-    sell: _MDFSideJudgment
 
 
 @dataclass
