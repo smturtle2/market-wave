@@ -2,23 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from random import Random
 
-TickMap = dict[int, float]
-
-
-@dataclass(frozen=True)
-class MDFContext:
-    current_price: float
-    current_tick: int
-    tick_size: float
-    mood: float
-    trend: float
-    volatility: float
-    regime: str
-    augmentation_strength: float
-    step_index: int
-    rng: Random
+TickMap = dict[float, float]
 
 
 @dataclass(frozen=True)
@@ -40,6 +25,11 @@ class MDFSignals:
     ask_occupancy_by_tick: Mapping[int, float] = field(default_factory=dict)
     bid_depth_pressure: float = 0.0
     ask_depth_pressure: float = 0.0
+    book_vacuum: float = 0.0
+    bid_vacuum: float = 0.0
+    ask_vacuum: float = 0.0
+    churn_pressure: float = 0.0
+    displacement_pressure: float = 0.0
     spread_ticks: float = 1.0
     spread_pressure: float = 0.0
     cancel_pressure: float = 0.0
@@ -48,6 +38,7 @@ class MDFSignals:
     resiliency: float = 1.0
     activity: float = 0.0
     activity_event: float = 0.0
+    arrival_cluster: float = 0.0
     flow_persistence: float = 0.0
     meta_order_side: float = 0.0
     volatility_cluster: float = 0.0

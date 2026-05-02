@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 PriceMap = dict[float, float]
-TickMap = dict[int, float]
+TickMap = dict[float, float]
 
 MUTABLE_SNAPSHOT_NOTE = (
     "State dataclasses are frozen at the attribute level, but their list and dict "
@@ -16,6 +16,8 @@ MUTABLE_SNAPSHOT_NOTE = (
 
 @dataclass(frozen=True)
 class IntensityState:
+    """Submitted-flow intensity split for one market state."""
+
     total: float
     buy: float
     sell: float
@@ -25,6 +27,8 @@ class IntensityState:
 
 @dataclass(frozen=True)
 class LatentState:
+    """Latent mood, trend, and volatility values used by the simulator."""
+
     mood: float
     trend: float
     volatility: float
@@ -34,20 +38,18 @@ class LatentState:
 class MDFState:
     """Market Distribution Function snapshot.
 
-    The dataclass is frozen, but the contained maps and lists remain mutable plain
+    Keys are gap-unit offsets sampled by the engine before conversion to prices.
+    The dataclass is frozen, but the contained maps remain mutable plain
     containers for compatibility with ``to_dict()``/JSON export workflows.
     """
 
-    relative_ticks: list[int] = field(default_factory=list)
     buy_entry_mdf: TickMap = field(default_factory=dict)
     sell_entry_mdf: TickMap = field(default_factory=dict)
-    buy_entry_mdf_by_price: PriceMap = field(default_factory=dict)
-    sell_entry_mdf_by_price: PriceMap = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class OrderBookState:
-    """Aggregated order-book snapshot with plain mutable price maps."""
+    """Aggregated order-book snapshot with volume keyed by price."""
 
     bid_volume_by_price: PriceMap = field(default_factory=dict)
     ask_volume_by_price: PriceMap = field(default_factory=dict)
@@ -68,6 +70,7 @@ class MarketState:
     intensity: IntensityState
     latent: LatentState
     price_grid: list[float]
+    mdf_price_basis: float
     mdf: MDFState
     orderbook: OrderBookState
 
@@ -76,8 +79,11 @@ class MarketState:
 class StepInfo:
     """Per-step observation and diagnostics.
 
-    Existing fields are kept compatible where practical during the alpha line,
-    but the nested dict/list fields are plain mutable snapshot containers.
+    ``StepInfo`` is the main observation record returned by ``Market.step()``.
+    It includes pre/post prices, active condition labels, MDF snapshots,
+    submitted volume, cancelled volume, executions, and order-book snapshots.
+    Nested dict/list fields are plain mutable containers; treat the object as a
+    read-only observation unless you explicitly copy it.
     """
 
     step_index: int
@@ -95,11 +101,8 @@ class StepInfo:
     augmentation_strength: float
     price_grid: list[float]
     mdf_price_basis: float
-    relative_ticks: list[int]
     buy_entry_mdf: TickMap
     sell_entry_mdf: TickMap
-    buy_entry_mdf_by_price: PriceMap
-    sell_entry_mdf_by_price: PriceMap
     buy_volume_by_price: PriceMap
     sell_volume_by_price: PriceMap
     entry_volume_by_price: PriceMap
@@ -119,12 +122,17 @@ class StepInfo:
     best_ask_after: float | None
     spread_before: float | None
     spread_after: float | None
+    mean_quote_age: float
     order_flow_imbalance: float
     orderbook_before: OrderBookState
     orderbook_after: OrderBookState
 
     def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly dataclass dictionary."""
+
         return asdict(self)
 
     def to_json(self, **kwargs: Any) -> str:
+        """Serialize the step observation to JSON."""
+
         return json.dumps(self.to_dict(), **kwargs)

@@ -15,16 +15,18 @@ class _MarketConditionsMixin:
         presets = {
             "normal": _MarketConditionState(),
             "trend_up": _MarketConditionState(
-                trend_bias=0.36,
-                volatility_pressure=0.06,
-                participation_bias=0.12,
+                trend_bias=0.21,
+                volatility_pressure=0.08,
+                liquidity_tightness=0.04,
+                stress_pressure=0.06,
+                participation_bias=0.16,
             ),
             "trend_down": _MarketConditionState(
-                trend_bias=-0.36,
-                volatility_pressure=0.10,
-                liquidity_tightness=0.05,
-                stress_pressure=0.08,
-                participation_bias=0.14,
+                trend_bias=-0.16,
+                volatility_pressure=0.08,
+                liquidity_tightness=0.04,
+                stress_pressure=0.06,
+                participation_bias=0.16,
             ),
             "high_vol": _MarketConditionState(
                 volatility_pressure=0.78,
@@ -39,7 +41,6 @@ class _MarketConditionsMixin:
                 participation_bias=-0.30,
             ),
             "squeeze": _MarketConditionState(
-                trend_bias=0.10,
                 volatility_pressure=0.62,
                 liquidity_tightness=0.56,
                 stress_pressure=0.72,
@@ -59,10 +60,10 @@ class _MarketConditionsMixin:
         trend_abs = abs(trend)
 
         return {
-            "mood": 0.12 * trend + 0.015 * squeeze,
-            "trend": 0.22 * trend + 0.050 * squeeze,
+            "mood": 0.12 * trend,
+            "trend": 0.55 * trend,
             "volatility": self._clamp(
-                1.0 + 0.36 * volatility + 0.08 * tightness + 0.04 * trend_abs,
+                1.0 + 0.55 * volatility + 0.08 * tightness + 0.04 * trend_abs,
                 0.78,
                 1.75,
             ),
@@ -159,6 +160,13 @@ class _MarketConditionsMixin:
                 0.075,
             ),
             "squeeze_gain": self._clamp(0.34 * squeeze, 0.0, 0.44),
+            "directional_persistence": self._clamp(
+                1.0
+                + 0.28 * trend_abs
+                - (1.0 - trend_abs) * (0.34 * volatility + 0.20 * stress),
+                0.38,
+                1.16,
+            ),
         }
 
     def _condition_label(self, condition: _MarketConditionState) -> str:
@@ -168,9 +176,9 @@ class _MarketConditionsMixin:
             return "thin_liquidity"
         if condition.volatility_pressure >= 0.58 or condition.stress_pressure >= 0.72:
             return "high_vol"
-        if condition.trend_bias >= 0.22:
+        if condition.trend_bias >= 0.15:
             return "trend_up"
-        if condition.trend_bias <= -0.22:
+        if condition.trend_bias <= -0.15:
             return "trend_down"
         return "normal"
 
@@ -180,13 +188,13 @@ class _MarketConditionsMixin:
         imbalance: float,
     ) -> _MarketConditionInputs:
         execution_pressure = min(
-            log1p(self._last_execution_volume / max(0.7, self.popularity)),
+            log1p(self._realized_flow.execution_volume / max(0.7, self.popularity)),
             2.0,
         )
         spread_gap = self._clamp((self._current_spread_ticks() - 2.0) / 5.0, 0.0, 1.0)
         bid_depth = self._nearby_book_depth("bid", self.state.price)
         ask_depth = self._nearby_book_depth("ask", self.state.price)
-        expected_depth = max(0.8, self.popularity * (3.6 + 0.30 * self.grid_radius))
+        expected_depth = self._expected_nearby_depth()
         depth_shortage = self._clamp(
             1.0 - (bid_depth + ask_depth) / max(expected_depth, 1e-12),
             0.0,
@@ -195,11 +203,11 @@ class _MarketConditionsMixin:
         volatility_jump = max(0.0, latent.volatility - self.state.latent.volatility)
         return _MarketConditionInputs(
             execution_pressure=execution_pressure,
-            return_shock=1.0 - exp(-self._last_abs_return_ticks / 1.4),
+            return_shock=1.0 - exp(-self._realized_flow.abs_return_ticks / 1.4),
             volatility_shock=1.0 - exp(-volatility_jump / 0.25),
-            imbalance_shock=abs(imbalance - self._last_imbalance),
-            signed_return=self._last_return_ticks,
-            flow_imbalance=self._last_imbalance,
+            imbalance_shock=abs(imbalance - self._realized_flow.flow_imbalance),
+            signed_return=self._realized_flow.return_ticks,
+            flow_imbalance=self._realized_flow.flow_imbalance,
             spread_gap=spread_gap,
             depth_shortage=depth_shortage,
             cancel_pressure=self._microstructure.cancel_pressure,
@@ -211,36 +219,36 @@ class _MarketConditionsMixin:
         previous: _MarketConditionState,
         inputs: _MarketConditionInputs,
     ) -> _MarketConditionState:
-        preset = self._condition_preset(self.regime)
-        preset_weight = 0.22 if self.regime == "auto" else 0.62
-        adaptive_weight = 1.0 - preset_weight
         noise_scale = 0.010 + 0.018 * self.augmentation_strength
 
         def signed_next(
             previous_value: float,
-            preset_value: float,
             evidence: float,
             *,
             memory: float,
             low: float,
             high: float,
         ) -> float:
-            target = preset_weight * preset_value + adaptive_weight * evidence
             noise = self._rng.gauss(0.0, noise_scale)
-            return self._clamp(memory * previous_value + (1.0 - memory) * target + noise, low, high)
+            return self._clamp(
+                memory * previous_value + (1.0 - memory) * evidence + noise,
+                low,
+                high,
+            )
 
         def pressure_next(
             previous_value: float,
-            preset_value: float,
             evidence: float,
             *,
             memory: float,
             high: float,
         ) -> float:
-            mixed = preset_weight * preset_value + adaptive_weight * evidence
-            target = max(0.72 * preset_value, mixed)
             noise = self._rng.gauss(0.0, noise_scale)
-            return self._clamp(memory * previous_value + (1.0 - memory) * target + noise, 0.0, high)
+            return self._clamp(
+                memory * previous_value + (1.0 - memory) * evidence + noise,
+                0.0,
+                high,
+            )
 
         signed_return = self._clamp(inputs.signed_return / 5.0, -1.0, 1.0)
         trend_evidence = self._clamp(
@@ -280,8 +288,8 @@ class _MarketConditionsMixin:
             1.2,
         )
         squeeze_evidence = self._clamp(
-            0.82 * inputs.squeeze_setup
-            + 0.18 * max(0.0, signed_return),
+            0.82 * abs(inputs.squeeze_setup)
+            + 0.18 * abs(signed_return),
             0.0,
             1.5,
         )
@@ -289,46 +297,40 @@ class _MarketConditionsMixin:
         return _MarketConditionState(
             trend_bias=signed_next(
                 previous.trend_bias,
-                preset.trend_bias,
                 trend_evidence,
-                memory=0.86,
+                memory=0.985,
                 low=-1.0,
                 high=1.0,
             ),
             volatility_pressure=pressure_next(
                 previous.volatility_pressure,
-                preset.volatility_pressure,
                 volatility_evidence,
-                memory=0.82,
+                memory=0.960,
                 high=1.8,
             ),
             liquidity_tightness=pressure_next(
                 previous.liquidity_tightness,
-                preset.liquidity_tightness,
                 liquidity_evidence,
-                memory=0.84,
+                memory=0.960,
                 high=1.8,
             ),
             stress_pressure=pressure_next(
                 previous.stress_pressure,
-                preset.stress_pressure,
                 stress_evidence,
-                memory=0.80,
+                memory=0.955,
                 high=1.8,
             ),
             participation_bias=signed_next(
                 previous.participation_bias,
-                preset.participation_bias,
                 participation_evidence,
-                memory=0.82,
+                memory=0.950,
                 low=-0.8,
                 high=1.2,
             ),
             squeeze_pressure=pressure_next(
                 previous.squeeze_pressure,
-                preset.squeeze_pressure,
                 squeeze_evidence,
-                memory=0.78,
+                memory=0.950,
                 high=1.5,
             ),
         )

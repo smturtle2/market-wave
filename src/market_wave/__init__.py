@@ -1,6 +1,10 @@
-from .generation import GeneratedPath, GenerationMetadata, generate_paths
+"""Public API for the market-wave synthetic market simulator.
+
+The package root intentionally exposes only the simulator entry point and state
+snapshot dataclasses. Metrics helpers live in :mod:`market_wave.metrics`.
+"""
+
 from .market import Market
-from .metrics import ValidationMetrics, compute_metrics
 from .state import (
     IntensityState,
     LatentState,
@@ -11,8 +15,6 @@ from .state import (
 )
 
 __all__ = [
-    "GeneratedPath",
-    "GenerationMetadata",
     "IntensityState",
     "LatentState",
     "MDFState",
@@ -20,7 +22,4 @@ __all__ = [
     "MarketState",
     "OrderBookState",
     "StepInfo",
-    "ValidationMetrics",
-    "compute_metrics",
-    "generate_paths",
 ]

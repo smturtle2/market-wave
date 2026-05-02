@@ -45,19 +45,44 @@ class _EntryFlow:
 @dataclass
 class _TradeStats:
     executed_by_price: PriceMap
+    buy_executed_by_price: PriceMap = field(default_factory=dict)
+    sell_executed_by_price: PriceMap = field(default_factory=dict)
     total_volume: float = 0.0
     notional: float = 0.0
     trade_count: int = 0
+    buy_volume: float = 0.0
+    sell_volume: float = 0.0
+    buy_levels_walked: int = 0
+    sell_levels_walked: int = 0
+    first_price: float | None = None
     last_price: float | None = None
+    min_price: float | None = None
+    max_price: float | None = None
 
-    def record(self, price: float, volume: float) -> None:
+    def record(self, price: float, volume: float, side: str | None = None) -> None:
         if volume <= 0:
             return
         self.executed_by_price[price] = self.executed_by_price.get(price, 0.0) + volume
         self.total_volume += volume
         self.notional += price * volume
         self.trade_count += 1
+        if side == "buy":
+            self.buy_executed_by_price[price] = (
+                self.buy_executed_by_price.get(price, 0.0) + volume
+            )
+            self.buy_volume += volume
+            self.buy_levels_walked += 1
+        elif side == "sell":
+            self.sell_executed_by_price[price] = (
+                self.sell_executed_by_price.get(price, 0.0) + volume
+            )
+            self.sell_volume += volume
+            self.sell_levels_walked += 1
+        if self.first_price is None:
+            self.first_price = price
         self.last_price = price
+        self.min_price = price if self.min_price is None else min(self.min_price, price)
+        self.max_price = price if self.max_price is None else max(self.max_price, price)
 
 
 @dataclass
@@ -68,6 +93,43 @@ class _ExecutionResult:
     market_buy_volume: float = 0.0
     market_sell_volume: float = 0.0
     cancelled_volume_by_price: PriceMap = field(default_factory=dict)
+    bid_cancelled_volume_by_price: PriceMap = field(default_factory=dict)
+    ask_cancelled_volume_by_price: PriceMap = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _RealizedFlow:
+    return_ticks: float = 0.0
+    abs_return_ticks: float = 0.0
+    execution_volume: float = 0.0
+    submitted_buy_volume: float = 0.0
+    submitted_sell_volume: float = 0.0
+    rested_buy_volume: float = 0.0
+    rested_sell_volume: float = 0.0
+    executed_by_price: PriceMap = field(default_factory=dict)
+    cancelled_by_price: PriceMap = field(default_factory=dict)
+    bid_cancelled_by_price: PriceMap = field(default_factory=dict)
+    ask_cancelled_by_price: PriceMap = field(default_factory=dict)
+    flow_imbalance: float = 0.0
+    intent_imbalance: float = 0.0
+    rested_imbalance: float = 0.0
+    residual_imbalance: float = 0.0
+    best_bid: float | None = None
+    best_ask: float | None = None
+    spread: float | None = None
+
+
+@dataclass(frozen=True)
+class _ParticipantPressureState:
+    upward_push: float = 0.0
+    downward_push: float = 0.0
+    upward_resistance: float = 0.0
+    downward_resistance: float = 0.0
+    flow_continuation: float = 0.0
+    absorption: float = 0.0
+    exhaustion: float = 0.0
+    signed_intent_memory: float = 0.0
+    noise_pressure: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -88,13 +150,16 @@ class _MicrostructureState:
     liquidity_stress: float = 0.0
     stress_side: float = 0.0
     spread_pressure: float = 0.0
-    last_cancelled_volume: float = 0.0
     flow_persistence: float = 0.0
     meta_order_side: float = 0.0
     volatility_cluster: float = 0.0
     participation_burst: float = 0.0
     liquidity_drought: float = 0.0
     cancel_burst: float = 0.0
+    arrival_cluster: float = 0.0
+    book_vacuum: float = 0.0
+    churn_pressure: float = 0.0
+    displacement_pressure: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -139,6 +204,4 @@ class _StepComputationCache:
     micro: _MicrostructureState | None = None
     signals: MDFSignals | None = None
     spread_ticks: float | None = None
-    entry_probabilities_by_side: dict[str, PriceMap] = field(default_factory=dict)
-    expected_depth_by_side: dict[str, float] = field(default_factory=dict)
-    expected_volume_by_side_price: dict[tuple[str, float], float] = field(default_factory=dict)
+    entry_support_by_book_side: dict[str, PriceMap] = field(default_factory=dict)
