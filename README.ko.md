@@ -5,18 +5,24 @@
 </p>
 
 <p align="center">
-  <strong>Dynamic Market Distribution Function으로 빠르고 가벼운 synthetic market data를 만듭니다.</strong>
+  <strong>두 개의 live entry distribution으로 order-book 같은 synthetic market path를 만듭니다.</strong>
+  <br />
+  <span>체결 기반 가격, visible book state, 취소, imbalance, 내장 plot까지 제공합니다.</span>
 </p>
 
 <p align="center">
   <a href="https://pypi.org/project/market-wave/"><img alt="PyPI" src="https://img.shields.io/pypi/v/market-wave"></a>
   <a href="https://pypi.org/project/market-wave/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/market-wave"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <a href=".github/workflows/workflow.yml"><img alt="Tests" src="https://img.shields.io/badge/tests-pytest-2563eb"></a>
+  <a href="https://github.com/smturtle2/market-wave/actions/workflows/workflow.yml"><img alt="CI" src="https://github.com/smturtle2/market-wave/actions/workflows/workflow.yml/badge.svg"></a>
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> | 한국어
+  <a href="#설치">설치</a>
+  · <a href="#빠른-시작">빠른 시작</a>
+  · <a href="#시각화">시각화</a>
+  · <a href="docs/API.md">API docs</a>
+  · <a href="README.md">English</a>
 </p>
 
 `market-wave`는 개별 참여자를 만들지 않고 시장 전체의 진입 가격 분포로
@@ -32,22 +38,16 @@ MDF에서 직접 샘플링되며, realized sample이 다음 시장 상태에 되
 것입니다. 샘플링 이후 원하는 path를 맞추기 위한 order 후보정이나 강제 이동은
 하지 않습니다.
 
-## 왜 market-wave인가?
+## 제공하는 것
 
-- **개별 agent가 아닌 집계 의도**: 참여자 객체를 만들지 않고 gap 단위 offset별 확률질량으로
-  시장 의도를 표현합니다.
-- **Raw-mass MDF**: 관측 가능한 offset별 질량을 직접 더한 뒤 정규화해서
-  매수/매도 진입 의도를 표현합니다.
-- **분포와 거래강도 분리**: MDF는 의도가 어느 가격대에 있는지, intensity는 총
-  주문량이 얼마나 되는지를 담당합니다.
-- **체결 기반 가격**: 체결이 없으면 가격은 움직이지 않습니다.
-- **샘플 후 후보정 없음**: sampled order price는 목표 volatility, trend, spread,
-  path shape에 맞추려고 다시 쓰지 않습니다.
-- **단순한 batch loop**: `Market`을 만들고 `step(n)`을 호출하는 방식으로
-  재현 가능한 synthetic path를 생성합니다.
-- **관찰 가능한 상태**: 매 step마다 MDF, 제출 물량, 취소 물량, 체결, 호가창,
-  VWAP, spread, imbalance가 담긴 `StepInfo`를 반환합니다.
-- **내장 시각화**: `matplotlib` 기반의 깔끔한 light chart 스타일을 제공합니다.
+| 기능 | 의미 |
+| --- | --- |
+| 두 entry MDF | 매수/매도 의도를 gap 단위 offset distribution으로 샘플링합니다. |
+| 체결 기반 가격 | 체결이 없으면 mark가 움직이지 않습니다. |
+| Visible book state | 매 step마다 체결 전후 bid/ask depth를 확인할 수 있습니다. |
+| 취소 lifecycle | 시장 상태에 따라 resting liquidity가 줄거나 사라집니다. |
+| Tick-native diagnostics | 절대 가격 scale에 덜 의존하는 metric을 제공합니다. |
+| 내장 plotting | 가격, book heatmap, volume, imbalance를 한 번에 그립니다. |
 
 ## 설치
 
@@ -203,12 +203,6 @@ fig, ax = market.plot(last=220, orderbook_depth=12)
 기본 `market_wave` 스타일은 가격/VWAP, 단순 level 기준 bid/ask orderbook depth
 heatmap, 체결량, order-flow imbalance를 함께 보여주는 light multi-panel 차트입니다.
 예전 3-panel 화면은 `orderbook=False`로 볼 수 있습니다.
-
-Dark overlay 모드도 사용할 수 있습니다.
-
-```python
-fig, ax = market.plot(layout="overlay", style="market_wave_dark")
-```
 
 ## Synthetic Data
 

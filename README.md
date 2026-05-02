@@ -5,52 +5,50 @@
 </p>
 
 <p align="center">
-  <strong>Fast, lightweight synthetic market data from a Dynamic Market Distribution Function.</strong>
+  <strong>Generate market-like order-book paths from two live entry distributions.</strong>
+  <br />
+  <span>Execution-driven prices, visible book state, cancellations, imbalance, and built-in plots.</span>
 </p>
 
 <p align="center">
   <a href="https://pypi.org/project/market-wave/"><img alt="PyPI" src="https://img.shields.io/pypi/v/market-wave"></a>
   <a href="https://pypi.org/project/market-wave/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/market-wave"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <a href=".github/workflows/workflow.yml"><img alt="Tests" src="https://img.shields.io/badge/tests-pytest-2563eb"></a>
+  <a href="https://github.com/smturtle2/market-wave/actions/workflows/workflow.yml"><img alt="CI" src="https://github.com/smturtle2/market-wave/actions/workflows/workflow.yml/badge.svg"></a>
 </p>
 
 <p align="center">
-  English | <a href="README.ko.md">한국어</a>
+  <a href="#install">Install</a>
+  · <a href="#quickstart">Quickstart</a>
+  · <a href="#visualization">Visualization</a>
+  · <a href="docs/API.md">API docs</a>
+  · <a href="README.ko.md">한국어</a>
 </p>
 
-`market-wave` is a Python library for generating synthetic market paths from a
-market-wide entry price distribution. It does not create individual
-participants. Instead, it models aggregate buy/sell entry intent, resting
-order-book depth, probabilistic order cancellation, taker flow, and
-execution-driven price movement from probability mass over gap-unit offsets.
+`market-wave` is a small Python simulator for synthetic market paths that need
+to look and behave like an order book, without building individual agent
+objects. It models aggregate buy/sell entry intent, resting depth, cancellation,
+taker flow, executions, and price movement on a gap-native tick grid.
 
-It is not a forecasting model. It is a lightweight simulation primitive for
-experiments, visualization, teaching, and strategy-environment prototyping.
+It is designed for experiments, visualization, teaching, and strategy
+environment prototyping. It is not a forecasting model, not a replay engine, and
+not financial advice.
+
+## What You Get
+
+| Capability | What it means |
+| --- | --- |
+| Two entry MDFs | Buy and sell intent are sampled from gap-unit offset distributions. |
+| Execution-driven price | The mark only moves when trades print. |
+| Visible book state | Every step includes bid/ask depth before and after execution. |
+| Cancellation lifecycle | Resting liquidity can shrink or disappear as market state changes. |
+| Tick-native diagnostics | Metrics compare paths without depending on absolute price scale. |
+| Built-in plotting | One call renders price, book heatmaps, volume, and imbalance. |
 
 Core engine rule: market state reshapes the two entry MDFs, incoming order
-offsets are sampled directly from those MDFs, and the realized samples feed back
+offsets are sampled directly from those MDFs, and realized samples feed back
 into the next market state. The engine does not post-correct sampled orders or
 force a target path after sampling.
-
-## Why market-wave?
-
-- **Aggregate intent, not agents**: market participants are represented by
-  probability mass over gap-unit offsets, not by individual objects.
-- **Raw-mass MDF**: buy/sell entry intent is built by summing observable
-  offset-level mass, then normalizing directly.
-- **Separated shape and size**: MDFs decide where intent sits; intensity decides
-  how much order flow appears.
-- **Execution-driven prices**: prices stay flat unless trades execute.
-- **No post-sampling correction**: sampled order prices are not rewritten to hit
-  target volatility, trend, spread, or path shape.
-- **Plain batch loops**: create reproducible synthetic paths by instantiating
-  `Market` and calling `step(n)`.
-- **Inspectable state**: every step returns a `StepInfo` snapshot with MDFs,
-  submitted volume, cancelled volume, executions, order book state, VWAP,
-  spread, and imbalance.
-- **Built-in plotting**: `matplotlib` is included, with a clean light chart style
-  by default.
 
 ## Install
 
@@ -80,10 +78,9 @@ Python `>=3.10` is supported.
 from market_wave import Market
 from market_wave.metrics import compute_metrics
 
-market = Market(popularity=3.0, seed=42)
+market = Market(initial_price=10_000, gap=10, popularity=1.6, seed=23)
 steps = market.step(500)
-paths = [steps]
-metrics = compute_metrics(paths)
+metrics = compute_metrics([steps])
 
 last = steps[-1]
 print(last.price_before, "->", last.price_after)
@@ -94,7 +91,7 @@ print("imbalance:", round(last.order_flow_imbalance, 3))
 print("execution rate:", round(metrics.execution_rate, 3))
 ```
 
-Configure the model directly with plain constructor parameters:
+Configure the model with plain constructor parameters:
 
 ```python
 from market_wave import Market
@@ -116,6 +113,8 @@ For simple export workflows, use `step.to_dict()`, `step.to_json()`, or
 The exact numbers are seed- and version-dependent. The printed fields are meant
 to show the current mark, sampled entry volume, executed volume, resting book
 depth, and realized order-flow imbalance for the final step.
+
+See [docs/API.md](docs/API.md) for the full public API.
 
 ## Smoke Matrix
 
@@ -210,12 +209,6 @@ The default `market_wave` style uses a light multi-panel chart: price/VWAP,
 bid and ask orderbook depth heatmaps by simple level, executed volume, and
 order-flow imbalance. To keep the legacy three-panel view, pass
 `orderbook=False`.
-
-Dark overlay mode is still available:
-
-```python
-fig, ax = market.plot(layout="overlay", style="market_wave_dark")
-```
 
 ## Synthetic Data
 
